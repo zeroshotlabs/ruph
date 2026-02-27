@@ -737,6 +737,45 @@ impl AstPhpProcessor {
                 self.side_effect_output = Some(out);
                 return Ok(PhpValue::Null);
             }
+            "exe" => {
+                // exe('path/') - resolve and execute like the web server does:
+                // directory -> find _index.php -> execute it
+                // file.php -> execute it
+                // file.html -> process through PHP (handles <?php tags)
+                if let Some(target) = args.get(0) {
+                    let target_str = target.as_string();
+                    let path = self.resolve_local_path(&target_str)?;
+
+                    let script = if path.is_dir() {
+                        // Look for _index.php in directory
+                        let candidate = path.join("_index.php");
+                        if candidate.exists() {
+                            candidate
+                        } else {
+                            return Err(anyhow!("No _index.php found in {}", target_str));
+                        }
+                    } else if path.is_file() {
+                        path
+                    } else {
+                        return Err(anyhow!("exe: path not found: {}", target_str));
+                    };
+
+                    let content = fs::read_to_string(&script).await
+                        .map_err(|_| anyhow!("exe: cannot read {}", script.display()))?;
+
+                    let previous_source = self.source_code.clone();
+                    let previous_template = self.current_template_path.clone();
+                    self.current_template_path = Some(script.clone());
+
+                    let mut exe_output = String::new();
+                    self.process_php_code(&content, &mut exe_output).await?;
+
+                    self.source_code = previous_source;
+                    self.current_template_path = previous_template;
+                    return Ok(PhpValue::String(exe_output));
+                }
+                Ok(PhpValue::Null)
+            }
             "http_request" => {
                 let method = args.get(0).map(|s| s.as_string()).unwrap_or("GET".to_string());
                 let url = args.get(1).map(|s| s.as_string()).unwrap_or_default();
@@ -867,7 +906,7 @@ impl AstPhpProcessor {
         let canonical_root = root_dir.canonicalize()
             .map_err(|_| anyhow!("Cannot canonicalize root dir"))?;
         let canonical_path = raw_path.canonicalize()
-            .map_err(|_| anyhow!("Cannot resolve path"))?;
+            .map_err(|_| anyhow!("Cannot resolve path: {}", raw_path.display()))?;
 
         if !canonical_path.starts_with(&canonical_root) {
             return Err(anyhow!("Path traversal attempt detected"));
