@@ -16,6 +16,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tempfile::NamedTempFile;
 use std::io::Write as StdWrite;
+use std::sync::Arc;
+
+/// Callback for routing PHP stderr lines (e.g. error_log()) to domain-specific logs.
+pub type PhpStderrHandler = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Built-in PHP functions provided by ruph, auto-prepended to every script
 const RUPH_BUILTINS_PHP: &str = r#"<?php
@@ -250,6 +254,7 @@ impl PhpProcessor {
         query_params: &HashMap<String, String>,
         post_data: &HashMap<String, String>,
         server_vars: &HashMap<String, String>,
+        stderr_handler: Option<&PhpStderrHandler>,
     ) -> Result<String> {
         debug!("Executing PHP via external binary: {:?}", file_path);
 
@@ -258,15 +263,19 @@ impl PhpProcessor {
             .map_err(|e| anyhow!("Failed to execute PHP: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stdout.is_empty() {
-                warn!("PHP exited with error but produced output: {}", stderr.trim());
-                let (_, body, _) = Self::parse_cgi_output(&stdout);
-                return Ok(body);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                warn!("PHP: {}", trimmed);
+                if let Some(handler) = stderr_handler {
+                    handler(trimmed);
+                }
             }
-            return Err(anyhow!("PHP execution failed: {}", stderr));
+        }
+
+        if !output.status.success() && stdout.is_empty() {
+            return Err(anyhow!("PHP execution failed: {}", stderr.trim()));
         }
 
         let (_, body, _) = Self::parse_cgi_output(&stdout);
@@ -281,6 +290,7 @@ impl PhpProcessor {
         query_params: &HashMap<String, String>,
         post_data: &HashMap<String, String>,
         server_vars: &HashMap<String, String>,
+        stderr_handler: Option<&PhpStderrHandler>,
     ) -> Result<crate::ast_php_processor::PhpExecution> {
         debug!("Executing PHP with header parsing: {:?}", file_path);
 
@@ -295,7 +305,11 @@ impl PhpProcessor {
             if stdout.is_empty() {
                 return Err(anyhow!("PHP execution failed: {}", stderr));
             }
-            warn!("PHP exited with error but produced output: {}", stderr.trim());
+            let msg = format!("PHP exited with error but produced output: {}", stderr.trim());
+            warn!("{}", msg);
+            if let Some(handler) = stderr_handler {
+                handler(&msg);
+            }
         }
 
         let (headers, body, status) = Self::parse_cgi_output(&stdout);
@@ -310,12 +324,13 @@ impl PhpProcessor {
         query_params: &HashMap<String, String>,
         post_data: &HashMap<String, String>,
         server_vars: &HashMap<String, String>,
+        stderr_handler: Option<PhpStderrHandler>,
     ) -> Result<PhpStream> {
         debug!("Streaming PHP output: {:?}", file_path);
 
         let mut command = self.build_command(file_path, query_params, post_data, server_vars);
         command.stdout(std::process::Stdio::piped());
-        command.stderr(std::process::Stdio::null());
+        command.stderr(std::process::Stdio::piped());
 
         let mut child = command.spawn()
             .map_err(|e| anyhow!("Failed to spawn PHP: {}", e))?;
@@ -323,6 +338,29 @@ impl PhpProcessor {
         let stdout = child.stdout.take()
             .ok_or_else(|| anyhow!("Failed to acquire PHP stdout"))?;
         let mut reader = BufReader::new(stdout);
+
+        // Forward PHP stderr to ruph logger (and domain log if handler provided)
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut err_reader = BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match err_reader.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                warn!("PHP: {}", trimmed);
+                                if let Some(ref handler) = stderr_handler {
+                                    handler(trimmed);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         // Read CGI headers line-by-line until blank line
         let mut headers = HashMap::new();
@@ -436,6 +474,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &sv,
+                None,
             ).await;
 
             if let Ok(output) = result {

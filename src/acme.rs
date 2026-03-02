@@ -14,6 +14,18 @@ use hyper_util::rt::TokioIo;
 use serde_json;
 
 pub async fn issue_cert(email: &str, domain: &str, ssl_dir: &Path) -> Result<()> {
+    if domain.contains('*') {
+        return Err(anyhow!(
+            "Wildcard certificates (e.g. *.example.com) require DNS-01 validation \
+             which ruph does not support. Use certbot with a DNS plugin instead:\n  \
+             certbot certonly --dns-<provider> -d \"{}\" -d \"{}\"\n\
+             Then copy fullchain.pem and privkey.pem to {}/",
+            domain,
+            domain.trim_start_matches("*."),
+            ssl_dir.join(domain).display()
+        ));
+    }
+
     let domain_dir = ssl_dir.join(domain);
     std::fs::create_dir_all(&domain_dir)?;
 
@@ -27,13 +39,23 @@ pub async fn issue_cert(email: &str, domain: &str, ssl_dir: &Path) -> Result<()>
     let auth = auths.get(0).ok_or_else(|| anyhow!("No authorization"))?;
     let challenge = auth.challenges.iter()
         .find(|c| c.r#type == ChallengeType::Http01)
-        .ok_or_else(|| anyhow!("HTTP-01 challenge not offered"))?;
+        .ok_or_else(|| anyhow!("HTTP-01 challenge not offered for {}. Available: {:?}",
+            domain,
+            auth.challenges.iter().map(|c| format!("{:?}", c.r#type)).collect::<Vec<_>>()
+        ))?;
 
     let token = challenge.token.clone();
     let key_auth = order.key_authorization(challenge).as_str().to_string();
 
+    // Bind the challenge listener NOW so port conflicts fail immediately
     info!("Starting temporary HTTP-01 challenge server on :80 for {}", domain);
-    let handle = tokio::spawn(run_challenge_server(token.clone(), key_auth.clone()));
+    let challenge_listener = TcpListener::bind("0.0.0.0:80").await
+        .map_err(|e| anyhow!(
+            "Cannot bind ACME challenge server to :80 ({}).\n\
+             Port 80 must be free for HTTP-01 validation. Stop nginx/ruph first, or use certbot.",
+            e
+        ))?;
+    let handle = tokio::spawn(run_challenge_server(challenge_listener, token.clone(), key_auth.clone()));
 
     order.set_challenge_ready(&challenge.url).await?;
 
@@ -101,8 +123,7 @@ async fn create_or_load_account(email: &str, ssl_dir: &Path) -> Result<Account> 
     Ok(account)
 }
 
-async fn run_challenge_server(token: String, key_auth: String) -> Result<()> {
-    let listener = TcpListener::bind("0.0.0.0:80").await?;
+async fn run_challenge_server(listener: TcpListener, token: String, key_auth: String) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let token = token.clone();

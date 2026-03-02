@@ -29,7 +29,8 @@ Arguments:
   [DOCROOT]  Root directory to serve
 
 Options:
-      --bind <BIND>            Bind address [default: 0.0.0.0:8082]
+      --bind-https <ADDR>      HTTPS bind address (default from config)
+      --bind-http <ADDR>       Optional plain-HTTP bind address
   -c, --config <FILE>          Configuration file (INI format)
       --new-cert <NEW_CERT>    Generate ACME/Let's Encrypt cert: email@domain.com,example.com
       --list-certs             List known certificates and exit

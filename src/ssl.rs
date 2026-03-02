@@ -1,14 +1,18 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use rustls::ServerConfig;
-use rustls::server::ResolvesServerCertUsingSni;
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::server::ServerSessionMemoryCache;
+use rustls::crypto::ring::Ticketer;
 use rustls::sign::CertifiedKey;
 use rustls::crypto::ring::sign::any_supported_type;
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer};
-use tracing::warn;
+use tracing::debug;
 
 pub fn default_ssl_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
@@ -17,11 +21,53 @@ pub fn default_ssl_dir() -> PathBuf {
     PathBuf::from(".ruph").join("ssl")
 }
 
+/// SNI cert resolver with wildcard fallback.
+/// Tries exact match first, then `*.parent.domain`.
+#[derive(Debug)]
+struct WildcardCertResolver {
+    certs: HashMap<String, Arc<CertifiedKey>>,
+}
+
+impl WildcardCertResolver {
+    fn new() -> Self {
+        Self { certs: HashMap::new() }
+    }
+
+    fn add(&mut self, name: &str, cert_key: CertifiedKey) {
+        self.certs.insert(name.to_lowercase(), Arc::new(cert_key));
+    }
+
+    fn len(&self) -> usize {
+        self.certs.len()
+    }
+}
+
+impl ResolvesServerCert for WildcardCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let sni = client_hello.server_name()?.to_lowercase();
+
+        // Exact match
+        if let Some(ck) = self.certs.get(&sni) {
+            return Some(ck.clone());
+        }
+
+        // Wildcard: lists.nyphp.org -> *.nyphp.org
+        if let Some(dot) = sni.find('.') {
+            let wildcard = format!("*.{}", &sni[dot + 1..]);
+            if let Some(ck) = self.certs.get(&wildcard) {
+                debug!("Wildcard cert match: {} -> {}", sni, wildcard);
+                return Some(ck.clone());
+            }
+        }
+
+        None
+    }
+}
+
 pub fn build_tls_config(ssl_dir: &Path) -> Result<ServerConfig> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let mut resolver = ResolvesServerCertUsingSni::new();
-    let mut count = 0usize;
+    let mut resolver = WildcardCertResolver::new();
 
     if ssl_dir.exists() {
         for entry in std::fs::read_dir(ssl_dir)? {
@@ -32,21 +78,27 @@ pub fn build_tls_config(ssl_dir: &Path) -> Result<ServerConfig> {
             }
             if let Some(domain) = path.file_name().and_then(|s| s.to_str()) {
                 if let Ok(cert_key) = load_cert_key(&path) {
-                    if resolver.add(domain, cert_key).is_ok() {
-                        count += 1;
-                    }
+                    resolver.add(domain, cert_key);
                 }
             }
         }
     }
 
-    if count == 0 {
+    if resolver.len() == 0 {
         return Err(anyhow!("No TLS certificates found in {}", ssl_dir.display()));
     }
 
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
-        .with_cert_resolver(std::sync::Arc::new(resolver));
+        .with_cert_resolver(Arc::new(resolver));
+
+    // Enable and tune TLS session resumption for lower reconnect latency.
+    config.ticketer = Ticketer::new()
+        .map_err(|e| anyhow!("Failed to initialize TLS ticketing: {}", e))?;
+    config.session_storage = ServerSessionMemoryCache::new(4096);
+
+    // Prefer HTTP/2 when supported by clients; allow HTTP/1.1 fallback.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(config)
 }
@@ -112,7 +164,7 @@ pub fn warn_expiring(ssl_dir: &Path, days: i64) {
             if let Ok(expiry) = cert_expiry(&cert_path) {
                 if expiry <= threshold {
                     if let Some(domain) = path.file_name().and_then(|s| s.to_str()) {
-                        warn!("TLS certificate for {} expires on {}", domain, expiry);
+                        eprintln!("  WARNING: TLS certificate for {} expires on {}", domain, expiry);
                     }
                 }
             }
