@@ -6,8 +6,6 @@ use tracing::{error, info, warn};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{body::Incoming as IncomingBody, Request, Response, StatusCode};
-use http_body_util::Full;
-use bytes::Bytes;
 use std::convert::Infallible;
 use tokio::net::TcpListener;
 use hyper_util::rt::TokioIo;
@@ -20,9 +18,9 @@ mod config;
 mod ssl;
 mod acme;
 
-use crate::web_server::WebServer;
+use crate::web_server::{WebServer, RuphBody};
 
-type ResponseBody = Full<Bytes>;
+type ResponseBody = RuphBody;
 
 #[derive(Parser, Debug)]
 #[command(name = "ruph")]
@@ -51,6 +49,10 @@ struct Cli {
     /// Enable TLS (uses certs from ~/.ruph/ssl)
     #[arg(long, default_value_t = false)]
     tls: bool,
+
+    /// PHP binary to use (e.g. php-cgi, /usr/local/bin/php-cgi). Overrides config file.
+    #[arg(long, value_name = "BINARY")]
+    php_binary: Option<String>,
 
     /// Log level (error, warn, info, debug, trace)
     #[arg(long, default_value = "info")]
@@ -130,12 +132,15 @@ async fn main() -> Result<()> {
         .iter()
         .map(|(k, v)| (k.clone(), std::path::PathBuf::from(v)))
         .collect();
+    // CLI --php-binary overrides config file php.binary
+    let php_binary = cli.php_binary.clone().or(cfg.php_binary.clone());
+
     let web_server = Arc::new(WebServer::new(
         root_dir,
         domain_roots,
         cfg.index_files.clone(),
         cfg.php_mode.clone(),
-        cfg.php_binary.clone(),
+        php_binary,
     )?);
 
     let listener = TcpListener::bind(addr).await?;
@@ -222,7 +227,7 @@ async fn handle_request(
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .header("content-type", "text/plain")
-                .body(Full::new(Bytes::from("Internal Server Error")))
+                .body(RuphBody::full("Internal Server Error"))
                 .unwrap()
         }
     };

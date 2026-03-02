@@ -90,11 +90,20 @@ impl EmbeddedPhpProcessor {
             current_pos = match_obj.end();
         }
         
+        // PHP-only file with no closing ?> — treat everything after <?php as statements.
+        if current_pos == 0 {
+            if let Some(rest) = code.trim_start().strip_prefix("<?php") {
+                let php_output = self.execute_php_statements(rest.trim(), context)?;
+                output.push_str(&php_output);
+                return Ok(output);
+            }
+        }
+
         // Add remaining HTML content
         if current_pos < code.len() {
             output.push_str(&code[current_pos..]);
         }
-        
+
         Ok(output)
     }
     

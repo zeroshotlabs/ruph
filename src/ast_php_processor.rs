@@ -134,7 +134,7 @@ impl AstPhpProcessor {
         // If no PHP tags were found but code contains a PHP open tag without closing,
         // treat the whole file as PHP (common when the closing tag is omitted).
         if !found_tag && code.contains("<?php") {
-            let php_output = self.execute_php_ast_php_only(code).await?;
+            let php_output = self.execute_php_ast(code).await?;
             return Ok(php_output);
         }
 
@@ -190,6 +190,7 @@ impl AstPhpProcessor {
         Ok(output)
     }
 
+    #[allow(dead_code)]
     async fn execute_php_ast_php_only(&mut self, php_code: &str) -> Result<String> {
         let mut code = php_code.to_string();
         if let Some(pos) = code.find("<?php") {

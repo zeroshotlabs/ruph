@@ -12,10 +12,10 @@ use tracing::info;
 /// PHP processor selection mode
 #[derive(Debug, Clone, PartialEq)]
 pub enum PhpMode {
-    /// AST -> embedded -> libphp (default)
+    /// AST -> embedded -> cgi (default)
     Auto,
     /// External PHP binary first, then AST -> embedded
-    Libphp,
+    Cgi,
     /// AST only (no fallback to external)
     Ast,
     /// Embedded regex processor only
@@ -25,7 +25,7 @@ pub enum PhpMode {
 impl PhpMode {
     fn from_str(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
-            "libphp" | "external" | "php" => PhpMode::Libphp,
+            "cgi" | "external" | "php" => PhpMode::Cgi,
             "ast" => PhpMode::Ast,
             "embedded" | "regex" => PhpMode::Embedded,
             _ => PhpMode::Auto,
@@ -126,6 +126,11 @@ impl Config {
 
         // [php]
         if let Some(v) = ini.get("php", "processor") {
+            if v.trim().eq_ignore_ascii_case("libphp") {
+                return Err(anyhow!(
+                    "php.processor=libphp is not implemented. Use php.processor=cgi and set php.binary to a php-cgi binary."
+                ));
+            }
             config.php_mode = PhpMode::from_str(&v);
         }
         if let Some(v) = ini.get("php", "binary") {

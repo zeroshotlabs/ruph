@@ -9,7 +9,7 @@ foreach( [1,2,3] as $v )
 echo "path: " . $_SERVER['REQUEST_URI'] . "\n";
 
 
-$name = 'hans';
+$name = 'hello';
 
 echo $name;
 echo var_dump($name);
