@@ -5,10 +5,15 @@
 //! It supports common PHP features like echo, variables, basic functions, and superglobals.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use anyhow::Result;
 use tracing::debug;
 use regex::Regex;
 use chrono::{DateTime, Utc};
+
+static PHP_TAG_RE: OnceLock<Regex> = OnceLock::new();
+static IF_RE: OnceLock<Regex> = OnceLock::new();
+static FOREACH_RE: OnceLock<Regex> = OnceLock::new();
 
 /// Simple embedded PHP processor
 pub struct EmbeddedPhpProcessor {
@@ -72,8 +77,8 @@ impl EmbeddedPhpProcessor {
         let mut current_pos = 0;
         
         // Find PHP tags (both <?php and short tags)
-        let php_tag_regex = Regex::new(r"<\?(?:php)?\s*(.*?)\?>").unwrap();
-        
+        let php_tag_regex = PHP_TAG_RE.get_or_init(|| Regex::new(r"(?s)<\?(?:php)?\s*(.*?)\?>").unwrap());
+
         for cap in php_tag_regex.captures_iter(code) {
             let match_obj = cap.get(0).unwrap();
             
@@ -147,26 +152,34 @@ impl EmbeddedPhpProcessor {
     
     /// Parse echo statement
     fn parse_echo_statement(&self, statement: &str) -> Result<Option<String>> {
-        let echo_regex = Regex::new(r"^\s*echo\s+(.+)$").unwrap();
-        
-        if let Some(cap) = echo_regex.captures(statement) {
-            Ok(Some(cap.get(1).unwrap().as_str().to_string()))
-        } else {
-            Ok(None)
+        let s = statement.trim_start();
+        if let Some(rest) = s.strip_prefix("echo") {
+            if rest.starts_with(|c: char| c.is_whitespace()) {
+                return Ok(Some(rest.trim().to_string()));
+            }
         }
+        Ok(None)
     }
     
     /// Parse variable assignment
     fn parse_assignment(&self, statement: &str) -> Result<Option<(String, String)>> {
-        let assign_regex = Regex::new(r"^\s*\$(\w+)\s*=\s*(.+)$").unwrap();
-        
-        if let Some(cap) = assign_regex.captures(statement) {
-            let var_name = cap.get(1).unwrap().as_str().to_string();
-            let var_value = cap.get(2).unwrap().as_str().to_string();
-            Ok(Some((var_name, var_value)))
-        } else {
-            Ok(None)
+        let s = statement.trim_start();
+        if let Some(rest) = s.strip_prefix('$') {
+            if let Some(eq_pos) = rest.find('=') {
+                // Skip == and === comparison operators
+                if rest.as_bytes().get(eq_pos + 1) == Some(&b'=') {
+                    return Ok(None);
+                }
+                let name = rest[..eq_pos].trim();
+                if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    let value = rest[eq_pos + 1..].trim().to_string();
+                    if !value.is_empty() {
+                        return Ok(Some((name.to_string(), value)));
+                    }
+                }
+            }
         }
+        Ok(None)
     }
     
     /// Evaluate PHP expression
@@ -214,46 +227,49 @@ impl EmbeddedPhpProcessor {
     
     /// Parse superglobal array access like $_GET['key']
     fn parse_superglobal_access(&self, expr: &str, context: &PhpContext) -> Result<Option<String>> {
-        let superglobal_regex = Regex::new(r#"^\$(_[A-Z]+)\[['"](.*)['"]]\]?$"#).unwrap();
-        
-        if let Some(cap) = superglobal_regex.captures(expr) {
-            let superglobal_name = cap.get(1).unwrap().as_str();
-            let key = cap.get(2).unwrap().as_str();
-            
-            if let Some(superglobal) = context.get_superglobal(superglobal_name) {
-                if let Some(value) = superglobal.get(key) {
-                    return Ok(Some(value.clone()));
+        let s = expr.trim();
+        // Match $_ followed by uppercase letters, then ['key'] or ["key"]
+        if let Some(rest) = s.strip_prefix("$_") {
+            if let Some(bracket_pos) = rest.find('[') {
+                let name_part = &rest[..bracket_pos];
+                if !name_part.is_empty() && name_part.chars().all(|c| c.is_ascii_uppercase()) {
+                    let full_name = format!("_{}", name_part);
+                    let inner = rest[bracket_pos + 1..].trim_end_matches(']');
+                    let key = inner.trim_matches(|c| c == '\'' || c == '"');
+                    if let Some(superglobal) = context.get_superglobal(&full_name) {
+                        if let Some(value) = superglobal.get(key) {
+                            return Ok(Some(value.clone()));
+                        }
+                    }
+                    return Ok(Some("Unknown".to_string()));
                 }
             }
-            // Return "Unknown" for missing superglobal values
-            return Ok(Some("Unknown".to_string()));
         }
-        
         Ok(None)
     }
     
     /// Parse function call
     fn parse_function_call(&self, expr: &str, context: &PhpContext) -> Result<Option<String>> {
-        let func_regex = Regex::new(r"^(\w+)\((.*?)\)$").unwrap();
-        
-        if let Some(cap) = func_regex.captures(expr) {
-            let func_name = cap.get(1).unwrap().as_str();
-            let args_str = cap.get(2).unwrap().as_str();
-            
-            // Parse arguments (simplified)
-            let args: Vec<String> = if args_str.trim().is_empty() {
-                Vec::new()
-            } else {
-                args_str.split(',').map(|arg| {
-                    self.evaluate_expression(arg.trim(), context).unwrap_or_default()
-                }).collect()
-            };
-            
-            if let Some(func) = self.builtin_functions.get(func_name) {
-                return Ok(Some(func(&args)));
+        let s = expr.trim();
+        if let Some(paren_pos) = s.find('(') {
+            let name = &s[..paren_pos];
+            if !name.is_empty()
+                && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && s.ends_with(')')
+            {
+                let args_str = &s[paren_pos + 1..s.len() - 1];
+                let args: Vec<String> = if args_str.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    args_str.split(',').map(|arg| {
+                        self.evaluate_expression(arg.trim(), context).unwrap_or_default()
+                    }).collect()
+                };
+                if let Some(func) = self.builtin_functions.get(name) {
+                    return Ok(Some(func(&args)));
+                }
             }
         }
-        
         Ok(None)
     }
     
@@ -335,7 +351,7 @@ impl EmbeddedPhpProcessor {
     
     /// Handle if statements with endif
     fn handle_if_statement(&self, code: &str, context: &mut PhpContext) -> Result<Option<String>> {
-        let if_regex = Regex::new(r"(?s)if\s*\(\s*(.+?)\s*\)\s*:(.*?)endif").unwrap();
+        let if_regex = IF_RE.get_or_init(|| Regex::new(r"(?s)if\s*\(\s*(.+?)\s*\)\s*:(.*?)endif").unwrap());
         
         if let Some(cap) = if_regex.captures(code) {
             let condition = cap.get(1).unwrap().as_str();
@@ -356,7 +372,7 @@ impl EmbeddedPhpProcessor {
     
     /// Handle foreach loops with endforeach
     fn handle_foreach_loop(&self, code: &str, context: &mut PhpContext) -> Result<Option<String>> {
-        let foreach_regex = Regex::new(r"(?s)foreach\s*\(\s*(.+?)\s+as\s+(.+?)\s*\)\s*:(.*?)endforeach").unwrap();
+        let foreach_regex = FOREACH_RE.get_or_init(|| Regex::new(r"(?s)foreach\s*\(\s*(.+?)\s+as\s+(.+?)\s*\)\s*:(.*?)endforeach").unwrap());
         
         if let Some(cap) = foreach_regex.captures(code) {
             let array_expr = cap.get(1).unwrap().as_str();

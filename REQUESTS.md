@@ -47,9 +47,11 @@ During top-down middleware execution, request handling stops immediately when a 
 
 - non-200 status, or
 - `Location` header present, or
-- (body/content alone does not short-circuit).
+- **non-empty response body** (middleware produced output).
 
 If none short-circuit, normal static/script resolution continues.
+
+A `_index.php` that wants to pass through to the next directory or to normal file resolution must produce **no output** (empty body, status 200, no Location header).
 
 Code: `should_short_circuit_middleware`, `run_directory_index_chain`.
 
@@ -128,10 +130,12 @@ Current behavior:
 1. Middleware phase executes top-down:
    - `/<docroot>/_index.php`
    - `/static/_index.php`
-2. If none short-circuit, target resolution chooses existing static file `/static/img.gif`.
-3. Static file is served.
+2. If `/static/_index.php` produces **any output**, it short-circuits — the static file is **not** served.
+3. If `/static/_index.php` produces **no output** (empty body, 200, no Location), target resolution proceeds and serves `/static/img.gif`.
 
-If `/static/img.gif` does not exist:
+This means a `_index.php` that wants to intercept all requests under its directory (including requests that map to real files) just needs to produce output. To pass through transparently, it must produce no output.
+
+If `/static/img.gif` does not exist and no middleware short-circuited:
 
 - Fallback is root init script (`/<docroot>/_index.php`), not nearest-ancestor `/static/_index.php`.
 

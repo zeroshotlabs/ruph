@@ -365,6 +365,17 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Shared hyper connection builder with tuned H2 window sizes.
+/// 1 MiB initial windows mean the first response fits in one window
+/// without waiting for flow-control ACKs, reducing TTFB on larger pages.
+fn http_builder() -> AutoBuilder<TokioExecutor> {
+    let mut b = AutoBuilder::new(TokioExecutor::new());
+    b.http2()
+        .initial_stream_window_size(1024 * 1024)
+        .initial_connection_window_size(2 * 1024 * 1024);
+    b
+}
+
 /// Serve a single TCP connection, optionally upgrading to TLS.
 async fn serve_connection(
     stream: tokio::net::TcpStream,
@@ -377,6 +388,13 @@ async fn serve_connection(
 ) {
     stats.connection_opened();
     let conn_stats = stats.clone();
+
+    // Disable Nagle's algorithm so TLS handshake packets are sent immediately
+    // rather than being buffered waiting for more data. Material impact on
+    // handshake latency (can save 40ms+ on some networks).
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!("Failed to set TCP_NODELAY: {}", e);
+    }
 
     if let Some(config) = tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(config);
@@ -399,7 +417,7 @@ async fn serve_connection(
                     let sp = status_page_path.clone();
                     async move { handle_request(req, ws, remote_addr, Some(sni), dl, st, sp).await }
                 });
-                let builder = AutoBuilder::new(TokioExecutor::new());
+                let builder = http_builder();
                 if let Err(err) = builder.serve_connection(io, service).await {
                     error!("[{}] TLS error from {}: {}", sni, remote_addr, err);
                 }
@@ -417,7 +435,7 @@ async fn serve_connection(
             let sp = status_page_path.clone();
             async move { handle_request(req, ws, remote_addr, None, dl, st, sp).await }
         });
-        let builder = AutoBuilder::new(TokioExecutor::new());
+        let builder = http_builder();
         if let Err(err) = builder.serve_connection(io, service).await {
             error!("Error serving connection from {}: {}", remote_addr, err);
         }

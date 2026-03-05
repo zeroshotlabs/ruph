@@ -6,12 +6,15 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use async_recursion::async_recursion;
 use anyhow::{Result, anyhow};
 use tracing::{debug, warn};
 use tree_sitter::{Parser, Node};
 use tree_sitter_php;
 use regex::Regex;
+
+static PHP_TAG_RE: OnceLock<Regex> = OnceLock::new();
 use tokio::fs;
 use reqwest::Client;
 use serde_json::Value as JsonValue;
@@ -105,7 +108,7 @@ impl AstPhpProcessor {
         let mut current_pos = 0;
 
         // Find PHP tags (both <?php ... ?> and <?= ... ?>)
-        let php_tag_regex = Regex::new(r"(?s)<\?(php|=)?(.*?)\?>").unwrap();
+        let php_tag_regex = PHP_TAG_RE.get_or_init(|| Regex::new(r"(?s)<\?(php|=)?(.*?)\?>").unwrap());
 
         let mut found_tag = false;
 

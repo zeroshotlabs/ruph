@@ -35,13 +35,18 @@ if (!function_exists('exe')) {
         $docroot = !empty($_SERVER['DOCUMENT_ROOT']) ? $_SERVER['DOCUMENT_ROOT']
                  : (!empty($_ENV['DOCUMENT_ROOT']) ? $_ENV['DOCUMENT_ROOT']
                  : (getenv('DOCUMENT_ROOT') ?: getcwd()));
-        // Resolve relative to docroot
-        if ($path[0] !== '/') {
-            $full = $docroot . '/' . $path;
+        // If $path is already an absolute filesystem path, use it directly;
+        // otherwise resolve relative to docroot.
+        if ($path[0] === '/') {
+            $direct = realpath($path);
+            if ($direct !== false && (is_file($direct) || is_dir($direct))) {
+                $real = $direct;
+            } else {
+                $real = realpath($docroot . $path);
+            }
         } else {
-            $full = $docroot . $path;
+            $real = realpath($docroot . '/' . $path);
         }
-        $real = realpath($full);
         if ($real === false) {
             trigger_error("exe: path not found: $path", E_USER_WARNING);
             return '';
@@ -262,8 +267,10 @@ impl PhpProcessor {
             .output().await
             .map_err(|e| anyhow!("Failed to execute PHP: {}", e))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8(output.stdout)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+        let stderr_bytes = output.stderr;
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         for line in stderr.lines() {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
@@ -298,7 +305,8 @@ impl PhpProcessor {
             .output().await
             .map_err(|e| anyhow!("Failed to execute PHP: {}", e))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stdout = String::from_utf8(output.stdout)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

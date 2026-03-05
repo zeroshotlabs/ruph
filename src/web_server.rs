@@ -49,6 +49,15 @@ impl RuphBody {
     pub fn streaming(rx: mpsc::Receiver<Result<Bytes, io::Error>>) -> Self {
         RuphBody::Streaming(rx)
     }
+
+    /// Returns true if the body is known to be empty (non-streaming with zero bytes).
+    pub fn is_empty(&self) -> bool {
+        match self {
+            RuphBody::Full(None) => true,
+            RuphBody::Full(Some(b)) => b.is_empty(),
+            RuphBody::Streaming(_) => false, // assume non-empty if streaming
+        }
+    }
 }
 
 impl Body for RuphBody {
@@ -90,8 +99,12 @@ pub struct WebServer {
     domain_roots: HashMap<String, PathBuf>,
     /// Prefix-based docroot overrides (e.g. "www" matches "www.*")
     prefix_roots: Vec<(String, PathBuf)>,
+    /// Pre-canonicalized versions of all configured root dirs (raw -> canonical)
+    canonical_roots: HashMap<PathBuf, PathBuf>,
     /// Ordered list of filenames to try when a directory is requested
     index_files: Vec<String>,
+    /// Cached first PHP index file name (used as middleware entry point every request)
+    middleware_index: String,
     /// PHP processor mode (controls execution order)
     php_mode: PhpMode,
     /// AST-based PHP processor
@@ -181,6 +194,23 @@ impl WebServer {
             },
         };
 
+        // Pre-canonicalize all configured roots so resolve_file_path() doesn't do it per request.
+        let mut canonical_roots: HashMap<PathBuf, PathBuf> = HashMap::new();
+        for root in std::iter::once(&root_dir)
+            .chain(domain_roots.values())
+            .chain(prefix_roots.iter().map(|(_, r)| r))
+        {
+            if let Ok(canonical) = root.canonicalize() {
+                canonical_roots.insert(root.clone(), canonical);
+            }
+        }
+
+        let middleware_index = index_files
+            .iter()
+            .find(|name| name.ends_with(".php"))
+            .cloned()
+            .unwrap_or_else(|| "_index.php".to_string());
+
         if ast_php_processor.is_none() && embedded_php_processor.is_none() && php_processor.is_none() {
             warn!("No PHP processors available. PHP files will be served as static content.");
         } else {
@@ -207,7 +237,9 @@ impl WebServer {
             root_dir,
             domain_roots,
             prefix_roots,
+            canonical_roots,
             index_files,
+            middleware_index,
             php_mode,
             ast_php_processor,
             embedded_php_processor,
@@ -274,11 +306,7 @@ impl WebServer {
 
     /// Middleware index name: first configured PHP index file, defaulting to `_index.php`.
     fn middleware_index_name(&self) -> &str {
-        self.index_files
-            .iter()
-            .find(|name| name.ends_with(".php"))
-            .map(|s| s.as_str())
-            .unwrap_or("_index.php")
+        &self.middleware_index
     }
 
     /// Build the top-down directory chain for a request path.
@@ -436,9 +464,12 @@ impl WebServer {
             root.join(clean_path)
         };
 
-        // Ensure the resolved path is within the root directory
-        let canonical_root = root.canonicalize()
-            .map_err(|_| anyhow!("Cannot canonicalize root directory"))?;
+        // Ensure the resolved path is within the root directory.
+        // Use the pre-canonicalized root if available (common case); fall back to computing it.
+        let canonical_root = self.canonical_roots.get(root)
+            .cloned()
+            .or_else(|| root.canonicalize().ok())
+            .ok_or_else(|| anyhow!("Cannot canonicalize root directory"))?;
 
         if let Ok(canonical_file) = file_path.canonicalize() {
             if !canonical_file.starts_with(&canonical_root) {
@@ -879,6 +910,11 @@ impl WebServer {
         if resp.headers().contains_key("location") {
             return true;
         }
+        // If the middleware produced body content, use it as the final response.
+        // A _index.php that wants to pass through should produce no output.
+        if !resp.body().is_empty() {
+            return true;
+        }
         false
     }
 
@@ -1094,6 +1130,6 @@ mod tests {
             .status(StatusCode::OK)
             .body(RuphBody::full("body from middleware"))
             .unwrap();
-        assert!(!WebServer::should_short_circuit_middleware(&ok_with_body));
+        assert!(WebServer::should_short_circuit_middleware(&ok_with_body));
     }
 }
