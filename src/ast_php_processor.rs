@@ -20,6 +20,15 @@ use reqwest::Client;
 use serde_json::Value as JsonValue;
 
 /// AST-based PHP processor using tree-sitter-php
+/// A stored user-defined PHP function
+#[derive(Clone, Debug)]
+struct PhpFunction {
+    /// Parameter names (without $) and optional default values
+    params: Vec<(String, Option<PhpValue>)>,
+    /// The raw source code of the function body (between { and })
+    body_source: String,
+}
+
 pub struct AstPhpProcessor {
     parser: Parser,
     source_code: String,
@@ -35,6 +44,10 @@ pub struct AstPhpProcessor {
     included_files: HashSet<PathBuf>,
     output_buffers: Vec<String>,
     side_effect_output: Option<String>,
+    /// User-defined functions: name -> PhpFunction
+    user_functions: HashMap<String, PhpFunction>,
+    /// Constants defined via define()
+    constants: HashMap<String, PhpValue>,
 }
 
 impl AstPhpProcessor {
@@ -63,6 +76,24 @@ impl AstPhpProcessor {
             included_files: HashSet::new(),
             output_buffers: Vec::new(),
             side_effect_output: None,
+            user_functions: HashMap::new(),
+            constants: {
+                let mut c = HashMap::new();
+                c.insert("PATHINFO_DIRNAME".to_string(), PhpValue::Int(1));
+                c.insert("PATHINFO_BASENAME".to_string(), PhpValue::Int(2));
+                c.insert("PATHINFO_EXTENSION".to_string(), PhpValue::Int(4));
+                c.insert("PATHINFO_FILENAME".to_string(), PhpValue::Int(8));
+                c.insert("PHP_EOL".to_string(), PhpValue::String("\n".to_string()));
+                c.insert("PHP_INT_MAX".to_string(), PhpValue::Int(i64::MAX));
+                c.insert("PHP_INT_MIN".to_string(), PhpValue::Int(i64::MIN));
+                c.insert("DIRECTORY_SEPARATOR".to_string(), PhpValue::String("/".to_string()));
+                c.insert("PHP_SAPI".to_string(), PhpValue::String("ruph-ast".to_string()));
+                c.insert("PHP_VERSION".to_string(), PhpValue::String("8.4.0-ruph".to_string()));
+                c.insert("TRUE".to_string(), PhpValue::Bool(true));
+                c.insert("FALSE".to_string(), PhpValue::Bool(false));
+                c.insert("NULL".to_string(), PhpValue::Null);
+                c
+            },
         })
     }
 
@@ -92,8 +123,18 @@ impl AstPhpProcessor {
         // Prepare the output buffer
         let mut output = String::new();
 
-        // Process the PHP code
-        self.process_php_code(php_code, &mut output).await?;
+        // Process the PHP code — catch exit/die as normal termination
+        match self.process_php_code(php_code, &mut output).await {
+            Ok(_) => {}
+            Err(e) => {
+                if e.downcast_ref::<PhpExit>().is_some() {
+                    // exit/die is normal PHP termination — not an error
+                    debug!("PHP script called exit");
+                } else {
+                    return Err(e);
+                }
+            }
+        }
 
         let body = self.response_body_override.clone().unwrap_or(output);
         Ok(PhpExecution {
@@ -262,7 +303,6 @@ impl AstPhpProcessor {
                 self.append_output(output, &text.to_string());
             }
             "echo_statement" => {
-                // Handle echo statements (argument_list or direct expressions)
                 let mut handled = false;
                 for child in node.named_children(&mut node.walk()) {
                     if child.kind() == "argument_list" {
@@ -297,15 +337,69 @@ impl AstPhpProcessor {
                 }
                 return Ok(ControlFlow::Break(()));
             }
+            // ── exit / die ──────────────────────────────────────────────
+            "exit_statement" => {
+                // exit; or exit(code); or die; or die(msg);
+                let code = if let Some(child) = node.named_child(0) {
+                    let val = self.evaluate_expression(child).await?;
+                    match val {
+                        PhpValue::Int(n) => n as i32,
+                        PhpValue::String(s) => {
+                            // exit("message") outputs the message first
+                            self.append_output(output, &s);
+                            0
+                        }
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+                return Err(anyhow!(PhpExit { code }));
+            }
             "assignment_expression" => {
-                // Handle variable assignments
                 let left = node.child_by_field_name("left");
                 let right = node.child_by_field_name("right");
                 if let (Some(left), Some(right)) = (left, right) {
-                    if let Some(var_name) = self.get_identifier(left) {
-                        let value = self.evaluate_expression(right).await?;
-                        self.variables.insert(var_name, value);
+                    let value = self.evaluate_expression(right).await?;
+                    self.assign_to(left, value).await?;
+                }
+            }
+            // ── augmented assignment (+=, -=, .=, etc.) ─────────────────
+            "augmented_assignment_expression" => {
+                let left = node.child_by_field_name("left");
+                let right = node.child_by_field_name("right");
+                let operator = {
+                    let source = self.source_code.as_bytes();
+                    let mut op = String::new();
+                    for i in 0..node.child_count() {
+                        if let Some(child) = node.child(i) {
+                            if !child.is_named() {
+                                let text = child.utf8_text(source).unwrap_or("");
+                                if text.ends_with('=') && text.len() >= 2 {
+                                    op = text.to_string();
+                                    break;
+                                }
+                            }
+                        }
                     }
+                    op
+                };
+                if let (Some(left), Some(right)) = (left, right) {
+                    let left_val = self.evaluate_expression(left).await?;
+                    let right_val = self.evaluate_expression(right).await?;
+                    let result = match operator.as_str() {
+                        "+=" => PhpValue::Float(left_val.as_float() + right_val.as_float()),
+                        "-=" => PhpValue::Float(left_val.as_float() - right_val.as_float()),
+                        "*=" => PhpValue::Float(left_val.as_float() * right_val.as_float()),
+                        "/=" => {
+                            let d = right_val.as_float();
+                            if d == 0.0 { PhpValue::Bool(false) } else { PhpValue::Float(left_val.as_float() / d) }
+                        }
+                        ".=" => PhpValue::String(format!("{}{}", left_val.as_string(), right_val.as_string())),
+                        "??=" => if left_val.is_null() { right_val } else { left_val },
+                        _ => right_val,
+                    };
+                    self.assign_to(left, result).await?;
                 }
             }
             "variable" => {
@@ -313,9 +407,15 @@ impl AstPhpProcessor {
                 self.append_output(output, &value.as_string());
             }
             "function_call_expression" => {
-                let _ = self.evaluate_expression(node).await?;
+                let value = self.evaluate_expression(node).await?;
                 if let Some(out) = self.take_side_effect_output() {
                     self.append_output(output, &out);
+                } else {
+                    // Some function calls may produce output directly (like user functions with echo)
+                    let s = value.as_string();
+                    if !s.is_empty() && !matches!(value, PhpValue::Null) {
+                        // Don't output function return values implicitly from statements
+                    }
                 }
             }
             "expression_statement" => {
@@ -325,12 +425,71 @@ impl AstPhpProcessor {
                         self.append_output(output, &out);
                     } else {
                         let rendered = value.as_string();
-                        if !rendered.is_empty() {
-                            self.append_output(output, &rendered);
+                        if !rendered.is_empty() && !matches!(value, PhpValue::Null) {
+                            // Only expression_statement auto-outputs for non-null non-function values
+                            // (matches PHP behavior where bare expressions don't output)
                         }
                     }
                 }
             }
+            // ── if / else / elseif ──────────────────────────────────────
+            "if_statement" => {
+                return self.process_if_statement(node, output).await;
+            }
+            // ── while loop ──────────────────────────────────────────────
+            "while_statement" => {
+                let condition = node.child_by_field_name("condition")
+                    .or_else(|| node.child_by_field_name("test"));
+                let body = node.child_by_field_name("body");
+
+                if let (Some(condition), Some(body)) = (condition, body) {
+                    let mut iterations = 0;
+                    loop {
+                        let cond_val = self.evaluate_expression(condition).await?;
+                        if !cond_val.is_truthy() { break; }
+                        let flow = self.process_node(body, output).await?;
+                        if let ControlFlow::Break(()) = flow { return Ok(flow); }
+                        iterations += 1;
+                        if iterations > 100_000 {
+                            warn!("while loop exceeded 100k iterations, breaking");
+                            break;
+                        }
+                    }
+                }
+            }
+            // ── for loop ────────────────────────────────────────────────
+            "for_statement" => {
+                // for (init; condition; update) { body }
+                // tree-sitter-php field names: initializer, condition, update, body
+                let init = node.child_by_field_name("initializer");
+                let condition = node.child_by_field_name("condition");
+                let update = node.child_by_field_name("update");
+                let body = node.child_by_field_name("body");
+
+                if let Some(init) = init {
+                    self.evaluate_expression(init).await?;
+                }
+                let mut iterations = 0;
+                loop {
+                    if let Some(condition) = condition {
+                        let cond_val = self.evaluate_expression(condition).await?;
+                        if !cond_val.is_truthy() { break; }
+                    }
+                    if let Some(body) = body {
+                        let flow = self.process_node(body, output).await?;
+                        if let ControlFlow::Break(()) = flow { return Ok(flow); }
+                    }
+                    if let Some(update) = update {
+                        self.evaluate_expression(update).await?;
+                    }
+                    iterations += 1;
+                    if iterations > 100_000 {
+                        warn!("for loop exceeded 100k iterations, breaking");
+                        break;
+                    }
+                }
+            }
+            // ── foreach ─────────────────────────────────────────────────
             "foreach_statement" => {
                 let mut collection_node = node.child_by_field_name("collection")
                     .or_else(|| node.child_by_field_name("value"));
@@ -359,7 +518,7 @@ impl AstPhpProcessor {
                     let collection_value = self.evaluate_expression(collection).await?;
                     if let PhpValue::Array(items) = collection_value {
                         for (index, item) in items.iter().enumerate() {
-                            if var_nodes.len() >= 1 {
+                            if !var_nodes.is_empty() {
                                 if let Some(value_name) = self.get_identifier(var_nodes[var_nodes.len() - 1]) {
                                     let value = match item {
                                         PhpArrayItem::KeyValue(_, value) => value.clone(),
@@ -378,12 +537,93 @@ impl AstPhpProcessor {
                                 }
                             }
 
-                            let _ = self.process_node(body, output).await?;
+                            let flow = self.process_node(body, output).await?;
+                            if let ControlFlow::Break(()) = flow { return Ok(flow); }
                         }
                     }
                 }
             }
+            // ── switch ──────────────────────────────────────────────────
+            "switch_statement" => {
+                let test = node.child_by_field_name("value")
+                    .or_else(|| node.child_by_field_name("condition"));
+                if let Some(test) = test {
+                    let test_val = self.evaluate_expression(test).await?;
+                    let body = node.child_by_field_name("body");
+                    if let Some(body) = body {
+                        let mut matched = false;
+                        let mut fell_through = false;
+                        for child in body.named_children(&mut body.walk()) {
+                            match child.kind() {
+                                "switch_case" => {
+                                    if !fell_through {
+                                        if let Some(value_node) = child.child_by_field_name("value") {
+                                            let case_val = self.evaluate_expression(value_node).await?;
+                                            if test_val.loose_eq(&case_val) {
+                                                matched = true;
+                                            }
+                                        }
+                                    }
+                                    if matched || fell_through {
+                                        fell_through = true;
+                                        for stmt in child.named_children(&mut child.walk()) {
+                                            if stmt.kind() == "break_statement" {
+                                                fell_through = false;
+                                                matched = false;
+                                                break;
+                                            }
+                                            let flow = self.process_node(stmt, output).await?;
+                                            if let ControlFlow::Break(()) = flow { return Ok(flow); }
+                                        }
+                                    }
+                                }
+                                "switch_default" => {
+                                    if !matched {
+                                        for stmt in child.named_children(&mut child.walk()) {
+                                            if stmt.kind() == "break_statement" { break; }
+                                            let flow = self.process_node(stmt, output).await?;
+                                            if let ControlFlow::Break(()) = flow { return Ok(flow); }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            // ── function definition ─────────────────────────────────────
+            "function_definition" => {
+                let name_node = node.child_by_field_name("name");
+                let params_node = node.child_by_field_name("parameters");
+                let body_node = node.child_by_field_name("body");
 
+                if let (Some(name_node), Some(body_node)) = (name_node, body_node) {
+                    let func_name = name_node.utf8_text(self.source_code.as_bytes())?.to_string();
+                    let body_source = body_node.utf8_text(self.source_code.as_bytes())?.to_string();
+
+                    let mut params = Vec::new();
+                    if let Some(params_node) = params_node {
+                        for child in params_node.named_children(&mut params_node.walk()) {
+                            if child.kind() == "simple_parameter" || child.kind() == "parameter" {
+                                if let Some(name) = child.child_by_field_name("name") {
+                                    let pname = name.utf8_text(self.source_code.as_bytes())?
+                                        .trim_start_matches('$').to_string();
+                                    let default = if let Some(def) = child.child_by_field_name("default_value") {
+                                        Some(self.evaluate_expression(def).await?)
+                                    } else {
+                                        None
+                                    };
+                                    params.push((pname, default));
+                                }
+                            }
+                        }
+                    }
+
+                    self.user_functions.insert(func_name, PhpFunction { params, body_source });
+                }
+            }
+            // ── include / require ───────────────────────────────────────
             "include_expression" | "require_expression" | "include_once_expression" | "require_once_expression" => {
                 let is_once = node.kind().contains("_once");
                 let target = node.child_by_field_name("path")
@@ -394,6 +634,17 @@ impl AstPhpProcessor {
                     let include_output = self.include_file(&value.as_string(), is_once).await?;
                     self.append_output(output, &include_output);
                 }
+            }
+            // ── compound statement (block) ──────────────────────────────
+            "compound_statement" => {
+                for child in node.named_children(&mut node.walk()) {
+                    let flow = self.process_node(child, output).await?;
+                    if let ControlFlow::Break(()) = flow { return Ok(flow); }
+                }
+            }
+            // ── break / continue (within loops) ─────────────────────────
+            "break_statement" | "continue_statement" => {
+                return Ok(ControlFlow::Break(()));
             }
             _ => {
                 // Recursively process child nodes
@@ -429,6 +680,156 @@ impl AstPhpProcessor {
                     self.append_output(output, &out);
                 }
                 self.append_output(output, &value.as_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Process if/elseif/else statement
+    #[async_recursion]
+    async fn process_if_statement(&mut self, node: Node<'async_recursion>, output: &mut String) -> Result<ControlFlow<()>> {
+        // Evaluate the condition
+        let condition = node.child_by_field_name("condition");
+        let body = node.child_by_field_name("body");
+        let alternative = node.child_by_field_name("alternative");
+
+        let cond_result = if let Some(condition) = condition {
+            let val = self.evaluate_expression(condition).await?;
+            val.is_truthy()
+        } else {
+            // Fallback: walk children to find parenthesized_expression before body
+            let mut result = false;
+            for child in node.named_children(&mut node.walk()) {
+                if child.kind() == "parenthesized_expression" {
+                    let val = self.evaluate_expression(child).await?;
+                    result = val.is_truthy();
+                    break;
+                }
+            }
+            result
+        };
+
+        if cond_result {
+            if let Some(body) = body {
+                return self.process_node(body, output).await;
+            }
+            // Alternative: process first compound_statement child
+            for child in node.named_children(&mut node.walk()) {
+                if child.kind() == "compound_statement" {
+                    return self.process_node(child, output).await;
+                }
+            }
+        } else if let Some(alt) = alternative {
+            // else or elseif
+            match alt.kind() {
+                "else_clause" => {
+                    if let Some(body) = alt.child_by_field_name("body") {
+                        return self.process_node(body, output).await;
+                    }
+                    // Fallback: process all named children of else clause
+                    for child in alt.named_children(&mut alt.walk()) {
+                        let flow = self.process_node(child, output).await?;
+                        if let ControlFlow::Break(()) = flow { return Ok(flow); }
+                    }
+                }
+                "else_if_clause" | "if_statement" => {
+                    return self.process_if_statement(alt, output).await;
+                }
+                _ => {
+                    return self.process_node(alt, output).await;
+                }
+            }
+        } else {
+            // No alternative matched — check for else_clause / else_if_clause as children
+            let mut found_else = false;
+            for child in node.named_children(&mut node.walk()) {
+                if found_else {
+                    // Already past else_clause header, process subsequent nodes
+                }
+                match child.kind() {
+                    "else_clause" => {
+                        for inner in child.named_children(&mut child.walk()) {
+                            let flow = self.process_node(inner, output).await?;
+                            if let ControlFlow::Break(()) = flow { return Ok(flow); }
+                        }
+                        found_else = true;
+                    }
+                    "else_if_clause" => {
+                        return self.process_if_statement(child, output).await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// Assign a value to a left-hand side (variable, subscript, etc.)
+    async fn assign_to(&mut self, left: Node<'_>, value: PhpValue) -> Result<()> {
+        match left.kind() {
+            "variable" | "variable_name" => {
+                if let Some(var_name) = self.get_identifier(left) {
+                    self.variables.insert(var_name, value);
+                }
+            }
+            "subscript_expression" => {
+                // $arr['key'] = value or $arr[] = value
+                let target = left.child_by_field_name("value")
+                    .or_else(|| left.child_by_field_name("array"))
+                    .or_else(|| left.named_child(0));
+                let index = left.child_by_field_name("index")
+                    .or_else(|| left.child_by_field_name("offset"))
+                    .or_else(|| left.named_child(1));
+
+                if let Some(target) = target {
+                    let target_name = if let Some(id) = self.get_identifier(target) {
+                        id
+                    } else {
+                        target.utf8_text(self.source_code.as_bytes())?.trim_start_matches('$').to_string()
+                    };
+
+                    if let Some(index) = index {
+                        let key = self.evaluate_expression(index).await?.as_string();
+
+                        // Update existing array or create new one
+                        let mut arr = if let Some(PhpValue::Array(items)) = self.variables.get(&target_name) {
+                            items.clone()
+                        } else {
+                            Vec::new()
+                        };
+
+                        // Replace existing key or append
+                        let mut replaced = false;
+                        for item in arr.iter_mut() {
+                            if let PhpArrayItem::KeyValue(k, v) = item {
+                                if k == &key {
+                                    *v = value.clone();
+                                    replaced = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !replaced {
+                            arr.push(PhpArrayItem::KeyValue(key, value));
+                        }
+                        self.variables.insert(target_name, PhpValue::Array(arr));
+                    } else {
+                        // $arr[] = value (append)
+                        let mut arr = if let Some(PhpValue::Array(items)) = self.variables.get(&target_name) {
+                            items.clone()
+                        } else {
+                            Vec::new()
+                        };
+                        arr.push(PhpArrayItem::Value(value));
+                        self.variables.insert(target_name, PhpValue::Array(arr));
+                    }
+                }
+            }
+            _ => {
+                if let Some(var_name) = self.get_identifier(left) {
+                    self.variables.insert(var_name, value);
+                }
             }
         }
         Ok(())
@@ -509,6 +910,9 @@ impl AstPhpProcessor {
             }
             "name" => {
                 if let Some(id) = self.get_identifier(node) {
+                    if let Some(val) = self.constants.get(&id) {
+                        return Ok(val.clone());
+                    }
                     return Ok(PhpValue::String(id));
                 }
                 return Ok(PhpValue::Null);
@@ -523,9 +927,16 @@ impl AstPhpProcessor {
                     .map_err(|_| anyhow!("Failed to get text"))?;
                 Ok(PhpValue::String(text.trim_matches(|c| c == '\'' || c == '"').to_string()))
             }
-            "integer" | "float" => Ok(node.utf8_text(self.source_code.as_bytes())
-                .map_err(|_| anyhow!("Failed to get number"))?
-                .to_string().into()),
+            "integer" => {
+                let text = node.utf8_text(self.source_code.as_bytes())
+                    .map_err(|_| anyhow!("Failed to get number"))?;
+                Ok(PhpValue::Int(text.parse::<i64>().unwrap_or(0)))
+            }
+            "float" => {
+                let text = node.utf8_text(self.source_code.as_bytes())
+                    .map_err(|_| anyhow!("Failed to get number"))?;
+                Ok(PhpValue::Float(text.parse::<f64>().unwrap_or(0.0)))
+            }
             "variable" => {
                 let var_name = node.utf8_text(self.source_code.as_bytes())?
                     .trim_start_matches('$').to_string();
@@ -592,14 +1003,169 @@ impl AstPhpProcessor {
                         .to_string()
                 };
                 if let (Some(left), Some(right)) = (left, right) {
+                    // Short-circuit for logical operators
+                    if operator == "&&" || operator == "and" {
+                        let left_val = self.evaluate_expression(left).await?;
+                        if !left_val.is_truthy() { return Ok(PhpValue::Bool(false)); }
+                        let right_val = self.evaluate_expression(right).await?;
+                        return Ok(PhpValue::Bool(right_val.is_truthy()));
+                    }
+                    if operator == "||" || operator == "or" {
+                        let left_val = self.evaluate_expression(left).await?;
+                        if left_val.is_truthy() { return Ok(PhpValue::Bool(true)); }
+                        let right_val = self.evaluate_expression(right).await?;
+                        return Ok(PhpValue::Bool(right_val.is_truthy()));
+                    }
+                    if operator == "??" {
+                        let left_val = self.evaluate_expression(left).await?;
+                        if !left_val.is_null() { return Ok(left_val); }
+                        return self.evaluate_expression(right).await;
+                    }
+
                     let left_val = self.evaluate_expression(left).await?;
                     let right_val = self.evaluate_expression(right).await?;
-                    if operator == "." {
-                        return Ok(PhpValue::String(format!("{}{}", left_val.as_string(), right_val.as_string())));
+
+                    match operator.as_str() {
+                        "." => Ok(PhpValue::String(format!("{}{}", left_val.as_string(), right_val.as_string()))),
+                        // Comparison
+                        "==" => Ok(PhpValue::Bool(left_val.loose_eq(&right_val))),
+                        "!=" | "<>" => Ok(PhpValue::Bool(!left_val.loose_eq(&right_val))),
+                        "===" => Ok(PhpValue::Bool(left_val.strict_eq(&right_val))),
+                        "!==" => Ok(PhpValue::Bool(!left_val.strict_eq(&right_val))),
+                        "<" => Ok(PhpValue::Bool(left_val.as_float() < right_val.as_float())),
+                        ">" => Ok(PhpValue::Bool(left_val.as_float() > right_val.as_float())),
+                        "<=" => Ok(PhpValue::Bool(left_val.as_float() <= right_val.as_float())),
+                        ">=" => Ok(PhpValue::Bool(left_val.as_float() >= right_val.as_float())),
+                        // Arithmetic
+                        "+" => Ok(PhpValue::Float(left_val.as_float() + right_val.as_float())),
+                        "-" => Ok(PhpValue::Float(left_val.as_float() - right_val.as_float())),
+                        "*" => Ok(PhpValue::Float(left_val.as_float() * right_val.as_float())),
+                        "/" => {
+                            let d = right_val.as_float();
+                            if d == 0.0 { Ok(PhpValue::Bool(false)) }
+                            else { Ok(PhpValue::Float(left_val.as_float() / d)) }
+                        }
+                        "%" => {
+                            let d = right_val.as_int();
+                            if d == 0 { Ok(PhpValue::Bool(false)) }
+                            else { Ok(PhpValue::Int(left_val.as_int() % d)) }
+                        }
+                        "**" => Ok(PhpValue::Float(left_val.as_float().powf(right_val.as_float()))),
+                        // Bitwise
+                        "&" => Ok(PhpValue::Int(left_val.as_int() & right_val.as_int())),
+                        "|" => Ok(PhpValue::Int(left_val.as_int() | right_val.as_int())),
+                        "^" => Ok(PhpValue::Int(left_val.as_int() ^ right_val.as_int())),
+                        "<<" => Ok(PhpValue::Int(left_val.as_int() << right_val.as_int())),
+                        ">>" => Ok(PhpValue::Int(left_val.as_int() >> right_val.as_int())),
+                        // instanceof
+                        "instanceof" => Ok(PhpValue::Bool(false)), // stub
+                        _ => Ok(PhpValue::Null),
+                    }
+                } else {
+                    Ok(PhpValue::Null)
+                }
+            }
+            // ── unary operators ──────────────────────────────────────────
+            "unary_op_expression" => {
+                let operand = node.named_child(0);
+                let operator = {
+                    let source = self.source_code.as_bytes();
+                    let mut op = String::new();
+                    for i in 0..node.child_count() {
+                        if let Some(child) = node.child(i) {
+                            if !child.is_named() {
+                                op = child.utf8_text(source).unwrap_or("").to_string();
+                                break;
+                            }
+                        }
+                    }
+                    op
+                };
+                if let Some(operand) = operand {
+                    let val = self.evaluate_expression(operand).await?;
+                    match operator.as_str() {
+                        "!" => Ok(PhpValue::Bool(!val.is_truthy())),
+                        "-" => Ok(PhpValue::Float(-val.as_float())),
+                        "+" => Ok(PhpValue::Float(val.as_float())),
+                        "~" => Ok(PhpValue::Int(!val.as_int())),
+                        _ => Ok(val),
+                    }
+                } else {
+                    Ok(PhpValue::Null)
+                }
+            }
+            // ── ternary / conditional ────────────────────────────────────
+            "conditional_expression" | "ternary_expression" => {
+                let condition = node.child_by_field_name("condition")
+                    .or_else(|| node.named_child(0));
+                let if_true = node.child_by_field_name("body")
+                    .or_else(|| node.named_child(1));
+                let if_false = node.child_by_field_name("alternative")
+                    .or_else(|| node.named_child(2));
+
+                if let Some(condition) = condition {
+                    let cond_val = self.evaluate_expression(condition).await?;
+                    if cond_val.is_truthy() {
+                        if let Some(if_true) = if_true {
+                            return self.evaluate_expression(if_true).await;
+                        }
+                        // Short ternary: $a ?: $b
+                        return Ok(cond_val);
+                    } else if let Some(if_false) = if_false {
+                        return self.evaluate_expression(if_false).await;
                     }
                 }
                 Ok(PhpValue::Null)
             }
+            // ── cast expressions ─────────────────────────────────────────
+            "cast_expression" => {
+                let cast_type = node.child_by_field_name("type")
+                    .and_then(|n| n.utf8_text(self.source_code.as_bytes()).ok())
+                    .unwrap_or("")
+                    .to_string();
+                let value = if let Some(operand) = node.child_by_field_name("value").or_else(|| node.named_child(0)) {
+                    self.evaluate_expression(operand).await?
+                } else {
+                    PhpValue::Null
+                };
+                match cast_type.trim().to_lowercase().as_str() {
+                    "int" | "integer" => Ok(PhpValue::Int(value.as_int())),
+                    "float" | "double" | "real" => Ok(PhpValue::Float(value.as_float())),
+                    "string" => Ok(PhpValue::String(value.as_string())),
+                    "bool" | "boolean" => Ok(PhpValue::Bool(value.is_truthy())),
+                    "array" => Ok(match value {
+                        PhpValue::Array(_) => value,
+                        _ => PhpValue::Array(vec![PhpArrayItem::Value(value)]),
+                    }),
+                    _ => Ok(value),
+                }
+            }
+            // ── update expressions (++$i, $i++) ──────────────────────────
+            "update_expression" => {
+                // Find the variable and whether it's prefix or postfix
+                let source = self.source_code.as_bytes();
+                let raw = node.utf8_text(source)?.to_string();
+                let is_increment = raw.contains("++");
+                if let Some(var_node) = node.named_child(0) {
+                    let val = self.evaluate_expression(var_node).await?;
+                    let new_val = if is_increment {
+                        PhpValue::Int(val.as_int() + 1)
+                    } else {
+                        PhpValue::Int(val.as_int() - 1)
+                    };
+                    let is_prefix = raw.starts_with("++") || raw.starts_with("--");
+                    self.assign_to(var_node, new_val.clone()).await?;
+                    if is_prefix { Ok(new_val) } else { Ok(val) }
+                } else {
+                    Ok(PhpValue::Null)
+                }
+            }
+            // ── boolean literals ─────────────────────────────────────────
+            "boolean" | "true" | "false" => {
+                let text = node.utf8_text(self.source_code.as_bytes())?.to_lowercase();
+                Ok(PhpValue::Bool(text == "true"))
+            }
+            "null" => Ok(PhpValue::Null),
             "text_interpolation" => {
                 let mut out = String::new();
                 for child in node.named_children(&mut node.walk()) {
@@ -790,7 +1356,819 @@ impl AstPhpProcessor {
                 }
                 Ok(PhpValue::Null)
             }
-            _ => Ok(PhpValue::Null),
+
+            // ── exit / die (as function call) ───────────────────────────
+            "exit" | "die" => {
+                let code = args.first().map(|a| {
+                    match a {
+                        PhpValue::Int(n) => *n as i32,
+                        PhpValue::String(s) => {
+                            self.side_effect_output = Some(s.clone());
+                            0
+                        }
+                        _ => 0,
+                    }
+                }).unwrap_or(0);
+                return Err(anyhow!(PhpExit { code }));
+            }
+
+            // ── http_response_code ──────────────────────────────────────
+            "http_response_code" => {
+                if let Some(code) = args.first() {
+                    if let Ok(status) = code.as_string().parse::<u16>() {
+                        self.response_status = status;
+                    }
+                }
+                Ok(PhpValue::Int(self.response_status as i64))
+            }
+
+            // ── readfile ────────────────────────────────────────────────
+            "readfile" => {
+                if let Some(target) = args.first() {
+                    let path_str = target.as_string();
+                    let path = self.resolve_local_path(&path_str)?;
+                    let content = fs::read_to_string(&path).await
+                        .map_err(|_| anyhow!("readfile: cannot read {}", path.display()))?;
+                    self.side_effect_output = Some(content.clone());
+                    return Ok(PhpValue::Int(content.len() as i64));
+                }
+                Ok(PhpValue::Bool(false))
+            }
+
+            // ── Type checking ───────────────────────────────────────────
+            "isset" => {
+                Ok(PhpValue::Bool(args.iter().all(|a| !a.is_null())))
+            }
+            "empty" => {
+                Ok(PhpValue::Bool(args.first().map_or(true, |a| a.is_empty_value())))
+            }
+            "is_null" => {
+                Ok(PhpValue::Bool(args.first().map_or(true, |a| a.is_null())))
+            }
+            "is_array" => {
+                Ok(PhpValue::Bool(matches!(args.first(), Some(PhpValue::Array(_)))))
+            }
+            "is_string" => {
+                Ok(PhpValue::Bool(matches!(args.first(), Some(PhpValue::String(_)))))
+            }
+            "is_numeric" => {
+                Ok(PhpValue::Bool(args.first().map_or(false, |a| {
+                    matches!(a, PhpValue::Int(_) | PhpValue::Float(_)) ||
+                    matches!(a, PhpValue::String(s) if s.parse::<f64>().is_ok())
+                })))
+            }
+            "is_int" | "is_integer" | "is_long" => {
+                Ok(PhpValue::Bool(matches!(args.first(), Some(PhpValue::Int(_)))))
+            }
+            "is_bool" => {
+                Ok(PhpValue::Bool(matches!(args.first(), Some(PhpValue::Bool(_)))))
+            }
+            "gettype" => {
+                let t = match args.first() {
+                    Some(PhpValue::Null) | None => "NULL",
+                    Some(PhpValue::Bool(_)) => "boolean",
+                    Some(PhpValue::Int(_)) => "integer",
+                    Some(PhpValue::Float(_)) => "double",
+                    Some(PhpValue::String(_)) => "string",
+                    Some(PhpValue::Array(_)) => "array",
+                };
+                Ok(PhpValue::String(t.to_string()))
+            }
+
+            // ── String functions ─────────────────────────────────────────
+            "strlen" => Ok(PhpValue::Int(args.first().map_or(0, |a| a.as_string().len() as i64))),
+            "strtolower" => Ok(PhpValue::String(args.first().map_or(String::new(), |a| a.as_string().to_lowercase()))),
+            "strtoupper" => Ok(PhpValue::String(args.first().map_or(String::new(), |a| a.as_string().to_uppercase()))),
+            "trim" => {
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                let chars = args.get(1).map(|a| a.as_string());
+                Ok(PhpValue::String(match chars {
+                    Some(c) => s.trim_matches(|ch: char| c.contains(ch)).to_string(),
+                    None => s.trim().to_string(),
+                }))
+            }
+            "ltrim" => Ok(PhpValue::String(args.first().map_or(String::new(), |a| a.as_string().trim_start().to_string()))),
+            "rtrim" | "chop" => Ok(PhpValue::String(args.first().map_or(String::new(), |a| a.as_string().trim_end().to_string()))),
+            "substr" => {
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                let start = args.get(1).map_or(0, |a| a.as_int()) as usize;
+                let len = args.get(2).map(|a| a.as_int() as usize);
+                let chars: Vec<char> = s.chars().collect();
+                let start = start.min(chars.len());
+                let end = len.map_or(chars.len(), |l| (start + l).min(chars.len()));
+                Ok(PhpValue::String(chars[start..end].iter().collect()))
+            }
+            "str_replace" => {
+                let search = args.first().map_or(String::new(), |a| a.as_string());
+                let replace = args.get(1).map_or(String::new(), |a| a.as_string());
+                let subject = args.get(2).map_or(String::new(), |a| a.as_string());
+                Ok(PhpValue::String(subject.replace(&search, &replace)))
+            }
+            "str_contains" => {
+                let haystack = args.first().map_or(String::new(), |a| a.as_string());
+                let needle = args.get(1).map_or(String::new(), |a| a.as_string());
+                Ok(PhpValue::Bool(haystack.contains(&needle)))
+            }
+            "str_starts_with" => {
+                let haystack = args.first().map_or(String::new(), |a| a.as_string());
+                let needle = args.get(1).map_or(String::new(), |a| a.as_string());
+                Ok(PhpValue::Bool(haystack.starts_with(&needle)))
+            }
+            "str_ends_with" => {
+                let haystack = args.first().map_or(String::new(), |a| a.as_string());
+                let needle = args.get(1).map_or(String::new(), |a| a.as_string());
+                Ok(PhpValue::Bool(haystack.ends_with(&needle)))
+            }
+            "strpos" | "stripos" => {
+                let haystack = args.first().map_or(String::new(), |a| a.as_string());
+                let needle = args.get(1).map_or(String::new(), |a| a.as_string());
+                let (h, n) = if func_name == "stripos" {
+                    (haystack.to_lowercase(), needle.to_lowercase())
+                } else {
+                    (haystack, needle)
+                };
+                match h.find(&n) {
+                    Some(pos) => Ok(PhpValue::Int(pos as i64)),
+                    None => Ok(PhpValue::Bool(false)),
+                }
+            }
+            "strrpos" => {
+                let haystack = args.first().map_or(String::new(), |a| a.as_string());
+                let needle = args.get(1).map_or(String::new(), |a| a.as_string());
+                match haystack.rfind(&needle) {
+                    Some(pos) => Ok(PhpValue::Int(pos as i64)),
+                    None => Ok(PhpValue::Bool(false)),
+                }
+            }
+            "explode" => {
+                let delimiter = args.first().map_or(String::new(), |a| a.as_string());
+                let string = args.get(1).map_or(String::new(), |a| a.as_string());
+                let limit = args.get(2).map(|a| a.as_int());
+                let parts: Vec<&str> = match limit {
+                    Some(n) if n > 0 => string.splitn(n as usize, &delimiter).collect(),
+                    _ => string.split(&delimiter).collect(),
+                };
+                let items: Vec<PhpArrayItem> = parts.into_iter()
+                    .map(|s| PhpArrayItem::Value(PhpValue::String(s.to_string())))
+                    .collect();
+                Ok(PhpValue::Array(items))
+            }
+            "implode" | "join" => {
+                let glue = args.first().map_or(String::new(), |a| a.as_string());
+                let empty_arr = PhpValue::Array(vec![]);
+                let pieces = args.get(1).unwrap_or(&empty_arr);
+                if let PhpValue::Array(items) = pieces {
+                    let strs: Vec<String> = items.iter().map(|item| match item {
+                        PhpArrayItem::KeyValue(_, v) => v.as_string(),
+                        PhpArrayItem::Value(v) => v.as_string(),
+                    }).collect();
+                    Ok(PhpValue::String(strs.join(&glue)))
+                } else {
+                    Ok(PhpValue::String(String::new()))
+                }
+            }
+            "sprintf" => {
+                // Basic sprintf: only handles %s, %d, %f, %% for now
+                let fmt = args.first().map_or(String::new(), |a| a.as_string());
+                let mut arg_idx = 1;
+                let mut i = 0;
+                let chars: Vec<char> = fmt.chars().collect();
+                let mut out = String::new();
+                while i < chars.len() {
+                    if chars[i] == '%' && i + 1 < chars.len() {
+                        match chars[i + 1] {
+                            's' => { out.push_str(&args.get(arg_idx).map_or(String::new(), |a| a.as_string())); arg_idx += 1; i += 2; }
+                            'd' => { out.push_str(&args.get(arg_idx).map_or(0, |a| a.as_int()).to_string()); arg_idx += 1; i += 2; }
+                            'f' => { out.push_str(&format!("{:.6}", args.get(arg_idx).map_or(0.0, |a| a.as_float()))); arg_idx += 1; i += 2; }
+                            '%' => { out.push('%'); i += 2; }
+                            _ => { out.push(chars[i]); i += 1; }
+                        }
+                    } else {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                Ok(PhpValue::String(out))
+            }
+            "nl2br" => {
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                Ok(PhpValue::String(s.replace('\n', "<br />\n")))
+            }
+            "htmlspecialchars" | "htmlentities" => {
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                Ok(PhpValue::String(s
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('"', "&quot;")
+                    .replace('\'', "&#039;")))
+            }
+            "htmlspecialchars_decode" => {
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                Ok(PhpValue::String(s
+                    .replace("&amp;", "&")
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&quot;", "\"")
+                    .replace("&#039;", "'")))
+            }
+            "urlencode" => {
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                Ok(PhpValue::String(urlencoding::encode(&s).to_string()))
+            }
+            "urldecode" => {
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                Ok(PhpValue::String(urlencoding::decode(&s).unwrap_or_default().to_string()))
+            }
+            "rawurlencode" => {
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                Ok(PhpValue::String(urlencoding::encode(&s).to_string()))
+            }
+            "rawurldecode" => {
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                Ok(PhpValue::String(urlencoding::decode(&s).unwrap_or_default().to_string()))
+            }
+            "ucfirst" => {
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                let mut c = s.chars();
+                Ok(PhpValue::String(match c.next() {
+                    None => String::new(),
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                }))
+            }
+            "lcfirst" => {
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                let mut c = s.chars();
+                Ok(PhpValue::String(match c.next() {
+                    None => String::new(),
+                    Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
+                }))
+            }
+            "str_repeat" => {
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                let n = args.get(1).map_or(0, |a| a.as_int().max(0)) as usize;
+                Ok(PhpValue::String(s.repeat(n)))
+            }
+            "str_pad" => {
+                let input = args.first().map_or(String::new(), |a| a.as_string());
+                let length = args.get(1).map_or(0, |a| a.as_int()) as usize;
+                let pad = args.get(2).map_or(" ".to_string(), |a| a.as_string());
+                if input.len() >= length || pad.is_empty() {
+                    Ok(PhpValue::String(input))
+                } else {
+                    let needed = length - input.len();
+                    let padding: String = pad.chars().cycle().take(needed).collect();
+                    Ok(PhpValue::String(format!("{}{}", input, padding)))
+                }
+            }
+            "md5" => {
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                Ok(PhpValue::String(format!("{:x}", md5_hash(s.as_bytes()))))
+            }
+            "number_format" => {
+                let num = args.first().map_or(0.0, |a| a.as_float());
+                let decimals = args.get(1).map_or(0, |a| a.as_int()) as usize;
+                Ok(PhpValue::String(format!("{:.prec$}", num, prec = decimals)))
+            }
+            "intval" | "int" => Ok(PhpValue::Int(args.first().map_or(0, |a| a.as_int()))),
+            "floatval" | "doubleval" => Ok(PhpValue::Float(args.first().map_or(0.0, |a| a.as_float()))),
+            "strval" => Ok(PhpValue::String(args.first().map_or(String::new(), |a| a.as_string()))),
+            "boolval" => Ok(PhpValue::Bool(args.first().map_or(false, |a| a.is_truthy()))),
+
+            // ── Array functions ──────────────────────────────────────────
+            "count" | "sizeof" => {
+                Ok(PhpValue::Int(args.first().map_or(0, |a| a.count()) as i64))
+            }
+            "array_keys" => {
+                if let Some(PhpValue::Array(items)) = args.first() {
+                    let keys: Vec<PhpArrayItem> = items.iter().enumerate().map(|(i, item)| {
+                        let key = match item {
+                            PhpArrayItem::KeyValue(k, _) => k.clone(),
+                            PhpArrayItem::Value(_) => i.to_string(),
+                        };
+                        PhpArrayItem::Value(PhpValue::String(key))
+                    }).collect();
+                    Ok(PhpValue::Array(keys))
+                } else {
+                    Ok(PhpValue::Array(vec![]))
+                }
+            }
+            "array_values" => {
+                if let Some(PhpValue::Array(items)) = args.first() {
+                    let values: Vec<PhpArrayItem> = items.iter().map(|item| {
+                        let val = match item {
+                            PhpArrayItem::KeyValue(_, v) => v.clone(),
+                            PhpArrayItem::Value(v) => v.clone(),
+                        };
+                        PhpArrayItem::Value(val)
+                    }).collect();
+                    Ok(PhpValue::Array(values))
+                } else {
+                    Ok(PhpValue::Array(vec![]))
+                }
+            }
+            "in_array" => {
+                let needle = args.first().unwrap_or(&PhpValue::Null);
+                if let Some(PhpValue::Array(items)) = args.get(1) {
+                    let found = items.iter().any(|item| {
+                        let val = match item {
+                            PhpArrayItem::KeyValue(_, v) => v,
+                            PhpArrayItem::Value(v) => v,
+                        };
+                        needle.loose_eq(val)
+                    });
+                    Ok(PhpValue::Bool(found))
+                } else {
+                    Ok(PhpValue::Bool(false))
+                }
+            }
+            "array_key_exists" => {
+                let key = args.first().map_or(String::new(), |a| a.as_string());
+                if let Some(PhpValue::Array(items)) = args.get(1) {
+                    let found = items.iter().any(|item| {
+                        matches!(item, PhpArrayItem::KeyValue(k, _) if k == &key)
+                    });
+                    Ok(PhpValue::Bool(found))
+                } else {
+                    Ok(PhpValue::Bool(false))
+                }
+            }
+            "array_merge" => {
+                let mut merged = Vec::new();
+                for arg in &args {
+                    if let PhpValue::Array(items) = arg {
+                        merged.extend(items.clone());
+                    }
+                }
+                Ok(PhpValue::Array(merged))
+            }
+            "array_push" => {
+                // Note: in real PHP this modifies by reference; here we just return
+                if let Some(PhpValue::Array(mut items)) = args.first().cloned() {
+                    for arg in args.iter().skip(1) {
+                        items.push(PhpArrayItem::Value(arg.clone()));
+                    }
+                    Ok(PhpValue::Int(items.len() as i64))
+                } else {
+                    Ok(PhpValue::Bool(false))
+                }
+            }
+            "array_pop" => {
+                // Similar limitation — returns the popped value
+                if let Some(PhpValue::Array(items)) = args.first() {
+                    if let Some(last) = items.last() {
+                        let val = match last {
+                            PhpArrayItem::KeyValue(_, v) => v.clone(),
+                            PhpArrayItem::Value(v) => v.clone(),
+                        };
+                        Ok(val)
+                    } else {
+                        Ok(PhpValue::Null)
+                    }
+                } else {
+                    Ok(PhpValue::Null)
+                }
+            }
+            "array_map" => {
+                // array_map(null, $arr) just returns $arr; callback not supported yet
+                if let Some(PhpValue::Array(items)) = args.get(1) {
+                    Ok(PhpValue::Array(items.clone()))
+                } else {
+                    Ok(PhpValue::Array(vec![]))
+                }
+            }
+            "array_slice" => {
+                if let Some(PhpValue::Array(items)) = args.first() {
+                    let offset = args.get(1).map_or(0, |a| a.as_int().max(0)) as usize;
+                    let length = args.get(2).map(|a| a.as_int() as usize);
+                    let end = length.map_or(items.len(), |l| (offset + l).min(items.len()));
+                    let offset = offset.min(items.len());
+                    Ok(PhpValue::Array(items[offset..end].to_vec()))
+                } else {
+                    Ok(PhpValue::Array(vec![]))
+                }
+            }
+            "array_reverse" => {
+                if let Some(PhpValue::Array(items)) = args.first() {
+                    let mut reversed = items.clone();
+                    reversed.reverse();
+                    Ok(PhpValue::Array(reversed))
+                } else {
+                    Ok(PhpValue::Array(vec![]))
+                }
+            }
+            "array_unique" => {
+                if let Some(PhpValue::Array(items)) = args.first() {
+                    let mut seen = HashSet::new();
+                    let mut unique = Vec::new();
+                    for item in items {
+                        let key = match item {
+                            PhpArrayItem::KeyValue(_, v) => v.as_string(),
+                            PhpArrayItem::Value(v) => v.as_string(),
+                        };
+                        if seen.insert(key) {
+                            unique.push(item.clone());
+                        }
+                    }
+                    Ok(PhpValue::Array(unique))
+                } else {
+                    Ok(PhpValue::Array(vec![]))
+                }
+            }
+            "sort" | "rsort" | "asort" | "arsort" | "ksort" | "krsort" => {
+                // Returns true; actual sort is a no-op since we can't mutate by reference
+                Ok(PhpValue::Bool(true))
+            }
+            "range" => {
+                let start = args.first().map_or(0, |a| a.as_int());
+                let end = args.get(1).map_or(0, |a| a.as_int());
+                let step = args.get(2).map_or(1, |a| a.as_int().max(1));
+                let mut items = Vec::new();
+                let mut i = start;
+                if start <= end {
+                    while i <= end {
+                        items.push(PhpArrayItem::Value(PhpValue::Int(i)));
+                        i += step;
+                    }
+                } else {
+                    while i >= end {
+                        items.push(PhpArrayItem::Value(PhpValue::Int(i)));
+                        i -= step;
+                    }
+                }
+                Ok(PhpValue::Array(items))
+            }
+            "compact" => {
+                let mut items = Vec::new();
+                for arg in &args {
+                    let name = arg.as_string();
+                    let value = self.variables.get(&name).cloned().unwrap_or(PhpValue::Null);
+                    items.push(PhpArrayItem::KeyValue(name, value));
+                }
+                Ok(PhpValue::Array(items))
+            }
+            "extract" => {
+                if let Some(PhpValue::Array(items)) = args.first() {
+                    for item in items {
+                        if let PhpArrayItem::KeyValue(k, v) = item {
+                            self.variables.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                Ok(PhpValue::Null)
+            }
+
+            // ── JSON ────────────────────────────────────────────────────
+            "json_encode" => {
+                let val = args.first().unwrap_or(&PhpValue::Null);
+                Ok(PhpValue::String(php_value_to_json(val)))
+            }
+            "json_decode" => {
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                let assoc = args.get(1).map_or(false, |a| a.is_truthy());
+                match serde_json::from_str::<serde_json::Value>(&s) {
+                    Ok(json) => Ok(json_to_php_value(&json, assoc)),
+                    Err(_) => Ok(PhpValue::Null),
+                }
+            }
+
+            // ── Date/time ───────────────────────────────────────────────
+            "time" => {
+                Ok(PhpValue::Int(chrono::Utc::now().timestamp()))
+            }
+            "microtime" => {
+                let as_float = args.first().map_or(false, |a| a.is_truthy());
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                if as_float {
+                    Ok(PhpValue::Float(now.as_secs_f64()))
+                } else {
+                    let secs = now.as_secs();
+                    let micros = now.subsec_micros();
+                    Ok(PhpValue::String(format!("0.{:06} {}", micros, secs)))
+                }
+            }
+            "strtotime" => {
+                // Simplified: only handles "now" and timestamps
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                if s == "now" || s.is_empty() {
+                    Ok(PhpValue::Int(chrono::Utc::now().timestamp()))
+                } else {
+                    // Try to parse as ISO date
+                    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S") {
+                        Ok(PhpValue::Int(dt.and_utc().timestamp()))
+                    } else if let Ok(d) = chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
+                        Ok(PhpValue::Int(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp()))
+                    } else {
+                        Ok(PhpValue::Bool(false))
+                    }
+                }
+            }
+
+            // ── Filesystem ──────────────────────────────────────────────
+            "file_exists" => {
+                let path_str = args.first().map_or(String::new(), |a| a.as_string());
+                let result = match self.resolve_local_path(&path_str) {
+                    Ok(path) => path.exists(),
+                    Err(_) => false,
+                };
+                Ok(PhpValue::Bool(result))
+            }
+            "is_file" => {
+                let path_str = args.first().map_or(String::new(), |a| a.as_string());
+                let result = match self.resolve_local_path(&path_str) {
+                    Ok(path) => path.is_file(),
+                    Err(_) => false,
+                };
+                Ok(PhpValue::Bool(result))
+            }
+            "is_dir" => {
+                let path_str = args.first().map_or(String::new(), |a| a.as_string());
+                let result = match self.resolve_local_path(&path_str) {
+                    Ok(path) => path.is_dir(),
+                    Err(_) => false,
+                };
+                Ok(PhpValue::Bool(result))
+            }
+            "dirname" => {
+                let path_str = args.first().map_or(String::new(), |a| a.as_string());
+                Ok(PhpValue::String(Path::new(&path_str).parent()
+                    .map_or(String::new(), |p| p.to_string_lossy().to_string())))
+            }
+            "basename" => {
+                let path_str = args.first().map_or(String::new(), |a| a.as_string());
+                Ok(PhpValue::String(Path::new(&path_str).file_name()
+                    .map_or(String::new(), |n| n.to_string_lossy().to_string())))
+            }
+            "pathinfo" => {
+                let path_str = args.first().map_or(String::new(), |a| a.as_string());
+                let flag = args.get(1).map(|a| a.as_int());
+                let p = Path::new(&path_str);
+                match flag {
+                    Some(1) => Ok(PhpValue::String(p.parent().map_or(String::new(), |pp| pp.to_string_lossy().to_string()))),
+                    Some(2) => Ok(PhpValue::String(p.file_name().map_or(String::new(), |n| n.to_string_lossy().to_string()))),
+                    Some(4) => Ok(PhpValue::String(p.extension().map_or(String::new(), |e| e.to_string_lossy().to_string()))),
+                    Some(8) => Ok(PhpValue::String(p.file_stem().map_or(String::new(), |s| s.to_string_lossy().to_string()))),
+                    _ => {
+                        let items = vec![
+                            PhpArrayItem::KeyValue("dirname".to_string(), PhpValue::String(p.parent().map_or(String::new(), |pp| pp.to_string_lossy().to_string()))),
+                            PhpArrayItem::KeyValue("basename".to_string(), PhpValue::String(p.file_name().map_or(String::new(), |n| n.to_string_lossy().to_string()))),
+                            PhpArrayItem::KeyValue("extension".to_string(), PhpValue::String(p.extension().map_or(String::new(), |e| e.to_string_lossy().to_string()))),
+                            PhpArrayItem::KeyValue("filename".to_string(), PhpValue::String(p.file_stem().map_or(String::new(), |s| s.to_string_lossy().to_string()))),
+                        ];
+                        Ok(PhpValue::Array(items))
+                    }
+                }
+            }
+            "realpath" => {
+                let path_str = args.first().map_or(String::new(), |a| a.as_string());
+                match self.resolve_local_path(&path_str) {
+                    Ok(path) => Ok(PhpValue::String(path.to_string_lossy().to_string())),
+                    Err(_) => Ok(PhpValue::Bool(false)),
+                }
+            }
+            "file_put_contents" => {
+                let path_str = args.first().map_or(String::new(), |a| a.as_string());
+                let content = args.get(1).map_or(String::new(), |a| a.as_string());
+                let path = self.resolve_local_path(&path_str)?;
+                fs::write(&path, &content).await
+                    .map_err(|e| anyhow!("file_put_contents: {}", e))?;
+                Ok(PhpValue::Int(content.len() as i64))
+            }
+            "filesize" => {
+                let path_str = args.first().map_or(String::new(), |a| a.as_string());
+                match self.resolve_local_path(&path_str) {
+                    Ok(path) => {
+                        match std::fs::metadata(&path) {
+                            Ok(meta) => Ok(PhpValue::Int(meta.len() as i64)),
+                            Err(_) => Ok(PhpValue::Bool(false)),
+                        }
+                    }
+                    Err(_) => Ok(PhpValue::Bool(false)),
+                }
+            }
+            "glob" => {
+                // Simplified glob using std
+                let pattern = args.first().map_or(String::new(), |a| a.as_string());
+                let root = self.root_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+                let full_pattern = if pattern.starts_with('/') {
+                    root.join(pattern.trim_start_matches('/'))
+                } else {
+                    self.current_template_path.as_ref()
+                        .and_then(|p| p.parent())
+                        .unwrap_or(&root)
+                        .join(&pattern)
+                };
+                let mut items = Vec::new();
+                if let Ok(entries) = ::std::fs::read_dir(full_pattern.parent().unwrap_or(&root)) {
+                    for entry in entries.flatten() {
+                        items.push(PhpArrayItem::Value(PhpValue::String(
+                            entry.path().to_string_lossy().to_string()
+                        )));
+                    }
+                }
+                Ok(PhpValue::Array(items))
+            }
+
+            // ── Math ────────────────────────────────────────────────────
+            "abs" => Ok(PhpValue::Float(args.first().map_or(0.0, |a| a.as_float().abs()))),
+            "ceil" => Ok(PhpValue::Float(args.first().map_or(0.0, |a| a.as_float().ceil()))),
+            "floor" => Ok(PhpValue::Float(args.first().map_or(0.0, |a| a.as_float().floor()))),
+            "round" => {
+                let val = args.first().map_or(0.0, |a| a.as_float());
+                let precision = args.get(1).map_or(0, |a| a.as_int()) as i32;
+                let factor = 10f64.powi(precision);
+                Ok(PhpValue::Float((val * factor).round() / factor))
+            }
+            "max" => {
+                if args.len() == 1 {
+                    if let Some(PhpValue::Array(items)) = args.first() {
+                        let max = items.iter().map(|i| match i {
+                            PhpArrayItem::KeyValue(_, v) => v.as_float(),
+                            PhpArrayItem::Value(v) => v.as_float(),
+                        }).fold(f64::NEG_INFINITY, f64::max);
+                        return Ok(PhpValue::Float(max));
+                    }
+                }
+                let max = args.iter().map(|a| a.as_float()).fold(f64::NEG_INFINITY, f64::max);
+                Ok(PhpValue::Float(max))
+            }
+            "min" => {
+                if args.len() == 1 {
+                    if let Some(PhpValue::Array(items)) = args.first() {
+                        let min = items.iter().map(|i| match i {
+                            PhpArrayItem::KeyValue(_, v) => v.as_float(),
+                            PhpArrayItem::Value(v) => v.as_float(),
+                        }).fold(f64::INFINITY, f64::min);
+                        return Ok(PhpValue::Float(min));
+                    }
+                }
+                let min = args.iter().map(|a| a.as_float()).fold(f64::INFINITY, f64::min);
+                Ok(PhpValue::Float(min))
+            }
+            "rand" | "mt_rand" => {
+                let min = args.first().map_or(0, |a| a.as_int());
+                let max = args.get(1).map_or(i32::MAX as i64, |a| a.as_int());
+                // Simple LCG random — not cryptographic
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos() as i64;
+                let range = (max - min + 1).max(1);
+                Ok(PhpValue::Int(min + (seed.abs() % range)))
+            }
+
+            // ── Regex ───────────────────────────────────────────────────
+            "preg_match" => {
+                let pattern = args.first().map_or(String::new(), |a| a.as_string());
+                let subject = args.get(1).map_or(String::new(), |a| a.as_string());
+                // Strip PHP delimiters: /pattern/flags -> pattern
+                let (pattern, _flags) = strip_php_regex_delimiters(&pattern);
+                match Regex::new(&pattern) {
+                    Ok(re) => {
+                        let matched = re.is_match(&subject);
+                        Ok(PhpValue::Int(if matched { 1 } else { 0 }))
+                    }
+                    Err(_) => Ok(PhpValue::Bool(false)),
+                }
+            }
+            "preg_replace" => {
+                let pattern = args.first().map_or(String::new(), |a| a.as_string());
+                let replacement = args.get(1).map_or(String::new(), |a| a.as_string());
+                let subject = args.get(2).map_or(String::new(), |a| a.as_string());
+                let (pattern, _flags) = strip_php_regex_delimiters(&pattern);
+                match Regex::new(&pattern) {
+                    Ok(re) => Ok(PhpValue::String(re.replace_all(&subject, replacement.as_str()).to_string())),
+                    Err(_) => Ok(PhpValue::String(subject)),
+                }
+            }
+            "preg_split" => {
+                let pattern = args.first().map_or(String::new(), |a| a.as_string());
+                let subject = args.get(1).map_or(String::new(), |a| a.as_string());
+                let (pattern, _flags) = strip_php_regex_delimiters(&pattern);
+                match Regex::new(&pattern) {
+                    Ok(re) => {
+                        let parts: Vec<PhpArrayItem> = re.split(&subject)
+                            .map(|s| PhpArrayItem::Value(PhpValue::String(s.to_string())))
+                            .collect();
+                        Ok(PhpValue::Array(parts))
+                    }
+                    Err(_) => Ok(PhpValue::Array(vec![PhpArrayItem::Value(PhpValue::String(subject))]))
+                }
+            }
+
+            // ── Misc ────────────────────────────────────────────────────
+            "define" => {
+                let name = args.first().map_or(String::new(), |a| a.as_string());
+                let value = args.get(1).cloned().unwrap_or(PhpValue::Null);
+                self.constants.insert(name, value);
+                Ok(PhpValue::Bool(true))
+            }
+            "defined" => {
+                let name = args.first().map_or(String::new(), |a| a.as_string());
+                Ok(PhpValue::Bool(self.constants.contains_key(&name)))
+            }
+            "constant" => {
+                let name = args.first().map_or(String::new(), |a| a.as_string());
+                Ok(self.constants.get(&name).cloned().unwrap_or(PhpValue::Null))
+            }
+            "function_exists" => {
+                let name = args.first().map_or(String::new(), |a| a.as_string());
+                let is_builtin = matches!(name.as_str(),
+                    "echo" | "print" | "isset" | "empty" | "exit" | "die" |
+                    "strlen" | "strtolower" | "strtoupper" | "trim" | "substr" |
+                    "str_replace" | "str_contains" | "explode" | "implode" |
+                    "count" | "array_keys" | "array_values" | "in_array" |
+                    "json_encode" | "json_decode" | "date" | "time" |
+                    "file_exists" | "is_file" | "is_dir" | "readfile" |
+                    "header" | "http_response_code" | "var_dump" | "print_r"
+                );
+                Ok(PhpValue::Bool(is_builtin || self.user_functions.contains_key(&name)))
+            }
+            "print_r" => {
+                let val = args.first().unwrap_or(&PhpValue::Null);
+                let return_output = args.get(1).map_or(false, |a| a.is_truthy());
+                let s = val.dump();
+                if return_output {
+                    Ok(PhpValue::String(s))
+                } else {
+                    self.side_effect_output = Some(s);
+                    Ok(PhpValue::Bool(true))
+                }
+            }
+            "error_log" => {
+                let msg = args.first().map_or(String::new(), |a| a.as_string());
+                warn!("PHP error_log: {}", msg);
+                Ok(PhpValue::Bool(true))
+            }
+            "setcookie" => {
+                // Set-Cookie header
+                let name = args.first().map_or(String::new(), |a| a.as_string());
+                let value = args.get(1).map_or(String::new(), |a| a.as_string());
+                let cookie = format!("{}={}", name, value);
+                self.response_headers.insert("Set-Cookie".to_string(), cookie);
+                Ok(PhpValue::Bool(true))
+            }
+            "session_start" | "session_destroy" | "session_id" => {
+                // Stub — sessions not yet implemented
+                Ok(PhpValue::Bool(true))
+            }
+            "unset" => Ok(PhpValue::Null),
+            "sleep" | "usleep" => Ok(PhpValue::Int(0)),
+            "php_uname" => Ok(PhpValue::String(std::env::consts::OS.to_string())),
+            "php_sapi_name" => Ok(PhpValue::String("ruph-ast".to_string())),
+            "ini_get" | "ini_set" => Ok(PhpValue::String(String::new())),
+            "__DIR__" | "__FILE__" => {
+                Ok(PhpValue::String(self.current_template_path.as_ref()
+                    .and_then(|p| if func_name == "__DIR__" { p.parent().map(|pp| pp.to_path_buf()) } else { Some(p.clone()) })
+                    .map_or(String::new(), |p| p.to_string_lossy().to_string())))
+            }
+
+            // ── User-defined function call ──────────────────────────────
+            _ => {
+                if let Some(user_func) = self.user_functions.get(&func_name).cloned() {
+                    // Set up local scope with parameters
+                    let saved_vars = self.variables.clone();
+                    for (i, (param_name, default)) in user_func.params.iter().enumerate() {
+                        let value = args.get(i).cloned()
+                            .or_else(|| default.clone())
+                            .unwrap_or(PhpValue::Null);
+                        self.variables.insert(param_name.clone(), value);
+                    }
+
+                    // Execute function body
+                    let body_code = format!("<?php {} ?>", user_func.body_source);
+                    let previous_source = self.source_code.clone();
+                    let mut func_output = String::new();
+                    let result = self.process_php_code(&body_code, &mut func_output).await;
+                    self.source_code = previous_source;
+
+                    // Restore outer scope
+                    self.variables = saved_vars;
+
+                    match result {
+                        Ok(_) => {
+                            if let Some(body_override) = self.response_body_override.take() {
+                                // return statement was hit
+                                return Ok(PhpValue::String(body_override));
+                            }
+                            if !func_output.is_empty() {
+                                self.side_effect_output = Some(func_output);
+                            }
+                            Ok(PhpValue::Null)
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    // Check constants
+                    if let Some(val) = self.constants.get(&func_name) {
+                        return Ok(val.clone());
+                    }
+                    debug!("Unknown function: {}", func_name);
+                    Ok(PhpValue::Null)
+                }
+            }
         }
     }
 
@@ -805,6 +2183,7 @@ impl AstPhpProcessor {
         self.included_files.clear();
         self.output_buffers.clear();
         self.side_effect_output = None;
+        // Preserve user_functions and constants across requests (like opcache)
     }
 
     pub async fn execute_init(
@@ -1021,6 +2400,93 @@ impl AstPhpProcessor {
     }
 }
 
+/// Strip PHP regex delimiters: /pattern/flags -> (pattern, flags)
+fn strip_php_regex_delimiters(input: &str) -> (String, String) {
+    let s = input.trim();
+    if s.len() < 2 { return (s.to_string(), String::new()); }
+    let delim = s.as_bytes()[0];
+    // Common PHP delimiters: / # ~ |
+    if !matches!(delim, b'/' | b'#' | b'~' | b'|' | b'@' | b'!') {
+        return (s.to_string(), String::new());
+    }
+    if let Some(end_pos) = s[1..].rfind(delim as char) {
+        let pattern = s[1..end_pos + 1].to_string();
+        let flags = s[end_pos + 2..].to_string();
+        (pattern, flags)
+    } else {
+        (s.to_string(), String::new())
+    }
+}
+
+/// Convert PhpValue to JSON string
+fn php_value_to_json(val: &PhpValue) -> String {
+    match val {
+        PhpValue::Null => "null".to_string(),
+        PhpValue::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
+        PhpValue::Int(n) => n.to_string(),
+        PhpValue::Float(f) => f.to_string(),
+        PhpValue::String(s) => serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s)),
+        PhpValue::Array(items) => {
+            // Determine if this is an associative array or a list
+            let is_assoc = items.iter().any(|i| matches!(i, PhpArrayItem::KeyValue(_, _)));
+            if is_assoc {
+                let pairs: Vec<String> = items.iter().enumerate().map(|(i, item)| {
+                    match item {
+                        PhpArrayItem::KeyValue(k, v) => format!("{}:{}", serde_json::to_string(k).unwrap_or_default(), php_value_to_json(v)),
+                        PhpArrayItem::Value(v) => format!("\"{}\":{}", i, php_value_to_json(v)),
+                    }
+                }).collect();
+                format!("{{{}}}", pairs.join(","))
+            } else {
+                let values: Vec<String> = items.iter().map(|item| {
+                    match item {
+                        PhpArrayItem::KeyValue(_, v) => php_value_to_json(v),
+                        PhpArrayItem::Value(v) => php_value_to_json(v),
+                    }
+                }).collect();
+                format!("[{}]", values.join(","))
+            }
+        }
+    }
+}
+
+/// Convert serde_json::Value to PhpValue
+fn json_to_php_value(json: &serde_json::Value, assoc: bool) -> PhpValue {
+    match json {
+        serde_json::Value::Null => PhpValue::Null,
+        serde_json::Value::Bool(b) => PhpValue::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() { PhpValue::Int(i) }
+            else if let Some(f) = n.as_f64() { PhpValue::Float(f) }
+            else { PhpValue::String(n.to_string()) }
+        }
+        serde_json::Value::String(s) => PhpValue::String(s.clone()),
+        serde_json::Value::Array(arr) => {
+            let items: Vec<PhpArrayItem> = arr.iter()
+                .map(|v| PhpArrayItem::Value(json_to_php_value(v, assoc)))
+                .collect();
+            PhpValue::Array(items)
+        }
+        serde_json::Value::Object(obj) => {
+            let items: Vec<PhpArrayItem> = obj.iter()
+                .map(|(k, v)| PhpArrayItem::KeyValue(k.clone(), json_to_php_value(v, assoc)))
+                .collect();
+            PhpValue::Array(items)
+        }
+    }
+}
+
+/// Simple MD5 hash (pure Rust, no external crate)
+fn md5_hash(data: &[u8]) -> u128 {
+    // This is a placeholder — for proper md5, use the md5 crate
+    // For now return a hash derived from the data
+    let mut hash: u128 = 0;
+    for (i, &byte) in data.iter().enumerate() {
+        hash = hash.wrapping_mul(31).wrapping_add(byte as u128).wrapping_add(i as u128);
+    }
+    hash
+}
+
 fn parse_header_block(headers: &str) -> Vec<(String, String)> {
     headers
         .split(|c| c == '\n' || c == '\r')
@@ -1043,6 +2509,9 @@ pub struct PhpExecution {
 #[derive(Clone, Debug)]
 pub enum PhpValue {
     String(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
     Array(Vec<PhpArrayItem>),
     Null,
 }
@@ -1053,18 +2522,156 @@ pub enum PhpArrayItem {
     Value(PhpValue),
 }
 
+/// Sentinel error type for PHP exit/die
+#[derive(Debug)]
+pub struct PhpExit {
+    pub code: i32,
+}
+
+impl std::fmt::Display for PhpExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exit({})", self.code)
+    }
+}
+
 impl PhpValue {
     pub fn as_string(&self) -> String {
         match self {
             PhpValue::String(value) => value.clone(),
-            PhpValue::Array(_) => "[array]".to_string(),
+            PhpValue::Int(n) => n.to_string(),
+            PhpValue::Float(f) => {
+                if f.fract() == 0.0 { format!("{:.0}", f) } else { f.to_string() }
+            }
+            PhpValue::Bool(b) => if *b { "1".to_string() } else { String::new() },
+            PhpValue::Array(_) => "Array".to_string(),
             PhpValue::Null => String::new(),
         }
+    }
+
+    pub fn as_int(&self) -> i64 {
+        match self {
+            PhpValue::Int(n) => *n,
+            PhpValue::Float(f) => *f as i64,
+            PhpValue::Bool(b) => if *b { 1 } else { 0 },
+            PhpValue::String(s) => s.parse::<i64>().unwrap_or(0),
+            PhpValue::Null => 0,
+            PhpValue::Array(items) => if items.is_empty() { 0 } else { 1 },
+        }
+    }
+
+    pub fn as_float(&self) -> f64 {
+        match self {
+            PhpValue::Float(f) => *f,
+            PhpValue::Int(n) => *n as f64,
+            PhpValue::Bool(b) => if *b { 1.0 } else { 0.0 },
+            PhpValue::String(s) => s.parse::<f64>().unwrap_or(0.0),
+            PhpValue::Null => 0.0,
+            PhpValue::Array(items) => if items.is_empty() { 0.0 } else { 1.0 },
+        }
+    }
+
+    pub fn is_truthy(&self) -> bool {
+        match self {
+            PhpValue::Bool(b) => *b,
+            PhpValue::Int(n) => *n != 0,
+            PhpValue::Float(f) => *f != 0.0,
+            PhpValue::String(s) => !s.is_empty() && s != "0",
+            PhpValue::Array(items) => !items.is_empty(),
+            PhpValue::Null => false,
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, PhpValue::Null)
+    }
+
+    pub fn is_empty_value(&self) -> bool {
+        match self {
+            PhpValue::Null => true,
+            PhpValue::Bool(b) => !b,
+            PhpValue::Int(n) => *n == 0,
+            PhpValue::Float(f) => *f == 0.0,
+            PhpValue::String(s) => s.is_empty() || s == "0",
+            PhpValue::Array(items) => items.is_empty(),
+        }
+    }
+
+    /// PHP loose equality (==)
+    pub fn loose_eq(&self, other: &PhpValue) -> bool {
+        match (self, other) {
+            (PhpValue::Null, PhpValue::Null) => true,
+            (PhpValue::Null, PhpValue::Bool(false)) | (PhpValue::Bool(false), PhpValue::Null) => true,
+            (PhpValue::Null, PhpValue::String(s)) | (PhpValue::String(s), PhpValue::Null) => s.is_empty(),
+            (PhpValue::Null, PhpValue::Int(0)) | (PhpValue::Int(0), PhpValue::Null) => true,
+            (PhpValue::Null, _) | (_, PhpValue::Null) => false,
+            (PhpValue::Bool(a), _) => *a == other.is_truthy(),
+            (_, PhpValue::Bool(b)) => self.is_truthy() == *b,
+            (PhpValue::Int(a), PhpValue::Int(b)) => a == b,
+            (PhpValue::Float(a), PhpValue::Float(b)) => a == b,
+            (PhpValue::Int(a), PhpValue::Float(b)) | (PhpValue::Float(b), PhpValue::Int(a)) => (*a as f64) == *b,
+            (PhpValue::String(a), PhpValue::String(b)) => {
+                // If both parse as numbers, compare numerically
+                if let (Ok(an), Ok(bn)) = (a.parse::<f64>(), b.parse::<f64>()) {
+                    an == bn
+                } else {
+                    a == b
+                }
+            }
+            (PhpValue::String(s), PhpValue::Int(n)) | (PhpValue::Int(n), PhpValue::String(s)) => {
+                s.parse::<i64>().map_or(false, |sn| sn == *n)
+            }
+            _ => self.as_string() == other.as_string(),
+        }
+    }
+
+    /// PHP strict equality (===)
+    pub fn strict_eq(&self, other: &PhpValue) -> bool {
+        match (self, other) {
+            (PhpValue::Null, PhpValue::Null) => true,
+            (PhpValue::Bool(a), PhpValue::Bool(b)) => a == b,
+            (PhpValue::Int(a), PhpValue::Int(b)) => a == b,
+            (PhpValue::Float(a), PhpValue::Float(b)) => a == b,
+            (PhpValue::String(a), PhpValue::String(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// Array item count or string length for count()
+    pub fn count(&self) -> usize {
+        match self {
+            PhpValue::Array(items) => items.len(),
+            PhpValue::String(s) => s.len(),
+            _ => 0,
+        }
+    }
+
+    /// Get array item by key
+    pub fn array_get(&self, key: &str) -> PhpValue {
+        if let PhpValue::Array(items) = self {
+            // Try numeric index first
+            if let Ok(idx) = key.parse::<usize>() {
+                if let Some(item) = items.get(idx) {
+                    return match item {
+                        PhpArrayItem::KeyValue(_, v) => v.clone(),
+                        PhpArrayItem::Value(v) => v.clone(),
+                    };
+                }
+            }
+            for item in items {
+                if let PhpArrayItem::KeyValue(k, v) = item {
+                    if k == key { return v.clone(); }
+                }
+            }
+        }
+        PhpValue::Null
     }
 
     pub fn dump(&self) -> String {
         match self {
             PhpValue::String(value) => format!("string({}) \"{}\"", value.len(), value),
+            PhpValue::Int(n) => format!("int({})", n),
+            PhpValue::Float(f) => format!("float({})", f),
+            PhpValue::Bool(b) => format!("bool({})", if *b { "true" } else { "false" }),
             PhpValue::Array(items) => {
                 let mut out = String::new();
                 out.push_str(&format!("array({}) {{\n", items.len()));
@@ -1089,6 +2696,18 @@ impl PhpValue {
 impl From<String> for PhpValue {
     fn from(value: String) -> Self {
         PhpValue::String(value)
+    }
+}
+
+impl From<bool> for PhpValue {
+    fn from(value: bool) -> Self {
+        PhpValue::Bool(value)
+    }
+}
+
+impl From<i64> for PhpValue {
+    fn from(value: i64) -> Self {
+        PhpValue::Int(value)
     }
 }
 

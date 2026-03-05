@@ -1,24 +1,211 @@
-# ruph
+# ruph — Rust + PHP
 
-A Rust + PHP web server with built-in PHP processing, TLS/ACME certificate management, and front-controller routing.
+A single-binary web server with built-in PHP scripting. No PHP installation required.
+
+ruph includes a native PHP interpreter powered by tree-sitter, giving you PHP's familiar syntax and templating for web sites and apps — all compiled into one cross-platform binary. For advanced use cases, ruph can optionally use an external PHP binary as a fallback.
 
 ## Quick Start
 
 ```bash
-# Serve current directory
-./ruph .
+# Serve a directory — that's it
+./ruph /var/www/mysite
 
-# Serve a specific docroot
-./ruph /var/www/html
-
-# With TLS (uses certs from ~/.ruph/ssl)
-./ruph /var/www/html --tls
+# With TLS
+./ruph /var/www/mysite --tls
 
 # With a config file
-./ruph /var/www/html -c ruph.ini
+./ruph -c ruph.ini /var/www/mysite
+```
+
+Create a `_index.php` in your docroot and you have a PHP-powered site:
+
+```php
+<?php
+// _index.php — runs for every request
+if ($_SERVER['REQUEST_URI'] === '/') {
+    readfile('./index.html');
+} else {
+    http_response_code(404);
+    echo "Not found";
+}
 ```
 
 Running `./ruph` with no arguments prints help.
+
+## How It Works
+
+### Request Flow
+
+```
+Request arrives
+    │
+    ├── ruph resolves URI against filesystem
+    │   Sets: $_SERVER['rr_file'], rr_dir, rr_index, rr_leaf_idx, rr_mime
+    │
+    ├── Execute /_index.php (master)
+    │   ├── exit() → DONE (PHP handled the request)
+    │   └── return  → ruph continues:
+    │
+    ├── Static file exists, no leaf _index.php → Rust serves directly (fast)
+    ├── Leaf _index.php exists → execute it → DONE
+    ├── Directory with index.html → Rust serves it
+    ├── Directory with nothing → 500
+    └── Nothing matched → 404
+```
+
+### _index.php Architecture
+
+Every directory can have a `_index.php`. At most **two** PHP files execute per request:
+
+1. **Master** (`/_index.php`) — always runs. Server admin controls this.
+2. **Leaf** (`/subdir/_index.php`) — runs if the request targets that directory.
+
+The master runs first and can:
+- **`exit`** — handle the request entirely (auth gates, redirects, error pages)
+- **return** — let ruph serve static files or execute the leaf
+
+This gives you a clean authority hierarchy: server admin controls the master, users/sub-groups control their directory's `_index.php`.
+
+```php
+<?php
+// Master _index.php — global auth, then delegate
+session_start();
+if (!authenticated()) { http_response_code(401); exit; }
+
+// Let the leaf _index.php handle it, or ruph serves static
+```
+
+### Pre-resolved Request Info
+
+ruph resolves the filesystem **before** PHP runs and sets these `$_SERVER` keys:
+
+| Key | Value |
+|-----|-------|
+| `rr_file` | Realpath of matched file, or `null` |
+| `rr_dir` | Realpath if URI maps to a directory, or `null` |
+| `rr_index` | First matching index file inside `rr_dir`, or `null` |
+| `rr_leaf_idx` | `_index.php` in the leaf directory, or `null` |
+| `rr_mime` | MIME type ruph would use for `rr_file` |
+
+Plus all standard `$_SERVER` keys: `REQUEST_URI`, `REQUEST_METHOD`, `QUERY_STRING`, `HTTP_HOST`, `DOCUMENT_ROOT`, `SCRIPT_FILENAME`, `PHP_SELF`, `PATH_INFO`, and all `HTTP_*` headers.
+
+## Ruph PHP Reference
+
+ruph's built-in interpreter runs PHP natively in Rust — no external PHP binary needed. It covers the PHP features used in web templating and request handling.
+
+### Language Features
+
+| Feature | Support |
+|---------|---------|
+| `<?php ?>` and `<?= ?>` tags | Full |
+| Inline HTML mixed with PHP | Full |
+| Variables, assignment, string interpolation | Full |
+| `if` / `else` / `elseif` | Full |
+| `while`, `for`, `foreach` | Full |
+| `switch` / `case` / `default` | Full |
+| `break`, `continue`, `return` | Full |
+| `exit` / `die` | Full |
+| `include` / `require` / `_once` variants | Full |
+| User-defined functions with defaults | Full |
+| Arrays (indexed and associative) | Full |
+| `$_GET`, `$_POST`, `$_SERVER`, `$_REQUEST` | Full |
+| String concatenation (`.`), `??`, `?:` | Full |
+| All comparison: `==`, `===`, `!=`, `!==`, `<`, `>`, `<=`, `>=` | Full |
+| Arithmetic: `+`, `-`, `*`, `/`, `%`, `**` | Full |
+| Logical: `&&`, `\|\|`, `!`, `and`, `or` | Full |
+| Augmented assignment: `+=`, `-=`, `.=`, `??=` | Full |
+| `++` / `--` (prefix and postfix) | Full |
+| Type casting: `(int)`, `(string)`, `(bool)`, `(float)`, `(array)` | Full |
+| Output buffering: `ob_start()`, `ob_get_clean()` | Full |
+| `define()` / `defined()` constants | Full |
+
+### Built-in Functions
+
+#### String
+
+`strlen`, `strtolower`, `strtoupper`, `trim`, `ltrim`, `rtrim`, `substr`, `str_replace`, `str_contains`, `str_starts_with`, `str_ends_with`, `strpos`, `stripos`, `strrpos`, `explode`, `implode`/`join`, `sprintf`, `nl2br`, `htmlspecialchars`, `htmlspecialchars_decode`, `htmlentities`, `urlencode`, `urldecode`, `rawurlencode`, `rawurldecode`, `ucfirst`, `lcfirst`, `str_repeat`, `str_pad`, `number_format`, `md5`
+
+#### Array
+
+`count`/`sizeof`, `array_keys`, `array_values`, `in_array`, `array_key_exists`, `array_merge`, `array_push`, `array_pop`, `array_slice`, `array_reverse`, `array_unique`, `array_map`, `range`, `compact`, `extract`, `sort`, `rsort`, `asort`, `arsort`, `ksort`, `krsort`
+
+#### Type
+
+`isset`, `empty`, `is_null`, `is_array`, `is_string`, `is_numeric`, `is_int`/`is_integer`, `is_bool`, `gettype`, `intval`, `floatval`/`doubleval`, `strval`, `boolval`
+
+#### JSON
+
+`json_encode`, `json_decode`
+
+#### Filesystem
+
+`file_exists`, `is_file`, `is_dir`, `readfile`, `file_get_contents`, `file_put_contents`, `filesize`, `dirname`, `basename`, `pathinfo`, `realpath`, `glob`
+
+#### Date/Time
+
+`date`, `time`, `microtime`, `strtotime`
+
+#### Math
+
+`abs`, `ceil`, `floor`, `round`, `max`, `min`, `rand`/`mt_rand`
+
+#### Regex
+
+`preg_match`, `preg_replace`, `preg_split`
+
+#### HTTP/Output
+
+`header`, `http_response_code`, `setcookie`, `echo`, `print_r`, `var_dump`, `error_log`
+
+#### Misc
+
+`phpversion`, `php_uname`, `php_sapi_name`, `function_exists`, `define`, `defined`, `constant`, `sleep`, `usleep`, `session_start`, `session_destroy`
+
+#### Ruph Extensions
+
+| Function | Description |
+|----------|-------------|
+| `exe($path)` | Execute a path like the web server: `exe('dir/')` runs `dir/_index.php` |
+| `render($template, $data)` | Render a PHP template with data |
+| `response($status, $headers, $body)` | Set response status, headers, and body in one call |
+| `http_request($method, $url, $headers, $body)` | Make an HTTP request from PHP |
+| `file_get_contents($url)` | Works with both local files and HTTP URLs |
+
+### Pre-defined Constants
+
+`PATHINFO_DIRNAME` (1), `PATHINFO_BASENAME` (2), `PATHINFO_EXTENSION` (4), `PATHINFO_FILENAME` (8), `PHP_EOL`, `PHP_INT_MAX`, `PHP_INT_MIN`, `DIRECTORY_SEPARATOR`, `PHP_SAPI`, `PHP_VERSION`, `TRUE`, `FALSE`, `NULL`
+
+### What's Not Included
+
+ruph PHP is designed for web scripting, not running legacy PHP applications. The following are **not** supported:
+
+- Classes and objects (`class`, `new`, `->`, `::`)
+- Namespaces and `use` statements
+- Anonymous functions / closures
+- Generators and `yield`
+- Try/catch exceptions
+- PHP extensions (PDO, curl, mbstring, etc.)
+- `$_SESSION` persistence (session functions exist as stubs)
+
+For sites that need full PHP, set `processor = cgi` in your config and ruph will use an external PHP binary as a subprocess.
+
+## PHP Processing Modes
+
+| Mode | How | External PHP? | Use Case |
+|------|-----|---------------|----------|
+| **`auto`** (default) | Built-in AST interpreter, fallback to CGI | No (optional) | Single-binary deployment |
+| **`ast`** | Built-in only, no fallback | No | Guaranteed single-binary |
+| **`cgi`** | External php-cgi subprocess | Yes | Full PHP compatibility |
+
+Set via `[php] processor` in `ruph.ini`:
+
+```ini
+[php]
+; auto (default) | ast | cgi
+processor = auto
+; Only needed for cgi mode (auto-detected if omitted)
+;binary = /usr/local/bin/php-cgi
+```
 
 ## CLI Options
 
@@ -32,9 +219,10 @@ Options:
       --bind-https <ADDR>      HTTPS bind address (default from config)
       --bind-http <ADDR>       Optional plain-HTTP bind address
   -c, --config <FILE>          Configuration file (INI format)
-      --new-cert <NEW_CERT>    Generate ACME/Let's Encrypt cert: email@domain.com,example.com
+      --new-cert <NEW_CERT>    Generate ACME/Let's Encrypt cert: email@domain,example.com
       --list-certs             List known certificates and exit
       --tls                    Enable TLS (uses certs from ~/.ruph/ssl)
+      --php-binary <BINARY>    PHP binary for cgi mode (overrides config)
       --log-level <LOG_LEVEL>  Log level: error, warn, info, debug, trace [default: info]
   -h, --help                   Print help
 ```
@@ -44,13 +232,9 @@ Options:
 ruph looks for `ruph.ini` in these locations (first match wins):
 
 1. `<docroot>/ruph.ini`
-2. `./ruph.ini` (current directory)
+2. `./ruph.ini`
 3. `~/.ruph/ruph.ini`
 4. `/etc/ruph/ruph.ini`
-
-Or specify explicitly with `-c /path/to/ruph.ini`.
-
-CLI arguments always override config file values.
 
 ### Example ruph.ini
 
@@ -62,115 +246,26 @@ tls = false
 
 [http]
 docroot = /var/www/html
-index_files = _index.php
+index_files = _index.php,index.html
 
 [php]
-; auto | libphp | ast | embedded
+; auto | ast | cgi
 processor = auto
-; Path to PHP binary (auto-detected if omitted)
-;binary = /usr/local/bin/php
-
-[ssl]
-; Override certificate directory (default: ~/.ruph/ssl)
-;dir = /etc/ruph/ssl
 ```
-
-## PHP Processing
-
-ruph has three PHP processors that execute in a configurable chain:
-
-| Processor | Description |
-|-----------|-------------|
-| **ast** | Tree-sitter PHP parser. Handles templates, includes, superglobals, output buffering. |
-| **embedded** | Lightweight regex-based processor. Handles echo, variables, basic functions. |
-| **libphp** | External PHP binary (php-cli). Full PHP support via subprocess. |
-
-### Processor Modes
-
-Set via `[php] processor` in `ruph.ini`:
-
-| Mode | Execution Order | Use Case |
-|------|----------------|----------|
-| `auto` (default) | ast -> embedded -> libphp | Fastest for simple templates, falls back for complex PHP |
-| `libphp` | libphp -> ast -> embedded | Full PHP compatibility first |
-| `ast` | ast only | Tree-sitter parsing only |
-| `embedded` | embedded only | Regex processing only |
-
-Each processor falls through to the next on failure or empty output.
-
-Example - force external PHP as primary:
-
-```ini
-[php]
-processor = libphp
-binary = /usr/local/bin/php
-```
-
-## Front Controller (_index.php)
-
-If a `_index.php` file exists in the docroot, it acts as a front controller for all unmatched requests (similar to nginx `try_files` or Apache `FallbackResource`).
-
-The routing order is:
-
-1. Exact file match -> serve static file or execute PHP script
-2. Directory match -> look for `_index.php` in that directory
-3. No match -> route to `<docroot>/_index.php` (if it exists)
-4. No `_index.php` -> return 404
-
-POST requests to non-script targets also route through the front controller.
-
-Available to `_index.php` via superglobals:
-
-- `$_SERVER['REQUEST_URI']` - the original requested path
-- `$_SERVER['REQUEST_METHOD']` - GET, POST, etc.
-- `$_SERVER['QUERY_STRING']` - original query string
-- `$_SERVER['SCRIPT_FILENAME']` - path to `_index.php` itself
-- `$_SERVER['DOCUMENT_ROOT']` - the docroot
-- `$_SERVER['PHP_SELF']` - script name relative to docroot
-- `$_SERVER['PATH_INFO']` - path info after the script name
-- `$_SERVER['HTTP_HOST']` - requested hostname
-- All HTTP headers as `$_SERVER['HTTP_*']`
 
 ## TLS / ACME Certificates
 
-Certificates are stored per-domain in `~/.ruph/ssl/<domain>/`:
-
-```
-~/.ruph/ssl/
-  example.com/
-    fullchain.pem
-    privkey.pem
-  other.com/
-    fullchain.pem
-    privkey.pem
-```
-
-### Issue a certificate via Let's Encrypt
+Certificates are stored per-domain in `~/.ruph/ssl/<domain>/`.
 
 ```bash
+# Issue a Let's Encrypt certificate
 ./ruph --new-cert you@example.com,example.com
-```
 
-### List certificates and expiry dates
-
-```bash
+# List certificates and expiry dates
 ./ruph --list-certs
 ```
 
-Certificates expiring within 30 days generate a warning at startup. Multiple domains are supported via SNI - ruph selects the correct certificate based on the requested hostname.
-
-## Logging
-
-ruph uses structured logging with domain names in every log line:
-
-```
-INFO  ruph: TLS established from 1.2.3.4:5678 [example.com]
-INFO  ruph: 1.2.3.4:5678 GET /page.php [example.com]
-ERROR ruph: TLS handshake error from 5.6.7.8:9999 [bad.com]: no server certificate chain resolved
-ERROR ruph: TLS accept error from 9.8.7.6:1234 (no ClientHello): received corrupt message
-```
-
-Set log level via CLI (`--log-level debug`) or config (`log_level = debug`).
+Multiple domains are supported via SNI. Certificates expiring within 30 days generate a warning at startup.
 
 ## Building
 
@@ -178,7 +273,23 @@ Set log level via CLI (`--log-level debug`) or config (`log_level = debug`).
 cargo build --release
 ```
 
-The binary is at `target/release/ruph`.
+The single binary is at `target/release/ruph`.
+
+### Cross-platform builds
+
+```bash
+# macOS (Apple Silicon)
+cargo build --release --target aarch64-apple-darwin
+
+# macOS (Intel)
+cargo build --release --target x86_64-apple-darwin
+
+# Windows
+cargo build --release --target x86_64-pc-windows-msvc
+
+# Linux (musl, fully static)
+cargo build --release --target x86_64-unknown-linux-musl
+```
 
 ### Running tests
 
