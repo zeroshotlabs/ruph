@@ -142,6 +142,54 @@ impl WebServer {
         builder
     }
 
+    /// Determine if a PhpExecution result means "request handled" (true) or "pass through" (false).
+    ///
+    /// - exit → always handled
+    /// - return true → pass through (Rust serves static file)
+    /// - return false / bare return → handled
+    /// - no return (fell off end) → infer from output/headers/status
+    fn php_handled_request(exec: &PhpExecution) -> bool {
+        if exec.exited { return true; }
+        match exec.returned {
+            Some(true) => false,  // return true = pass through to Rust
+            Some(false) => true,  // return false / bare return = handled
+            None => {
+                // No explicit return — auto-detect from output
+                !exec.body.trim().is_empty()
+                    || exec.headers.contains_key("location")
+                    || exec.status != 200
+            }
+        }
+    }
+
+    /// Build an HTTP response from a PhpExecution result.
+    /// Uses PHP's Content-Type if set, otherwise defaults to text/html.
+    fn build_php_response(exec: &PhpExecution) -> Result<Response<RuphBody>> {
+        let status = StatusCode::from_u16(exec.status).unwrap_or(StatusCode::OK);
+        let content_type = exec.headers.get("content-type")
+            .cloned()
+            .unwrap_or_else(|| "text/html; charset=utf-8".to_string());
+        let mut builder = Response::builder()
+            .status(status)
+            .header("Content-Type", &content_type);
+        // Apply remaining headers, skipping content-type (already set above)
+        for (name, value) in &exec.headers {
+            if name == "content-type" { continue; }
+            let header_name = match HeaderName::from_bytes(name.trim().as_bytes()) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let header_value = match HeaderValue::from_str(value.trim()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            builder = builder.header(header_name, header_value);
+        }
+        builder
+            .body(RuphBody::full(exec.body.clone()))
+            .map_err(|e| anyhow!("Failed to build response: {}", e))
+    }
+
     /// Create a new web server instance with PHP mode, optional binary path, and per-domain roots.
     pub fn new(
         root_dir: PathBuf,
@@ -305,12 +353,14 @@ impl WebServer {
     }
 
     /// Middleware index name: first configured PHP index file, defaulting to `_index.php`.
+    #[allow(dead_code)]
     fn middleware_index_name(&self) -> &str {
         &self.middleware_index
     }
 
     /// Build the top-down directory chain for a request path.
     /// Example: `/a/b/c.html` -> [`/`, `/a`, `/a/b`].
+    #[allow(dead_code)]
     fn directory_chain_for_path(&self, url_path: &str, root: &Path) -> Result<Vec<PathBuf>> {
         let decoded = decode(url_path).map_err(|_| anyhow!("Invalid URL encoding"))?;
         let clean = decoded.trim_start_matches('/');
@@ -334,7 +384,121 @@ impl WebServer {
         Ok(chain)
     }
 
-    /// Handle HTTP web requests
+    /// Pre-resolve the filesystem for a request URI, producing `rr_*` server variables.
+    ///
+    /// Returns a HashMap with keys: `rr_file`, `rr_dir`, `rr_index`, `rr_leaf_idx`, `rr_mime`, `rr_exists`.
+    /// Values are either realpath strings or empty string for null. `rr_exists` is "1" or "".
+    fn resolve_rr_vars(&self, url_path: &str, root: &Path) -> HashMap<String, String> {
+        let mut rr = HashMap::new();
+        rr.insert("rr_file".to_string(), String::new());
+        rr.insert("rr_dir".to_string(), String::new());
+        rr.insert("rr_index".to_string(), String::new());
+        rr.insert("rr_leaf_idx".to_string(), String::new());
+        rr.insert("rr_mime".to_string(), String::new());
+        rr.insert("rr_exists".to_string(), String::new());
+        rr.insert("rr_root".to_string(), root.to_string_lossy().to_string());
+
+        // The master _index.php path — leaf should never point to this
+        let master_path = root.join(&self.middleware_index);
+        let master_canonical = master_path.canonicalize().ok();
+
+        let file_path = match self.resolve_file_path(url_path, root) {
+            Ok(p) => p,
+            Err(_) => return rr,
+        };
+
+        if file_path.is_file() {
+            // URI maps to a file
+            let fname = file_path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+            // Never expose _index.php as rr_file
+            if fname != "_index.php" {
+                if let Ok(real) = file_path.canonicalize() {
+                    rr.insert("rr_file".to_string(), real.to_string_lossy().to_string());
+                    rr.insert("rr_exists".to_string(), "1".to_string());
+                    let mime = from_path(&real).first_or_octet_stream().to_string();
+                    rr.insert("rr_mime".to_string(), mime);
+                }
+            }
+            // Check for leaf _index.php in the file's parent directory
+            if let Some(parent) = file_path.parent() {
+                let leaf = parent.join("_index.php");
+                if leaf.is_file() {
+                    if let Ok(real) = leaf.canonicalize() {
+                        // Only set leaf if it's NOT the master _index.php
+                        if master_canonical.as_ref() != Some(&real) {
+                            rr.insert("rr_leaf_idx".to_string(), real.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        } else if file_path.is_dir() {
+            // URI maps to a directory
+            if let Ok(real) = file_path.canonicalize() {
+                rr.insert("rr_dir".to_string(), real.to_string_lossy().to_string());
+            }
+            // Check for index file in the directory
+            for name in &self.index_files {
+                if name == "_index.php" {
+                    continue; // _index.php is the leaf, not the index
+                }
+                let candidate = file_path.join(name);
+                if candidate.is_file() {
+                    if let Ok(real) = candidate.canonicalize() {
+                        rr.insert("rr_index".to_string(), real.to_string_lossy().to_string());
+                    }
+                    break;
+                }
+            }
+            // Check for leaf _index.php (only if different from master)
+            let leaf = file_path.join("_index.php");
+            if leaf.is_file() {
+                if let Ok(real) = leaf.canonicalize() {
+                    if master_canonical.as_ref() != Some(&real) {
+                        rr.insert("rr_leaf_idx".to_string(), real.to_string_lossy().to_string());
+                    }
+                }
+            }
+        } else {
+            // URI doesn't map to anything on disk — walk up to find the deepest existing dir
+            let decoded = decode(url_path).unwrap_or_default();
+            let clean = decoded.trim_start_matches('/');
+            let parts: Vec<&str> = clean.split('/').filter(|p| !p.is_empty()).collect();
+            let mut deepest = root.to_path_buf();
+            for part in &parts {
+                let next = deepest.join(part);
+                if next.is_dir() {
+                    deepest = next;
+                } else {
+                    break;
+                }
+            }
+            // Check for leaf _index.php in the deepest existing directory (only if != master)
+            let leaf = deepest.join("_index.php");
+            if leaf.is_file() {
+                if let Ok(real) = leaf.canonicalize() {
+                    if master_canonical.as_ref() != Some(&real) {
+                        rr.insert("rr_leaf_idx".to_string(), real.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+
+        rr
+    }
+
+    /// Handle HTTP web requests using the master/leaf _index.php architecture.
+    ///
+    /// Flow:
+    /// 1. Resolve rr_* variables (filesystem pre-resolution)
+    /// 2. Run master /_index.php (if it exists)
+    ///    - exit → request fully handled, return response
+    ///    - return → continue to default handling
+    /// 3. Default handling:
+    ///    a. rr_leaf_idx exists → execute leaf _index.php
+    ///    b. rr_file exists, no leaf → serve static file
+    ///    c. rr_dir + rr_index → serve index file
+    ///    d. rr_dir, no index or leaf → 500
+    ///    e. nothing matched → 404
     pub async fn handle_request(&self, req: Request<IncomingBody>) -> Result<Response<RuphBody>> {
         let host = req.headers().get("host")
             .and_then(|v| v.to_str().ok())
@@ -343,7 +507,6 @@ impl WebServer {
             .to_string();
 
         let root = self.effective_root(&host).clone();
-        let init_script = self.effective_init_script(&host);
         let stderr_handler = self.stderr_handler_for(&host);
 
         let method = req.method().clone();
@@ -356,16 +519,120 @@ impl WebServer {
             return Ok(self.error_response(StatusCode::FORBIDDEN, "Access denied"));
         }
 
-        // Execute `_index.php` middleware scripts top-down for all request URLs.
-        // If any middleware handles the response (redirect/body/non-200), stop immediately.
-        if let Some(resp) = self.run_directory_index_chain(&req, &root, stderr_handler.as_ref()).await? {
-            return Ok(resp);
+        // Only GET, POST, HEAD allowed
+        if !matches!(method, Method::GET | Method::POST | Method::HEAD) {
+            return Ok(self.error_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed"));
         }
 
+        // HEAD: handle separately (no body needed)
+        if method == Method::HEAD {
+            return self.handle_head_request(req, &root, self.effective_init_script(&host).as_deref(), stderr_handler.as_ref()).await;
+        }
+
+        // ── Step 1: Pre-resolve filesystem → rr_* variables ──
+        let rr_vars = self.resolve_rr_vars(&path, &root);
+
+        // ── Step 2: Find and run master /_index.php ──
+        let master_path = root.join(&self.middleware_index);
+        if master_path.is_file() {
+            // Extract query string and build server vars before consuming the request body
+            let query_string = req.uri().query().unwrap_or("").to_string();
+            let mut server_vars = self.build_server_vars(&req, &master_path, &root)?;
+            for (k, v) in &rr_vars {
+                server_vars.insert(k.clone(), v.clone());
+            }
+
+            // Parse query/post params
+            let query_params = self.parse_query_string(&query_string);
+            let post_params = if method == Method::POST {
+                let body_bytes = match req.collect().await {
+                    Ok(collected) => collected.to_bytes(),
+                    Err(_) => return Ok(self.error_response(StatusCode::BAD_REQUEST, "Invalid request body")),
+                };
+                self.parse_post_data(&body_bytes)
+            } else {
+                HashMap::new()
+            };
+
+            // Execute master _index.php
+            let master_result = self.run_php_buffered(
+                &master_path, &query_params, &post_params, &server_vars, stderr_handler.as_ref()
+            ).await;
+
+            match master_result {
+                Ok(exec) => {
+                    if Self::php_handled_request(&exec) {
+                        debug!("Master _index.php handled request (exited={}, returned={:?})", exec.exited, exec.returned);
+                        return Self::build_php_response(&exec);
+                    }
+                    debug!("Master _index.php passed through — continuing to default handling");
+                }
+                Err(e) => {
+                    warn!("Master _index.php failed: {} — continuing to default handling", e);
+                }
+            }
+
+            // ── Step 3: Default handling ──
+            let rr_leaf = &rr_vars["rr_leaf_idx"];
+            let rr_file = &rr_vars["rr_file"];
+            let rr_dir = &rr_vars["rr_dir"];
+            let rr_index = &rr_vars["rr_index"];
+
+            // ── Leaf execution (same exit/return semantics as master) ──
+            if !rr_leaf.is_empty() {
+                let leaf_path = PathBuf::from(rr_leaf);
+                let mut leaf_sv = self.build_server_vars_from_existing(&server_vars, &leaf_path, &root);
+                for (k, v) in &rr_vars {
+                    leaf_sv.insert(k.clone(), v.clone());
+                }
+
+                let leaf_result = self.run_php_buffered(
+                    &leaf_path, &query_params, &post_params, &leaf_sv, stderr_handler.as_ref()
+                ).await;
+
+                match leaf_result {
+                    Ok(exec) => {
+                        if Self::php_handled_request(&exec) {
+                            debug!("Leaf _index.php handled request (exited={}, returned={:?})", exec.exited, exec.returned);
+                            return Self::build_php_response(&exec);
+                        }
+                        debug!("Leaf _index.php passed through — falling through to static serving");
+                    }
+                    Err(e) => {
+                        warn!("Leaf _index.php failed: {} — falling through to static serving", e);
+                    }
+                }
+            }
+
+            // ── Static file / directory index / error ──
+            if !rr_file.is_empty() {
+                return self.serve_static_file(&PathBuf::from(rr_file)).await;
+            }
+
+            if !rr_dir.is_empty() && !rr_index.is_empty() {
+                let index_path = PathBuf::from(rr_index);
+                if index_path.extension().and_then(|s| s.to_str()) == Some("php") {
+                    let mut idx_sv = self.build_server_vars_from_existing(&server_vars, &index_path, &root);
+                    for (k, v) in &rr_vars {
+                        idx_sv.insert(k.clone(), v.clone());
+                    }
+                    return self.process_php_template(&index_path, &query_params, &post_params, &idx_sv, false, stderr_handler.as_ref()).await;
+                }
+                return self.serve_static_file(&index_path).await;
+            }
+
+            if !rr_dir.is_empty() {
+                return Ok(self.error_response(StatusCode::INTERNAL_SERVER_ERROR, "Directory requires a _index.php"));
+            }
+
+            return Ok(self.error_response(StatusCode::NOT_FOUND, "Not found"));
+        }
+
+        // No master _index.php — fall back to legacy request handling
+        let init_script = self.effective_init_script(&host);
         match method {
             Method::GET => self.handle_get_request(req, &root, init_script.as_deref(), stderr_handler.as_ref()).await,
             Method::POST => self.handle_post_request(req, &root, init_script.as_deref(), stderr_handler.as_ref()).await,
-            Method::HEAD => self.handle_head_request(req, &root, init_script.as_deref(), stderr_handler.as_ref()).await,
             _ => Ok(self.error_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed")),
         }
     }
@@ -634,7 +901,7 @@ impl WebServer {
         // Try AST first
         if let Some(ast) = &self.ast_php_processor {
             let mut ast = ast.lock().await;
-            match ast.execute_php(content, qp, pp, sv, template_path, &self.root_dir).await {
+            match ast.execute_php_with_handler(content, qp, pp, sv, template_path, &self.root_dir, stderr_handler.cloned()).await {
                 Ok(result) => return Ok(result),
                 Err(e) => warn!("AST failed for {:?}: {}, trying next", template_path, e),
             }
@@ -644,7 +911,7 @@ impl WebServer {
         if let Some(emb) = &self.embedded_php_processor {
             match emb.execute_php(content, qp, pp, sv) {
                 Ok(body) if !body.trim().is_empty() => return Ok(PhpExecution {
-                    body, status: 200, headers: HashMap::new(),
+                    body, status: 200, headers: HashMap::new(), exited: false, returned: None,
                 }),
                 Ok(_) => warn!("Embedded returned empty for {:?}, trying next", template_path),
                 Err(e) => warn!("Embedded failed for {:?}: {}, trying next", template_path, e),
@@ -655,7 +922,7 @@ impl WebServer {
         if let Some(php) = &self.php_processor {
             match php.process_file(template_path, content, qp, pp, sv, stderr_handler).await {
                 Ok(body) => return Ok(PhpExecution {
-                    body, status: 200, headers: HashMap::new(),
+                    body, status: 200, headers: HashMap::new(), exited: false, returned: None,
                 }),
                 Err(e) => warn!("External PHP failed for {:?}: {}", template_path, e),
             }
@@ -674,7 +941,7 @@ impl WebServer {
         if let Some(php) = &self.php_processor {
             match php.process_file(template_path, content, qp, pp, sv, None).await {
                 Ok(body) if !body.trim().is_empty() => return Ok(PhpExecution {
-                    body, status: 200, headers: HashMap::new(),
+                    body, status: 200, headers: HashMap::new(), exited: false, returned: None,
                 }),
                 Ok(_) => warn!("External PHP returned empty for {:?}, trying AST", template_path),
                 Err(e) => warn!("External PHP failed for {:?}: {}, trying AST", template_path, e),
@@ -694,7 +961,7 @@ impl WebServer {
         if let Some(emb) = &self.embedded_php_processor {
             match emb.execute_php(content, qp, pp, sv) {
                 Ok(body) => return Ok(PhpExecution {
-                    body, status: 200, headers: HashMap::new(),
+                    body, status: 200, headers: HashMap::new(), exited: false, returned: None,
                 }),
                 Err(e) => warn!("Embedded failed for {:?}: {}", template_path, e),
             }
@@ -722,7 +989,7 @@ impl WebServer {
     ) -> Result<PhpExecution> {
         if let Some(emb) = &self.embedded_php_processor {
             let body = emb.execute_php(content, qp, pp, sv)?;
-            return Ok(PhpExecution { body, status: 200, headers: HashMap::new() });
+            return Ok(PhpExecution { body, status: 200, headers: HashMap::new(), exited: false, returned: None });
         }
         Err(anyhow!("Embedded processor not available"))
     }
@@ -871,6 +1138,103 @@ impl WebServer {
         Ok(server_vars)
     }
 
+    /// Build server vars for a leaf/index script reusing existing request info.
+    fn build_server_vars_from_existing(
+        &self,
+        existing: &HashMap<String, String>,
+        script_path: &Path,
+        root: &Path,
+    ) -> HashMap<String, String> {
+        let mut sv = existing.clone();
+        let script_name = script_path
+            .strip_prefix(root)
+            .unwrap_or(script_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let script_name = if script_name.starts_with('/') {
+            script_name
+        } else {
+            format!("/{}", script_name)
+        };
+        sv.insert("SCRIPT_NAME".to_string(), script_name.clone());
+        sv.insert("SCRIPT_FILENAME".to_string(), script_path.to_string_lossy().to_string());
+        sv.insert("PHP_SELF".to_string(), script_name);
+        sv
+    }
+
+    /// Execute the master _index.php script, returning its PhpExecution result.
+    /// Run a PHP script in buffered mode, returning a PhpExecution with exit/return info.
+    /// Used for both master and leaf _index.php scripts.
+    async fn run_php_buffered(
+        &self,
+        script_path: &Path,
+        query_params: &HashMap<String, String>,
+        post_params: &HashMap<String, String>,
+        server_vars: &HashMap<String, String>,
+        stderr_handler: Option<&PhpStderrHandler>,
+    ) -> Result<PhpExecution> {
+        let content = fs::read_to_string(script_path).await
+            .map_err(|e| anyhow!("Cannot read master _index.php: {}", e))?;
+
+        let try_ast = matches!(self.php_mode, PhpMode::Ast | PhpMode::Auto);
+        let try_cgi = matches!(self.php_mode, PhpMode::Cgi | PhpMode::Auto);
+
+        // When configured for CGI, use CGI first (it's the full PHP runtime)
+        if matches!(self.php_mode, PhpMode::Cgi) {
+            if let Some(php) = &self.php_processor {
+                match php.process_file_with_headers(script_path, query_params, post_params, server_vars, stderr_handler).await {
+                    Ok(mut exec) => {
+                        // CGI can't distinguish exit vs return; use heuristics:
+                        // body content, redirect header, or non-200 status all signal "handled"
+                        exec.exited = !exec.body.trim().is_empty()
+                            || exec.headers.contains_key("location")
+                            || exec.status != 200;
+                        return Ok(exec);
+                    }
+                    Err(e) => warn!("Master CGI execution failed: {}", e),
+                }
+            }
+            // CGI-only mode: if CGI failed, try AST as last resort
+            if let Some(ast) = &self.ast_php_processor {
+                let mut ast = ast.lock().await;
+                match ast.execute_php_with_handler(&content, query_params, post_params, server_vars, script_path, &self.root_dir, stderr_handler.cloned()).await {
+                    Ok(result) => return Ok(result),
+                    Err(e) => warn!("Master AST fallback also failed: {}", e),
+                }
+            }
+        } else {
+            // AST or Auto mode: try AST first (tracks exit vs return)
+            if try_ast {
+                if let Some(ast) = &self.ast_php_processor {
+                    let mut ast = ast.lock().await;
+                    match ast.execute_php_with_handler(&content, query_params, post_params, server_vars, script_path, &self.root_dir, stderr_handler.cloned()).await {
+                        Ok(result) => return Ok(result),
+                        Err(e) => warn!("Master AST execution failed: {}, trying fallback", e),
+                    }
+                }
+            }
+            // Fallback to CGI (can't distinguish exit vs return; use heuristics)
+            if try_cgi {
+                if let Some(php) = &self.php_processor {
+                    match php.process_file_with_headers(script_path, query_params, post_params, server_vars, stderr_handler).await {
+                        Ok(mut exec) => {
+                            // CGI can't distinguish exit vs return; use heuristics:
+                            // body content, redirect header, or non-200 status all signal "handled"
+                            exec.exited = !exec.body.trim().is_empty()
+                                || exec.headers.contains_key("location")
+                                || exec.status != 200;
+                            return Ok(exec);
+                        }
+                        Err(e) => warn!("Master CGI execution failed: {}", e),
+                    }
+                }
+            }
+        }
+
+        Err(anyhow!("No PHP processor available for master _index.php"))
+    }
+
+    #[allow(dead_code)]
     async fn run_init_script_for(&self, req: &Request<IncomingBody>, root: &Path, init_script: Option<&Path>) -> Result<()> {
         let script_path = match init_script {
             Some(path) if path.is_file() => path,
@@ -903,6 +1267,7 @@ impl WebServer {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn should_short_circuit_middleware(resp: &Response<RuphBody>) -> bool {
         if resp.status() != StatusCode::OK {
             return true;
@@ -920,6 +1285,7 @@ impl WebServer {
 
     /// Execute configured PHP index middleware (`_index.php` by default)
     /// from root down each directory in the request path.
+    #[allow(dead_code)]
     async fn run_directory_index_chain(
         &self,
         req: &Request<IncomingBody>,

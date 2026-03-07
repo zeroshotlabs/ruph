@@ -290,7 +290,6 @@ impl PhpProcessor {
     }
 
     /// Execute a PHP file, parsing CGI headers and returning them alongside the body.
-    #[allow(dead_code)]
     pub async fn process_file_with_headers(
         &self,
         file_path: &Path,
@@ -321,7 +320,7 @@ impl PhpProcessor {
         }
 
         let (headers, body, status) = Self::parse_cgi_output(&stdout);
-        Ok(crate::ast_php_processor::PhpExecution { body, status, headers })
+        Ok(crate::ast_php_processor::PhpExecution { body, status, headers, exited: false, returned: None })
     }
 
     /// Spawn PHP and stream its output, parsing CGI headers from the start of stdout.

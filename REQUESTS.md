@@ -2,6 +2,18 @@
 
 This document describes how `ruph` currently resolves requests and decides when PHP executes.
 
+For `rr_*` server variables and return semantics, see [RETURN_RR_VARS.md](RETURN_RR_VARS.md).
+For configuration, see [RUPH_INI.md](RUPH_INI.md).
+
+## TLDR;
+
+Processing cascade for the _index.php controller files.
+
+- Master exit / return false / output → response (done)
+- Master return true / silent         → Leaf exit / return false / output → response (done)
+- Master return true / silent         → Leaf return true / silent → Rust serves static file (fast)
+- Master return true / silent         → No leaf → Rust serves static file (fast)
+
 ## 1) Host Resolution and Docroot Selection
 
 Routing host is determined in this order:
@@ -20,42 +32,79 @@ Host matching for exact and prefix virtual hosts is case-insensitive.
 
 Code: `main::handle_request`, `WebServer::handle_request`, `WebServer::effective_root`.
 
-## 2) `_index.php` Middleware Discovery (Top-Down)
+## 2) `_index.php` Master/Leaf Architecture
 
-After docroot selection, the middleware index filename is chosen as:
+After docroot selection, ruph looks for a master `_index.php` at the docroot root. The middleware index filename is chosen as:
 
 1. first configured `index_files` entry ending in `.php`,
 2. or `_index.php` if none are configured.
 
-For every request URL, that filename is executed top-down across directories:
+At most **two** PHP scripts execute per request:
 
-- root directory first,
-- then each directory component in request path order.
+1. **Master** (`/<docroot>/_index.php`) — always runs first. Server admin controls this.
+2. **Leaf** (`/<subdir>/_index.php`) — runs only if master passes through and a leaf exists in the deepest matching directory.
 
-Example:
+### Handled vs Pass-Through
 
-- `/pipermail/talk/2012-November/031492.html`
-- executes (if present): `/_index.php`, `/pipermail/_index.php`, `/pipermail/talk/_index.php`, `/pipermail/talk/2012-November/_index.php`
+A script is considered to have **handled** the request if any of:
 
-Execution uses CGI path when available (`php_mode` `cgi`/`auto`) so redirects/header/exit behavior is preserved. If CGI is unavailable/fails, AST init fallback is used.
+| Signal | Meaning |
+|--------|---------|
+| `exit` / `die` | Hard stop — always handled |
+| `return false` / `return` (bare) | Explicit handled |
+| Non-empty output (echo, readfile) | Auto-detected as handled |
+| `Location` header set | Auto-detected as handled |
+| Non-200 status code | Auto-detected as handled |
 
-Code: `middleware_index_name`, `directory_chain_for_path`, `run_directory_index_chain`.
+A script **passes through** if:
 
-## 3) Middleware Short-Circuit Rules
+| Signal | Meaning |
+|--------|---------|
+| `return true` | Explicit pass-through |
+| Silent (no output, no headers, status 200, no return) | Auto-detected as pass-through |
 
-During top-down middleware execution, request handling stops immediately when a middleware script returns a response that is considered handled:
+Code: `php_handled_request`, `handle_request`.
 
-- non-200 status, or
-- `Location` header present, or
-- **non-empty response body** (middleware produced output).
+## 3) Pre-Resolved Filesystem (`rr_*` Variables)
 
-If none short-circuit, normal static/script resolution continues.
+Before PHP runs, ruph resolves the request URI against the filesystem with path-traversal protection and sets `$_SERVER` keys:
 
-A `_index.php` that wants to pass through to the next directory or to normal file resolution must produce **no output** (empty body, status 200, no Location header).
+- `rr_root` — vhost document root
+- `rr_file` — realpath of matched file (never `_index.php`)
+- `rr_exists` — `"1"` if file exists, empty otherwise
+- `rr_dir` — realpath if URI maps to a directory
+- `rr_index` — first matching index file inside `rr_dir`
+- `rr_leaf_idx` — `_index.php` in deepest matching directory
+- `rr_mime` — MIME type for `rr_file`
 
-Code: `should_short_circuit_middleware`, `run_directory_index_chain`.
+See [RETURN_RR_VARS.md](RETURN_RR_VARS.md) for full details.
 
-## 4) Request Target Resolution
+Code: `resolve_rr_vars`.
+
+## 4) Standard `$_SERVER` Variables
+
+All standard CGI/PHP server variables are populated:
+
+| Variable | Source |
+|----------|--------|
+| `REQUEST_URI` | Normalized path+query (e.g. `/page.html?x=1`) |
+| `REQUEST_METHOD` | `GET`, `POST`, `HEAD` |
+| `QUERY_STRING` | Raw query string |
+| `HTTP_HOST` | From `Host` header |
+| `DOCUMENT_ROOT` | Vhost document root (same as `rr_root`) |
+| `SCRIPT_FILENAME` | Absolute path to the executing PHP script |
+| `PHP_SELF` | URI path of the script |
+| `PATH_INFO` | Extra path segments after script name |
+| `SERVER_NAME` | Hostname |
+| `SERVER_PORT` | Listen port |
+| `HTTPS` | `"on"` for TLS connections |
+| `HTTP_*` | All request headers as `HTTP_` prefixed vars |
+
+All HTTP request headers are automatically mapped: `Referer` → `HTTP_REFERER`, `User-Agent` → `HTTP_USER_AGENT`, `Accept` → `HTTP_ACCEPT`, etc.
+
+Code: `build_server_vars`.
+
+## 5) Request Target Resolution
 
 For request path `P`, resolution is:
 
@@ -72,7 +121,7 @@ For request path `P`, resolution is:
 
 Code: `resolve_request_target`, `find_index_file`.
 
-## 5) Method Behavior
+## 6) Method Behavior
 
 ### GET
 
@@ -101,7 +150,7 @@ Code: `handle_post_request`.
 
 Code: `handle_head_request`.
 
-## 6) PHP Execution Order for Script Targets
+## 7) PHP Execution Order for Script Targets
 
 When a target is `Script`, `process_php_template` applies:
 
@@ -112,12 +161,11 @@ When a target is `Script`, `process_php_template` applies:
 
 Important:
 
-- `php_mode` affects this script-execution phase.
 - `php_mode` affects script execution and middleware CGI behavior.
 
 Code: `process_php_template`.
 
-## 7) Hierarchy Clarification for `_index.php` + Static Files
+## 8) Hierarchy Clarification for `_index.php` + Static Files
 
 Given:
 
@@ -127,27 +175,29 @@ Given:
 
 Current behavior:
 
-1. Middleware phase executes top-down:
-   - `/<docroot>/_index.php`
-   - `/static/_index.php`
-2. If `/static/_index.php` produces **any output**, it short-circuits — the static file is **not** served.
-3. If `/static/_index.php` produces **no output** (empty body, 200, no Location), target resolution proceeds and serves `/static/img.gif`.
+1. Master `/_index.php` runs.
+2. If master passes through, leaf `/static/_index.php` runs.
+3. If leaf handles (output, headers, return false, or exit) — static file is **not** served.
+4. If leaf passes through (return true, or silent) — Rust serves `/static/img.gif`.
 
-This means a `_index.php` that wants to intercept all requests under its directory (including requests that map to real files) just needs to produce output. To pass through transparently, it must produce no output.
+If `/static/img.gif` does not exist and no script handled:
 
-If `/static/img.gif` does not exist and no middleware short-circuited:
-
-- Fallback is root init script (`/<docroot>/_index.php`), not nearest-ancestor `/static/_index.php`.
+- 404 is returned.
 
 If `/static/` is requested (directory path):
 
 - The server checks `index_files` inside `/static/` in configured order.
 - That means `index.html`, `_index.php`, etc. precedence is controlled only by `index_files` order.
 
-## 8) Root Front-Controller Fallback
+## 9) Root Front-Controller Fallback
 
 If no file/directory index target matches, request falls back to root front-controller script (same selected middleware PHP index filename at docroot root) when it exists as a file.
 
-## 9) CGI/PHP Server Vars Note
+## 10) Static File Delivery
 
-`REQUEST_URI` passed to PHP is normalized to path+query (for example, `/pipermail/talk/index.html?x=1`), not absolute-form URLs like `https://nyphp.org/...`.
+When Rust serves a static file (after PHP passes through), it delivers with:
+
+- `Content-Type` — detected from file extension via `mime_guess`
+- `Content-Length` — exact byte count
+
+This is the fastest path — no PHP overhead, direct file read and response.

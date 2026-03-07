@@ -84,7 +84,7 @@ impl Default for Config {
             http_docroot: None,
             domain_roots: HashMap::new(),
             prefix_roots: Vec::new(),
-            index_files: vec!["_index.php".to_string()],
+            index_files: vec!["_index.php".to_string(), "index.html".to_string(), "index.htm".to_string()],
             default_log: None,
             domain_logs: HashMap::new(),
             prefix_logs: Vec::new(),

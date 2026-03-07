@@ -151,7 +151,7 @@ Paths are resolved relative to the current template, or absolute from docroot if
 
 | Variable | Contents |
 |----------|----------|
-| `$_SERVER` | Request info: `REQUEST_URI`, `REQUEST_METHOD`, `HTTP_HOST`, `DOCUMENT_ROOT`, `rr_file`, `rr_dir`, `rr_index`, `rr_leaf_idx`, `rr_mime`, all `HTTP_*` headers |
+| `$_SERVER` | Request info: `REQUEST_URI`, `REQUEST_METHOD`, `HTTP_HOST`, `DOCUMENT_ROOT`, `rr_root`, `rr_file`, `rr_exists`, `rr_dir`, `rr_index`, `rr_leaf_idx`, `rr_mime`, all `HTTP_*` headers. See [RETURN_RR_VARS.md](RETURN_RR_VARS.md) for details. |
 | `$_GET` | Query string parameters |
 | `$_POST` | POST body parameters |
 | `$_REQUEST` | Merged `$_GET` + `$_POST` |
@@ -166,6 +166,18 @@ Paths are resolved relative to the current template, or absolute from docroot if
 | `PATHINFO_BASENAME` | `2` |
 | `PATHINFO_EXTENSION` | `4` |
 | `PATHINFO_FILENAME` | `8` |
+| `PHP_URL_SCHEME` | `0` |
+| `PHP_URL_HOST` | `1` |
+| `PHP_URL_PORT` | `2` |
+| `PHP_URL_USER` | `3` |
+| `PHP_URL_PASS` | `4` |
+| `PHP_URL_PATH` | `5` |
+| `PHP_URL_QUERY` | `6` |
+| `PHP_URL_FRAGMENT` | `7` |
+| `E_USER_ERROR` | `256` |
+| `E_USER_WARNING` | `512` |
+| `E_USER_NOTICE` | `1024` |
+| `E_USER_DEPRECATED` | `16384` |
 | `PHP_EOL` | `"\n"` |
 | `PHP_INT_MAX` | `9223372036854775807` |
 | `PHP_INT_MIN` | `-9223372036854775808` |
@@ -188,7 +200,7 @@ echo constant('SITE_NAME');
 
 ## Functions — Complete List
 
-### String (30)
+### String (32)
 
 | Function | Signature | Returns |
 |----------|-----------|---------|
@@ -196,8 +208,9 @@ echo constant('SITE_NAME');
 | `strtolower` | `strtolower($s)` | string |
 | `strtoupper` | `strtoupper($s)` | string |
 | `trim` | `trim($s [, $chars])` | string |
-| `ltrim` | `ltrim($s)` | string |
-| `rtrim` / `chop` | `rtrim($s)` | string |
+| `ltrim` | `ltrim($s [, $chars])` | string — supports character mask |
+| `rtrim` / `chop` | `rtrim($s [, $chars])` | string — supports character mask |
+| `substr_count` | `substr_count($haystack, $needle)` | int — count occurrences |
 | `substr` | `substr($s, $start [, $len])` | string |
 | `str_replace` | `str_replace($search, $replace, $subject)` | string |
 | `str_contains` | `str_contains($haystack, $needle)` | bool |
@@ -274,13 +287,15 @@ echo constant('SITE_NAME');
 | `json_encode` | `json_encode($value)` | string |
 | `json_decode` | `json_decode($json [, $assoc])` | mixed — arrays when `$assoc=true` |
 
-### Filesystem (12)
+### Filesystem (14)
 
 | Function | Signature | Returns |
 |----------|-----------|---------|
 | `file_exists` | `file_exists($path)` | bool |
 | `is_file` | `is_file($path)` | bool |
 | `is_dir` | `is_dir($path)` | bool |
+| `is_readable` | `is_readable($path)` | bool — alias for file_exists |
+| `is_writable` | `is_writable($path)` | bool — alias for file_exists |
 | `readfile` | `readfile($path)` | int — bytes output |
 | `file_get_contents` | `file_get_contents($path_or_url)` | string — works with HTTP URLs |
 | `file_put_contents` | `file_put_contents($path, $data)` | int — bytes written |
@@ -322,17 +337,26 @@ echo constant('SITE_NAME');
 
 Patterns use PHP delimiters: `/pattern/flags`. The `i`, `m`, `s` flags are passed to the Rust regex engine.
 
-### HTTP / Output (7)
+### URL (1)
 
 | Function | Signature | Returns |
 |----------|-----------|---------|
-| `header` | `header('Name: value')` | null — sets response header |
+| `parse_url` | `parse_url($url [, $component])` | array \| string — supports PHP_URL_* constants |
+
+Constants: `PHP_URL_SCHEME` (0), `PHP_URL_HOST` (1), `PHP_URL_PORT` (2), `PHP_URL_USER` (3), `PHP_URL_PASS` (4), `PHP_URL_PATH` (5), `PHP_URL_QUERY` (6), `PHP_URL_FRAGMENT` (7)
+
+### HTTP / Output (8)
+
+| Function | Signature | Returns |
+|----------|-----------|---------|
+| `header` | `header('Name: value' [, $replace [, $code]])` | null — sets response header; 3rd arg sets status code |
 | `http_response_code` | `http_response_code($code)` | int — sets/returns status |
 | `setcookie` | `setcookie($name, $value)` | true — sets Set-Cookie header |
 | `echo` | `echo $expr` | — outputs to response |
 | `print_r` | `print_r($val [, $return])` | string \| true |
 | `var_dump` | `var_dump($val, ...)` | null — outputs type info |
-| `error_log` | `error_log($msg)` | true — writes to ruph log |
+| `error_log` | `error_log($msg)` | true — writes to domain log file (or fallback global log) |
+| `trigger_error` | `trigger_error($msg [, $level])` | true — logs with error level prefix |
 
 ### Output Buffering (2)
 

@@ -81,13 +81,17 @@ ruph resolves the filesystem **before** PHP runs and sets these `$_SERVER` keys:
 
 | Key | Value |
 |-----|-------|
-| `rr_file` | Realpath of matched file, or `null` |
-| `rr_dir` | Realpath if URI maps to a directory, or `null` |
-| `rr_index` | First matching index file inside `rr_dir`, or `null` |
-| `rr_leaf_idx` | `_index.php` in the leaf directory, or `null` |
+| `rr_root` | Absolute path to the vhost document root |
+| `rr_file` | Realpath of matched file, or empty |
+| `rr_exists` | `"1"` if URI maps to an existing file, or empty |
+| `rr_dir` | Realpath if URI maps to a directory, or empty |
+| `rr_index` | First matching index file inside `rr_dir`, or empty |
+| `rr_leaf_idx` | `_index.php` in the leaf directory, or empty |
 | `rr_mime` | MIME type ruph would use for `rr_file` |
 
 Plus all standard `$_SERVER` keys: `REQUEST_URI`, `REQUEST_METHOD`, `QUERY_STRING`, `HTTP_HOST`, `DOCUMENT_ROOT`, `SCRIPT_FILENAME`, `PHP_SELF`, `PATH_INFO`, and all `HTTP_*` headers.
+
+For full details on return semantics and `rr_*` variables, see [RETURN_RR_VARS.md](RETURN_RR_VARS.md).
 
 ## Ruph PHP Reference
 

@@ -185,6 +185,7 @@ async fn main() -> Result<()> {
     } else if let Some(found) = config::Config::find_config(cli.root.as_deref()) {
         config::Config::load(&found)?
     } else {
+        eprintln!("  config: (none — using defaults)");
         config::Config::default()
     };
 
