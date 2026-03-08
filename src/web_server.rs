@@ -390,9 +390,12 @@ impl WebServer {
 
     /// Pre-resolve the filesystem for a request URI, producing `rr_*` server variables.
     ///
-    /// Returns a HashMap with keys: `rr_file`, `rr_dir`, `rr_index`, `rr_leaf_idx`, `rr_mime`, `rr_exists`.
-    /// Values are either realpath strings or empty string for null. `rr_exists` is "1" or "".
-    fn resolve_rr_vars(&self, url_path: &str, root: &Path) -> HashMap<String, String> {
+    /// Returns (HashMap, leaf_chain) where:
+    /// - HashMap has keys: `rr_file`, `rr_dir`, `rr_index`, `rr_leaf_idx`, `rr_mime`, `rr_exists`, `rr_root`
+    /// - leaf_chain is a Vec of _index.php paths from docroot down to target dir (outermost first)
+    ///
+    /// `rr_leaf_idx` is set to the deepest (last) entry in the chain for backward compat.
+    fn resolve_rr_vars(&self, url_path: &str, root: &Path) -> (HashMap<String, String>, Vec<PathBuf>) {
         let mut rr = HashMap::new();
         rr.insert("rr_file".to_string(), String::new());
         rr.insert("rr_dir".to_string(), String::new());
@@ -402,20 +405,19 @@ impl WebServer {
         rr.insert("rr_exists".to_string(), String::new());
         rr.insert("rr_root".to_string(), root.to_string_lossy().to_string());
 
-        // The master _index.php path — leaf should never point to this.
+        // The master _index.php path — leaves should never include this.
         // Master lives at the global root_dir, not the per-domain docroot.
         let master_path = self.root_dir.join(&self.middleware_index);
         let master_canonical = master_path.canonicalize().ok();
 
         let file_path = match self.resolve_file_path(url_path, root) {
             Ok(p) => p,
-            Err(_) => return rr,
+            Err(_) => return (rr, Vec::new()),
         };
 
-        if file_path.is_file() {
-            // URI maps to a file
+        // Determine the target directory for _index.php chain collection
+        let target_dir = if file_path.is_file() {
             let fname = file_path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-            // Never expose _index.php as rr_file
             if fname != "_index.php" {
                 if let Ok(real) = file_path.canonicalize() {
                     rr.insert("rr_file".to_string(), real.to_string_lossy().to_string());
@@ -424,27 +426,14 @@ impl WebServer {
                     rr.insert("rr_mime".to_string(), mime);
                 }
             }
-            // Check for leaf _index.php in the file's parent directory
-            if let Some(parent) = file_path.parent() {
-                let leaf = parent.join("_index.php");
-                if leaf.is_file() {
-                    if let Ok(real) = leaf.canonicalize() {
-                        // Only set leaf if it's NOT the master _index.php
-                        if master_canonical.as_ref() != Some(&real) {
-                            rr.insert("rr_leaf_idx".to_string(), real.to_string_lossy().to_string());
-                        }
-                    }
-                }
-            }
+            file_path.parent().map(|p| p.to_path_buf())
         } else if file_path.is_dir() {
-            // URI maps to a directory
             if let Ok(real) = file_path.canonicalize() {
                 rr.insert("rr_dir".to_string(), real.to_string_lossy().to_string());
             }
-            // Check for index file in the directory
             for name in &self.index_files {
                 if name == "_index.php" {
-                    continue; // _index.php is the leaf, not the index
+                    continue;
                 }
                 let candidate = file_path.join(name);
                 if candidate.is_file() {
@@ -454,17 +443,9 @@ impl WebServer {
                     break;
                 }
             }
-            // Check for leaf _index.php (only if different from master)
-            let leaf = file_path.join("_index.php");
-            if leaf.is_file() {
-                if let Ok(real) = leaf.canonicalize() {
-                    if master_canonical.as_ref() != Some(&real) {
-                        rr.insert("rr_leaf_idx".to_string(), real.to_string_lossy().to_string());
-                    }
-                }
-            }
+            Some(file_path.clone())
         } else {
-            // URI doesn't map to anything on disk — walk up to find the deepest existing dir
+            // URI doesn't map to anything on disk — walk down to find the deepest existing dir
             let decoded = decode(url_path).unwrap_or_default();
             let clean = decoded.trim_start_matches('/');
             let parts: Vec<&str> = clean.split('/').filter(|p| !p.is_empty()).collect();
@@ -477,18 +458,50 @@ impl WebServer {
                     break;
                 }
             }
-            // Check for leaf _index.php in the deepest existing directory (only if != master)
-            let leaf = deepest.join("_index.php");
-            if leaf.is_file() {
-                if let Ok(real) = leaf.canonicalize() {
-                    if master_canonical.as_ref() != Some(&real) {
-                        rr.insert("rr_leaf_idx".to_string(), real.to_string_lossy().to_string());
+            Some(deepest)
+        };
+
+        // Build the _index.php cascade chain: walk from docroot down to target_dir,
+        // collecting every _index.php found along the way (outermost first).
+        let mut leaf_chain: Vec<PathBuf> = Vec::new();
+        if let Some(target) = target_dir {
+            let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+            // Get the relative path segments from docroot to target
+            let target_canon = target.canonicalize().unwrap_or_else(|_| target.clone());
+            if let Ok(rel) = target_canon.strip_prefix(&canonical_root) {
+                // Walk down from docroot, checking each level
+                let mut current = canonical_root.clone();
+                // Check docroot itself first
+                let leaf = current.join("_index.php");
+                if leaf.is_file() {
+                    if let Ok(real) = leaf.canonicalize() {
+                        if master_canonical.as_ref() != Some(&real) {
+                            leaf_chain.push(real);
+                        }
+                    }
+                }
+                // Then each subdirectory component
+                for component in rel.components() {
+                    current = current.join(component);
+                    let leaf = current.join("_index.php");
+                    if leaf.is_file() {
+                        if let Ok(real) = leaf.canonicalize() {
+                            if master_canonical.as_ref() != Some(&real) {
+                                leaf_chain.push(real);
+                            }
+                        }
                     }
                 }
             }
         }
 
-        rr
+        // rr_leaf_idx = deepest leaf (backward compat)
+        if let Some(deepest) = leaf_chain.last() {
+            rr.insert("rr_leaf_idx".to_string(), deepest.to_string_lossy().to_string());
+        }
+
+        (rr, leaf_chain)
     }
 
     /// Handle HTTP web requests using the master/leaf _index.php architecture.
@@ -535,7 +548,12 @@ impl WebServer {
         }
 
         // ── Step 1: Pre-resolve filesystem → rr_* variables ──
-        let rr_vars = self.resolve_rr_vars(&path, &root);
+        let (rr_vars, leaf_chain) = self.resolve_rr_vars(&path, &root);
+        debug!("rr_vars: leaf_chain={:?} file={} dir={} index={}",
+            leaf_chain.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+            rr_vars.get("rr_file").unwrap_or(&String::new()),
+            rr_vars.get("rr_dir").unwrap_or(&String::new()),
+            rr_vars.get("rr_index").unwrap_or(&String::new()));
 
         // ── Step 2: Find and run master /_index.php ──
         // Master always lives at the global root_dir, not the per-domain docroot.
@@ -583,33 +601,32 @@ impl WebServer {
             }
 
             // ── Step 3: Default handling ──
-            let rr_leaf = &rr_vars["rr_leaf_idx"];
             let rr_file = &rr_vars["rr_file"];
             let rr_dir = &rr_vars["rr_dir"];
             let rr_index = &rr_vars["rr_index"];
 
-            // ── Leaf execution (same exit/return semantics as master) ──
-            if !rr_leaf.is_empty() {
-                let leaf_path = PathBuf::from(rr_leaf);
-                let mut leaf_sv = self.build_server_vars_from_existing(&server_vars, &leaf_path, &root);
+            // ── Leaf chain execution: run _index.php files from docroot down ──
+            // Each can exit (request handled) or return/fall-through to continue to the next.
+            for leaf_path in &leaf_chain {
+                let mut leaf_sv = self.build_server_vars_from_existing(&server_vars, leaf_path, &root);
                 for (k, v) in &rr_vars {
                     leaf_sv.insert(k.clone(), v.clone());
                 }
 
                 let leaf_result = self.run_php_buffered(
-                    &leaf_path, &query_params, &post_params, &leaf_sv, stderr_handler.as_ref()
+                    leaf_path, &query_params, &post_params, &leaf_sv, stderr_handler.as_ref()
                 ).await;
 
                 match leaf_result {
                     Ok(exec) => {
                         if Self::php_handled_request(&exec) {
-                            debug!("Leaf _index.php handled request (exited={}, returned={:?})", exec.exited, exec.returned);
+                            debug!("Leaf {:?} handled request (exited={}, returned={:?})", leaf_path, exec.exited, exec.returned);
                             return Self::build_php_response(&exec);
                         }
-                        debug!("Leaf _index.php passed through — falling through to static serving");
+                        debug!("Leaf {:?} passed through — continuing chain", leaf_path);
                     }
                     Err(e) => {
-                        warn!("Leaf _index.php failed: {} — falling through to static serving", e);
+                        warn!("Leaf {:?} failed: {} — continuing chain", leaf_path, e);
                     }
                 }
             }

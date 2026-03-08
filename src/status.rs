@@ -173,6 +173,7 @@ impl ServerStats {
         vars.insert("RUPH_IP_HITS_WINDOW".to_string(), ip_window.to_string());
         vars.insert("RUPH_RATE_WINDOW".to_string(), self.rate_window.to_string());
         vars.insert("REMOTE_IP".to_string(), ip.to_string());
+        vars.insert("REMOTE_ADDR".to_string(), ip.to_string());
         vars
     }
 }

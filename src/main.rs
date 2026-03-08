@@ -19,6 +19,7 @@ mod config;
 mod ssl;
 mod acme;
 mod status;
+mod crawl_rollup;
 
 use crate::web_server::{WebServer, RuphBody};
 
@@ -401,6 +402,16 @@ async fn main() -> Result<()> {
                 eprintln!("{}", status::format_stats_line(&stats_ref));
             }
         });
+    }
+
+    // Crawl log rollup + IP enrichment background tasks
+    let log_dir = format!("{}/ruph_logs",
+        web_server.root_dir.parent().unwrap_or(&web_server.root_dir).to_string_lossy());
+    // Only start if the crawl log directory exists
+    if std::path::Path::new(&format!("{}/crawl", log_dir)).exists() {
+        info!("Starting crawl rollup task (log_dir: {})", log_dir);
+        tokio::spawn(crawl_rollup::crawl_rollup_task(log_dir.clone()));
+        tokio::spawn(crawl_rollup::ip_enrichment_task(log_dir));
     }
 
     loop {

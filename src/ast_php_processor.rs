@@ -760,20 +760,49 @@ impl AstPhpProcessor {
             "break_statement" | "continue_statement" => {
                 return Ok(ControlFlow::Break(()));
             }
+            // ── const declarations ───────────────────────────────────────
+            "const_declaration" => {
+                // const FOO = 'bar'; or const FOO = ['a','b'];
+                for child in node.named_children(&mut node.walk()) {
+                    if child.kind() == "const_element" {
+                        let name_node = child.child_by_field_name("name")
+                            .or_else(|| child.named_child(0));
+                        let value_node = child.child_by_field_name("value")
+                            .or_else(|| child.named_child(1));
+                        if let (Some(name_n), Some(val_n)) = (name_node, value_node) {
+                            let name = name_n.utf8_text(self.source_code.as_bytes())?.to_string();
+                            let value = self.evaluate_expression(val_n).await?;
+                            self.constants.insert(name, value);
+                        }
+                    }
+                }
+            }
             _ => {
                 let kind = node.kind();
-                // Log unrecognized statement-level AST nodes
-                if !matches!(kind, "program" | "php_tag" | "php_end_tag" | "comment"
-                    | "text_interpolation" | "expression_statement" | "compound_statement"
-                    | "declaration_list" | "namespace_definition" | "namespace_use_declaration") {
-                    let line = node.start_position().row + 1;
-                    self.log_error(&format!("Unhandled AST node '{}' at line {}", kind, line));
-                }
-                // Recursively process child nodes
-                for child in node.named_children(&mut node.walk()) {
-                    let flow = self.process_node(child, output).await?;
-                    if let ControlFlow::Break(()) = flow {
-                        return Ok(ControlFlow::Break(()));
+                // Expression-like nodes that ended up in process_node:
+                // evaluate as expression (discarding result) instead of recursing into children
+                if kind.ends_with("_expression") || kind == "array_element_initializer"
+                    || kind == "string" || kind == "string_content" || kind == "integer"
+                    || kind == "float" || kind == "encapsed_string" {
+                    let _ = self.evaluate_expression(node).await.ok();
+                    if let Some(out) = self.take_side_effect_output() {
+                        self.append_output(output, &out);
+                    }
+                } else {
+                    // Log unrecognized statement-level AST nodes
+                    if !matches!(kind, "program" | "php_tag" | "php_end_tag" | "comment"
+                        | "text_interpolation" | "expression_statement" | "compound_statement"
+                        | "declaration_list" | "namespace_definition" | "namespace_use_declaration"
+                        | "const_element") {
+                        let line = node.start_position().row + 1;
+                        self.log_error(&format!("Unhandled AST node '{}' at line {}", kind, line));
+                    }
+                    // Recursively process child nodes
+                    for child in node.named_children(&mut node.walk()) {
+                        let flow = self.process_node(child, output).await?;
+                        if let ControlFlow::Break(()) = flow {
+                            return Ok(ControlFlow::Break(()));
+                        }
                     }
                 }
             }
@@ -953,6 +982,48 @@ impl AstPhpProcessor {
                     self.variables.insert(var_name, value);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Remove a variable or array key (unset).
+    #[async_recursion]
+    async fn unset_target(&mut self, node: Node<'async_recursion>) -> Result<()> {
+        match node.kind() {
+            "variable" | "variable_name" => {
+                if let Some(var_name) = self.get_identifier(node) {
+                    self.variables.remove(&var_name);
+                }
+            }
+            "subscript_expression" => {
+                let target = node.child_by_field_name("value")
+                    .or_else(|| node.child_by_field_name("array"))
+                    .or_else(|| node.named_child(0));
+                let index = node.child_by_field_name("index")
+                    .or_else(|| node.child_by_field_name("offset"))
+                    .or_else(|| node.named_child(1));
+
+                if let (Some(target), Some(index)) = (target, index) {
+                    let target_name = if let Some(id) = self.get_identifier(target) {
+                        id
+                    } else {
+                        target.utf8_text(self.source_code.as_bytes())?.trim_start_matches('$').to_string()
+                    };
+                    let key = self.evaluate_expression(index).await?.as_string();
+
+                    if let Some(PhpValue::Array(items)) = self.variables.get(&target_name) {
+                        let mut new_items = Vec::new();
+                        for item in items {
+                            match item {
+                                PhpArrayItem::KeyValue(k, _) if k == &key => {} // skip = remove
+                                _ => new_items.push(item.clone()),
+                            }
+                        }
+                        self.variables.insert(target_name, PhpValue::Array(new_items));
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1427,8 +1498,25 @@ impl AstPhpProcessor {
         }
         let func_name = {
             let source = self.source_code.as_bytes();
-            function.utf8_text(source)?.to_string()
+            let raw = function.utf8_text(source)?.to_string();
+            // Strip leading backslash from namespace-qualified calls like \is_scalar()
+            raw.trim_start_matches('\\').to_string()
         };
+
+        // Handle unset() specially — needs raw AST nodes to find variable/key references
+        if func_name == "unset" {
+            if let Some(args_node) = args_node {
+                for child in args_node.named_children(&mut args_node.walk()) {
+                    let target = if child.kind() == "argument" {
+                        child.named_child(0).unwrap_or(child)
+                    } else {
+                        child
+                    };
+                    self.unset_target(target).await?;
+                }
+            }
+            return Ok(PhpValue::Null);
+        }
 
         let mut args = Vec::new();
         if let Some(args_node) = args_node {
@@ -1446,8 +1534,64 @@ impl AstPhpProcessor {
         match func_name.as_str() {
             "phpversion" => Ok(PhpValue::String("8.4.0-ast".to_string())),
             "date" => {
-                let now = chrono::Utc::now();
-                Ok(PhpValue::String(now.format("%Y-%m-%d %H:%M:%S").to_string()))
+                let fmt = args.first().map_or(String::new(), |a| a.as_string());
+                let dt = if let Some(ts) = args.get(1) {
+                    let secs = ts.as_int();
+                    chrono::DateTime::from_timestamp(secs, 0)
+                        .map(|dt| dt.with_timezone(&chrono::Local))
+                        .unwrap_or_else(chrono::Local::now)
+                } else {
+                    chrono::Local::now()
+                };
+                if fmt.is_empty() {
+                    return Ok(PhpValue::String(dt.format("%Y-%m-%d %H:%M:%S").to_string()));
+                }
+                let mut out = String::new();
+                let chars: Vec<char> = fmt.chars().collect();
+                let mut i = 0;
+                while i < chars.len() {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        out.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    match chars[i] {
+                        'Y' => out.push_str(&dt.format("%Y").to_string()),
+                        'y' => out.push_str(&dt.format("%y").to_string()),
+                        'm' => out.push_str(&dt.format("%m").to_string()),
+                        'n' => out.push_str(&dt.format("%-m").to_string()),
+                        'd' => out.push_str(&dt.format("%d").to_string()),
+                        'j' => out.push_str(&dt.format("%-d").to_string()),
+                        'H' => out.push_str(&dt.format("%H").to_string()),
+                        'G' => out.push_str(&dt.format("%-H").to_string()),
+                        'i' => out.push_str(&dt.format("%M").to_string()),
+                        's' => out.push_str(&dt.format("%S").to_string()),
+                        'A' => out.push_str(&dt.format("%p").to_string()),
+                        'a' => out.push_str(&dt.format("%P").to_string()),
+                        'g' => out.push_str(&dt.format("%-I").to_string()),
+                        'U' => out.push_str(&dt.timestamp().to_string()),
+                        'N' => out.push_str(&dt.format("%u").to_string()),
+                        'w' => out.push_str(&dt.format("%w").to_string()),
+                        'D' => out.push_str(&dt.format("%a").to_string()),
+                        'l' => out.push_str(&dt.format("%A").to_string()),
+                        'F' => out.push_str(&dt.format("%B").to_string()),
+                        'M' => out.push_str(&dt.format("%b").to_string()),
+                        't' => {
+                            let y = dt.format("%Y").to_string().parse::<i32>().unwrap_or(2000);
+                            let m = dt.format("%m").to_string().parse::<u32>().unwrap_or(1);
+                            let days = match m {
+                                1|3|5|7|8|10|12 => 31,
+                                4|6|9|11 => 30,
+                                2 => if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 29 } else { 28 },
+                                _ => 30,
+                            };
+                            out.push_str(&days.to_string());
+                        }
+                        c => out.push(c),
+                    }
+                    i += 1;
+                }
+                Ok(PhpValue::String(out))
             }
             "header" => {
                 if let Some(header_line) = args.get(0) {
@@ -1778,12 +1922,94 @@ impl AstPhpProcessor {
                 let mut out = String::new();
                 while i < chars.len() {
                     if chars[i] == '%' && i + 1 < chars.len() {
-                        match chars[i + 1] {
-                            's' => { out.push_str(&args.get(arg_idx).map_or(String::new(), |a| a.as_string())); arg_idx += 1; i += 2; }
-                            'd' => { out.push_str(&args.get(arg_idx).map_or(0, |a| a.as_int()).to_string()); arg_idx += 1; i += 2; }
-                            'f' => { out.push_str(&format!("{:.6}", args.get(arg_idx).map_or(0.0, |a| a.as_float()))); arg_idx += 1; i += 2; }
-                            '%' => { out.push('%'); i += 2; }
-                            _ => { out.push(chars[i]); i += 1; }
+                        // Parse optional flags, width, precision: %[0-][width][.precision][type]
+                        let mut j = i + 1;
+                        let mut pad_char = ' ';
+                        let mut width: usize = 0;
+                        let mut precision: Option<usize> = None;
+                        let mut left_align = false;
+                        // Flags
+                        while j < chars.len() {
+                            match chars[j] {
+                                '0' if width == 0 && precision.is_none() => { pad_char = '0'; j += 1; }
+                                '-' => { left_align = true; j += 1; }
+                                _ => break,
+                            }
+                        }
+                        // Width
+                        while j < chars.len() && chars[j].is_ascii_digit() {
+                            width = width * 10 + (chars[j] as usize - '0' as usize);
+                            j += 1;
+                        }
+                        // Precision
+                        if j < chars.len() && chars[j] == '.' {
+                            j += 1;
+                            let mut p = 0usize;
+                            while j < chars.len() && chars[j].is_ascii_digit() {
+                                p = p * 10 + (chars[j] as usize - '0' as usize);
+                                j += 1;
+                            }
+                            precision = Some(p);
+                        }
+                        // Type specifier
+                        if j < chars.len() {
+                            let formatted = match chars[j] {
+                                's' => {
+                                    let s = args.get(arg_idx).map_or(String::new(), |a| a.as_string());
+                                    arg_idx += 1;
+                                    if let Some(p) = precision { s[..s.len().min(p)].to_string() } else { s }
+                                }
+                                'd' => {
+                                    let n = args.get(arg_idx).map_or(0, |a| a.as_int());
+                                    arg_idx += 1;
+                                    n.to_string()
+                                }
+                                'f' => {
+                                    let f = args.get(arg_idx).map_or(0.0, |a| a.as_float());
+                                    arg_idx += 1;
+                                    let p = precision.unwrap_or(6);
+                                    format!("{:.*}", p, f)
+                                }
+                                'x' => {
+                                    let n = args.get(arg_idx).map_or(0, |a| a.as_int());
+                                    arg_idx += 1;
+                                    format!("{:x}", n)
+                                }
+                                'X' => {
+                                    let n = args.get(arg_idx).map_or(0, |a| a.as_int());
+                                    arg_idx += 1;
+                                    format!("{:X}", n)
+                                }
+                                'o' => {
+                                    let n = args.get(arg_idx).map_or(0, |a| a.as_int());
+                                    arg_idx += 1;
+                                    format!("{:o}", n)
+                                }
+                                'b' => {
+                                    let n = args.get(arg_idx).map_or(0, |a| a.as_int());
+                                    arg_idx += 1;
+                                    format!("{:b}", n)
+                                }
+                                '%' => { i = j + 1; out.push('%'); continue; }
+                                _ => { out.push('%'); i = i + 1; continue; }
+                            };
+                            // Apply width padding
+                            if width > formatted.len() {
+                                let padding = width - formatted.len();
+                                if left_align {
+                                    out.push_str(&formatted);
+                                    for _ in 0..padding { out.push(' '); }
+                                } else {
+                                    for _ in 0..padding { out.push(pad_char); }
+                                    out.push_str(&formatted);
+                                }
+                            } else {
+                                out.push_str(&formatted);
+                            }
+                            i = j + 1;
+                        } else {
+                            out.push(chars[i]);
+                            i += 1;
                         }
                     } else {
                         out.push(chars[i]);
@@ -2498,6 +2724,8 @@ impl AstPhpProcessor {
                 // Stub — sessions not yet implemented
                 Ok(PhpValue::Bool(true))
             }
+            // unset() is handled specially before arg evaluation (see above)
+            // This fallback handles edge cases where it arrives as a regular call
             "unset" => Ok(PhpValue::Null),
             "sleep" | "usleep" => Ok(PhpValue::Int(0)),
             "php_uname" => Ok(PhpValue::String(std::env::consts::OS.to_string())),
@@ -2514,6 +2742,8 @@ impl AstPhpProcessor {
                 if let Some(user_func) = self.user_functions.get(&func_name).cloned() {
                     // Set up local scope with parameters
                     let saved_vars = self.variables.clone();
+                    let saved_script_returned = self.script_returned.take();
+                    let saved_body_override = self.response_body_override.take();
                     for (i, (param_name, default)) in user_func.params.iter().enumerate() {
                         let value = args.get(i).cloned()
                             .or_else(|| default.clone())
@@ -2531,10 +2761,15 @@ impl AstPhpProcessor {
                     // Restore outer scope
                     self.variables = saved_vars;
 
+                    // Extract function return value, then restore script-level state
+                    let func_return = self.response_body_override.take();
+                    self.script_returned = saved_script_returned;
+                    self.response_body_override = saved_body_override;
+
                     match result {
                         Ok(_) => {
-                            if let Some(body_override) = self.response_body_override.take() {
-                                // return statement was hit
+                            if let Some(body_override) = func_return {
+                                // return statement was hit inside function
                                 return Ok(PhpValue::String(body_override));
                             }
                             if !func_output.is_empty() {
