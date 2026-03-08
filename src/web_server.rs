@@ -504,7 +504,7 @@ impl WebServer {
     ///    c. rr_dir + rr_index → serve index file
     ///    d. rr_dir, no index or leaf → 500
     ///    e. nothing matched → 404
-    pub async fn handle_request(&self, req: Request<IncomingBody>, remote_addr: Option<std::net::SocketAddr>) -> Result<Response<RuphBody>> {
+    pub async fn handle_request(&self, req: Request<IncomingBody>, remote_addr: Option<std::net::SocketAddr>, is_tls: bool) -> Result<Response<RuphBody>> {
         let host = req.headers().get("host")
             .and_then(|v| v.to_str().ok())
             .or_else(|| req.uri().authority().map(|a| a.as_str()))
@@ -545,6 +545,9 @@ impl WebServer {
             // Extract query string and build server vars before consuming the request body
             let query_string = req.uri().query().unwrap_or("").to_string();
             let mut server_vars = self.build_server_vars_with_addr(&req, &master_path, &root, remote_addr)?;
+            if is_tls {
+                server_vars.insert("HTTPS".to_string(), "on".to_string());
+            }
             for (k, v) in &rr_vars {
                 server_vars.insert(k.clone(), v.clone());
             }
@@ -1161,6 +1164,7 @@ impl WebServer {
             let header_value = value.to_str().unwrap_or("").to_string();
             server_vars.insert(header_name, header_value);
         }
+
 
         // Inject RUPH_* stats vars if stats + remote_addr available
         if let (Some(stats), Some(addr)) = (&self.stats, remote_addr) {

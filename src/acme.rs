@@ -28,6 +28,11 @@ pub async fn issue_cert(email: &str, domain: &str, ssl_dir: &Path) -> Result<()>
 
     let domain_dir = ssl_dir.join(domain);
     std::fs::create_dir_all(&domain_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&domain_dir, std::fs::Permissions::from_mode(0o700));
+    }
 
     let account = create_or_load_account(email, ssl_dir).await?;
 
@@ -95,7 +100,13 @@ pub async fn issue_cert(email: &str, domain: &str, ssl_dir: &Path) -> Result<()>
         .ok_or_else(|| anyhow!("No certificate returned"))?;
 
     std::fs::write(domain_dir.join("fullchain.pem"), cert_chain)?;
-    std::fs::write(domain_dir.join("privkey.pem"), keypair.serialize_pem())?;
+    let privkey_path = domain_dir.join("privkey.pem");
+    std::fs::write(&privkey_path, keypair.serialize_pem())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&privkey_path, std::fs::Permissions::from_mode(0o600));
+    }
 
     info!("Certificate issued for {} and saved to {}", domain, domain_dir.display());
 
@@ -120,6 +131,11 @@ async fn create_or_load_account(email: &str, ssl_dir: &Path) -> Result<Account> 
 
     let (account, creds) = Account::create(&new_account, LetsEncrypt::Production.url(), None).await?;
     std::fs::write(&creds_path, serde_json::to_string_pretty(&creds)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&creds_path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(account)
 }
 

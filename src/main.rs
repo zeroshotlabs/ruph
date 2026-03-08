@@ -211,9 +211,9 @@ struct Cli {
     #[arg(long, value_name = "BINARY")]
     php_binary: Option<String>,
 
-    /// Log level (error, warn, info, debug, trace)
-    #[arg(long, default_value = "info")]
-    log_level: String,
+    /// Log level (error, warn, info, debug, trace). Overrides config file if set.
+    #[arg(long)]
+    log_level: Option<String>,
 
     /// Optional plain-HTTP bind address, e.g. 0.0.0.0:80
     #[arg(long = "bind-http", alias = "http-bind", value_name = "ADDR")]
@@ -248,7 +248,7 @@ async fn main() -> Result<()> {
     };
 
     // CLI overrides config (CLI takes precedence)
-    let log_level = if cli.log_level != "info" { &cli.log_level } else { &cfg.log_level };
+    let log_level = cli.log_level.as_deref().unwrap_or(&cfg.log_level);
     let log_console = cli.log_console || cfg.log_console;
     if log_console {
         init_logging(log_level)?;
@@ -570,7 +570,7 @@ async fn handle_request(
         }
     }
 
-    let response = match web_server.handle_request(req, Some(remote_addr)).await {
+    let response = match web_server.handle_request(req, Some(remote_addr), is_tls).await {
         Ok(resp) => resp,
         Err(e) => {
             error!("[{}] {} {} {} - {}", domain, remote_addr, method, uri, e);

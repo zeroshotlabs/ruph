@@ -327,10 +327,17 @@ impl Config {
                                 config.domain_logs.insert(domain.to_string(), path.to_string());
                             }
                         }
+                    } else if let Some(domain) = key.strip_prefix("error_log.") {
+                        if let Some(path) = value {
+                            let path = path.trim();
+                            if !path.is_empty() && !domain.is_empty() {
+                                config.domain_error_logs.insert(domain.to_string(), path.to_string());
+                            }
+                        }
                     }
                 }
             }
-            // Old-style [http] docroot / http_docroot / index_files / logs
+            // Old-style [http] docroot / http_docroot / index_files / logs / error_log
             if config.docroot.is_none() {
                 if let Some(v) = ini.get("http", "docroot") {
                     if !v.is_empty() { config.docroot = Some(v); }
@@ -351,6 +358,12 @@ impl Config {
                 if let Some(v) = ini.get("http", "logs") {
                     let v = v.trim().to_string();
                     if !v.is_empty() { config.default_log = Some(v); }
+                }
+            }
+            if config.default_error_log.is_none() {
+                if let Some(v) = ini.get("http", "error_log") {
+                    let v = v.trim().to_string();
+                    if !v.is_empty() { config.default_error_log = Some(v); }
                 }
             }
         }

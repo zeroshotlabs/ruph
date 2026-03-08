@@ -458,12 +458,33 @@ impl AstPhpProcessor {
                     let left_val = self.evaluate_expression(left).await?;
                     let right_val = self.evaluate_expression(right).await?;
                     let result = match operator.as_str() {
-                        "+=" => PhpValue::Float(left_val.as_float() + right_val.as_float()),
-                        "-=" => PhpValue::Float(left_val.as_float() - right_val.as_float()),
-                        "*=" => PhpValue::Float(left_val.as_float() * right_val.as_float()),
+                        "+=" => if left_val.is_int_like() && right_val.is_int_like() {
+                            PhpValue::Int(left_val.as_int().wrapping_add(right_val.as_int()))
+                        } else {
+                            PhpValue::Float(left_val.as_float() + right_val.as_float())
+                        },
+                        "-=" => if left_val.is_int_like() && right_val.is_int_like() {
+                            PhpValue::Int(left_val.as_int().wrapping_sub(right_val.as_int()))
+                        } else {
+                            PhpValue::Float(left_val.as_float() - right_val.as_float())
+                        },
+                        "*=" => if left_val.is_int_like() && right_val.is_int_like() {
+                            PhpValue::Int(left_val.as_int().wrapping_mul(right_val.as_int()))
+                        } else {
+                            PhpValue::Float(left_val.as_float() * right_val.as_float())
+                        },
                         "/=" => {
                             let d = right_val.as_float();
-                            if d == 0.0 { PhpValue::Bool(false) } else { PhpValue::Float(left_val.as_float() / d) }
+                            if d == 0.0 {
+                                self.log_error("Division by zero");
+                                PhpValue::Bool(false)
+                            } else if left_val.is_int_like() && right_val.is_int_like() {
+                                let li = left_val.as_int();
+                                let ri = right_val.as_int();
+                                if ri != 0 && li % ri == 0 { PhpValue::Int(li / ri) } else { PhpValue::Float(left_val.as_float() / d) }
+                            } else {
+                                PhpValue::Float(left_val.as_float() / d)
+                            }
                         }
                         ".=" => PhpValue::String(format!("{}{}", left_val.as_string(), right_val.as_string())),
                         "??=" => if left_val.is_null() { right_val } else { left_val },
@@ -1151,14 +1172,38 @@ impl AstPhpProcessor {
                         ">" => Ok(PhpValue::Bool(left_val.as_float() > right_val.as_float())),
                         "<=" => Ok(PhpValue::Bool(left_val.as_float() <= right_val.as_float())),
                         ">=" => Ok(PhpValue::Bool(left_val.as_float() >= right_val.as_float())),
-                        // Arithmetic
-                        "+" => Ok(PhpValue::Float(left_val.as_float() + right_val.as_float())),
-                        "-" => Ok(PhpValue::Float(left_val.as_float() - right_val.as_float())),
-                        "*" => Ok(PhpValue::Float(left_val.as_float() * right_val.as_float())),
+                        // Arithmetic — preserve Int when both operands are int-like
+                        "+" => Ok(if left_val.is_int_like() && right_val.is_int_like() {
+                            PhpValue::Int(left_val.as_int().wrapping_add(right_val.as_int()))
+                        } else {
+                            PhpValue::Float(left_val.as_float() + right_val.as_float())
+                        }),
+                        "-" => Ok(if left_val.is_int_like() && right_val.is_int_like() {
+                            PhpValue::Int(left_val.as_int().wrapping_sub(right_val.as_int()))
+                        } else {
+                            PhpValue::Float(left_val.as_float() - right_val.as_float())
+                        }),
+                        "*" => Ok(if left_val.is_int_like() && right_val.is_int_like() {
+                            PhpValue::Int(left_val.as_int().wrapping_mul(right_val.as_int()))
+                        } else {
+                            PhpValue::Float(left_val.as_float() * right_val.as_float())
+                        }),
                         "/" => {
                             let d = right_val.as_float();
-                            if d == 0.0 { Ok(PhpValue::Bool(false)) }
-                            else { Ok(PhpValue::Float(left_val.as_float() / d)) }
+                            if d == 0.0 {
+                                self.log_error("Division by zero");
+                                Ok(PhpValue::Bool(false))
+                            } else if left_val.is_int_like() && right_val.is_int_like() {
+                                let li = left_val.as_int();
+                                let ri = right_val.as_int();
+                                if ri != 0 && li % ri == 0 {
+                                    Ok(PhpValue::Int(li / ri))
+                                } else {
+                                    Ok(PhpValue::Float(left_val.as_float() / d))
+                                }
+                            } else {
+                                Ok(PhpValue::Float(left_val.as_float() / d))
+                            }
                         }
                         "%" => {
                             let d = right_val.as_int();
@@ -1172,8 +1217,11 @@ impl AstPhpProcessor {
                         "^" => Ok(PhpValue::Int(left_val.as_int() ^ right_val.as_int())),
                         "<<" => Ok(PhpValue::Int(left_val.as_int() << right_val.as_int())),
                         ">>" => Ok(PhpValue::Int(left_val.as_int() >> right_val.as_int())),
-                        // instanceof
-                        "instanceof" => Ok(PhpValue::Bool(false)), // stub
+                        // instanceof — classes not supported in AST mode
+                        "instanceof" => {
+                            self.log_error("instanceof is not supported in AST mode (always returns false)");
+                            Ok(PhpValue::Bool(false))
+                        }
                         _ => Ok(PhpValue::Null),
                     }
                 } else {
@@ -1200,8 +1248,8 @@ impl AstPhpProcessor {
                     let val = self.evaluate_expression(operand).await?;
                     match operator.as_str() {
                         "!" => Ok(PhpValue::Bool(!val.is_truthy())),
-                        "-" => Ok(PhpValue::Float(-val.as_float())),
-                        "+" => Ok(PhpValue::Float(val.as_float())),
+                        "-" => Ok(if val.is_int_like() { PhpValue::Int(-val.as_int()) } else { PhpValue::Float(-val.as_float()) }),
+                        "+" => Ok(if val.is_int_like() { PhpValue::Int(val.as_int()) } else { PhpValue::Float(val.as_float()) }),
                         "~" => Ok(PhpValue::Int(!val.as_int())),
                         _ => Ok(val),
                     }
@@ -1263,10 +1311,17 @@ impl AstPhpProcessor {
                 let is_increment = raw.contains("++");
                 if let Some(var_node) = node.named_child(0) {
                     let val = self.evaluate_expression(var_node).await?;
-                    let new_val = if is_increment {
-                        PhpValue::Int(val.as_int() + 1)
-                    } else {
-                        PhpValue::Int(val.as_int() - 1)
+                    let new_val = match &val {
+                        PhpValue::Float(f) => if is_increment {
+                            PhpValue::Float(f + 1.0)
+                        } else {
+                            PhpValue::Float(f - 1.0)
+                        },
+                        _ => if is_increment {
+                            PhpValue::Int(val.as_int() + 1)
+                        } else {
+                            PhpValue::Int(val.as_int() - 1)
+                        },
                     };
                     let is_prefix = raw.starts_with("++") || raw.starts_with("--");
                     self.assign_to(var_node, new_val.clone()).await?;
@@ -1325,16 +1380,23 @@ impl AstPhpProcessor {
                 if let Some(inner) = node.named_child(0) {
                     match self.evaluate_expression(inner).await {
                         Ok(val) => Ok(val),
-                        Err(_) => Ok(PhpValue::Bool(false)),
+                        Err(_) => Ok(PhpValue::Null),
                     }
                 } else {
                     Ok(PhpValue::Null)
                 }
             }
             _ => {
+                let kind = node.kind();
+                let line = node.start_position().row + 1;
+                self.log_error(&format!("Unhandled expression node '{}' at line {}", kind, line));
                 let mut expr_output = String::new();
                 let _ = self.process_node(node, &mut expr_output).await?;
-                Ok(PhpValue::String(expr_output))
+                if expr_output.is_empty() {
+                    Ok(PhpValue::Null)
+                } else {
+                    Ok(PhpValue::String(expr_output))
+                }
             }
         }
     }
@@ -2180,24 +2242,46 @@ impl AstPhpProcessor {
             "file_put_contents" => {
                 let path_str = args.first().map_or(String::new(), |a| a.as_string());
                 let content = args.get(1).map_or(String::new(), |a| a.as_string());
-                let path = self.resolve_local_path(&path_str)?;
+                let path = match self.resolve_local_path(&path_str) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.log_error(&format!("file_put_contents({}): {}", path_str, e));
+                        return Ok(PhpValue::Bool(false));
+                    }
+                };
                 // 3rd arg: flags — FILE_APPEND = 8, LOCK_EX = 2
                 let flags = args.get(2).map_or(0, |a| a.as_int());
                 let file_append = (flags & 8) != 0;
+                let len = content.len() as i64;
                 if file_append {
-                    use std::io::Write;
-                    let mut file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&path)
-                        .map_err(|e| anyhow!("file_put_contents: {}", e))?;
-                    file.write_all(content.as_bytes())
-                        .map_err(|e| anyhow!("file_put_contents: {}", e))?;
+                    let p = path.clone();
+                    let c = content.clone();
+                    let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                        use std::io::Write;
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&p)?;
+                        file.write_all(c.as_bytes())
+                    }).await;
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            self.log_error(&format!("file_put_contents({}): {}", path_str, e));
+                            return Ok(PhpValue::Bool(false));
+                        }
+                        Err(e) => {
+                            self.log_error(&format!("file_put_contents({}): {}", path_str, e));
+                            return Ok(PhpValue::Bool(false));
+                        }
+                    }
                 } else {
-                    fs::write(&path, &content).await
-                        .map_err(|e| anyhow!("file_put_contents: {}", e))?;
+                    if let Err(e) = fs::write(&path, &content).await {
+                        self.log_error(&format!("file_put_contents({}): {}", path_str, e));
+                        return Ok(PhpValue::Bool(false));
+                    }
                 }
-                Ok(PhpValue::Int(content.len() as i64))
+                Ok(PhpValue::Int(len))
             }
             "filesize" => {
                 let path_str = args.first().map_or(String::new(), |a| a.as_string());
@@ -2841,6 +2925,11 @@ impl PhpValue {
             PhpValue::Array(_) => "Array".to_string(),
             PhpValue::Null => String::new(),
         }
+    }
+
+    /// Returns true if this value is integer-typed (Int or Bool — PHP promotes bools to int in arithmetic).
+    pub fn is_int_like(&self) -> bool {
+        matches!(self, PhpValue::Int(_) | PhpValue::Bool(_))
     }
 
     pub fn as_int(&self) -> i64 {
