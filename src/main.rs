@@ -482,7 +482,7 @@ async fn handle_request(
     // Status page intercept — before virtual host routing
     if let Some(ref sp) = status_page_path {
         if uri.path() == sp.as_str() {
-            let html = status::render_status_page(&stats);
+            let html = status::render_status_page(&stats, remote_addr.ip(), &domain);
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/html; charset=utf-8")

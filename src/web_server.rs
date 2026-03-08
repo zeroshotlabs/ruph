@@ -402,8 +402,9 @@ impl WebServer {
         rr.insert("rr_exists".to_string(), String::new());
         rr.insert("rr_root".to_string(), root.to_string_lossy().to_string());
 
-        // The master _index.php path — leaf should never point to this
-        let master_path = root.join(&self.middleware_index);
+        // The master _index.php path — leaf should never point to this.
+        // Master lives at the global root_dir, not the per-domain docroot.
+        let master_path = self.root_dir.join(&self.middleware_index);
         let master_canonical = master_path.canonicalize().ok();
 
         let file_path = match self.resolve_file_path(url_path, root) {
@@ -537,7 +538,9 @@ impl WebServer {
         let rr_vars = self.resolve_rr_vars(&path, &root);
 
         // ── Step 2: Find and run master /_index.php ──
-        let master_path = root.join(&self.middleware_index);
+        // Master always lives at the global root_dir, not the per-domain docroot.
+        // Per-domain _index.php files are discovered as leaves.
+        let master_path = self.root_dir.join(&self.middleware_index);
         if master_path.is_file() {
             // Extract query string and build server vars before consuming the request body
             let query_string = req.uri().query().unwrap_or("").to_string();

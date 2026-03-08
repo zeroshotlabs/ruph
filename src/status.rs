@@ -145,6 +145,13 @@ impl ServerStats {
         }
     }
 
+    /// Count of distinct IPs that had any hits in the given window (seconds).
+    pub fn unique_ips_in_window(&self, window: u64) -> usize {
+        let now_secs = self.start_time.elapsed().as_secs();
+        let map = self.ip_windows.lock().unwrap_or_else(|e| e.into_inner());
+        map.values().filter(|w| w.hits_in_window(now_secs, window) > 0).count()
+    }
+
     /// Returns all IPs sorted by total hits descending.
     pub fn ip_hits(&self) -> Vec<(IpAddr, u64)> {
         let map = self.ip_windows.lock().unwrap_or_else(|e| e.into_inner());
@@ -170,7 +177,7 @@ impl ServerStats {
     }
 }
 
-pub fn render_status_page(stats: &ServerStats) -> String {
+pub fn render_status_page(stats: &ServerStats, viewer_ip: IpAddr, vhost: &str) -> String {
     let uptime = stats.uptime();
     let days = uptime.as_secs() / 86400;
     let hours = (uptime.as_secs() % 86400) / 3600;
@@ -219,7 +226,7 @@ td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
 </head>
 <body>
 <h1>ruph</h1>
-<div class="sub">server status &mdash; {now}</div>
+<div class="sub">server status &mdash; {now} &mdash; vhost: <strong>{vhost}</strong> &mdash; your IP: <strong>{viewer_ip}</strong></div>
 <div class="stats">
     <div class="stat">
         <div class="label">Active Connections</div>
@@ -245,6 +252,10 @@ td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
         <div class="label">Unique IPs</div>
         <div class="value">{unique_ips}</div>
     </div>
+    <div class="stat">
+        <div class="label">IPs/s (2s window)</div>
+        <div class="value">{ips_per_s:.1}</div>
+    </div>
 </div>
 
 <h2>Hits by Source IP</h2>
@@ -257,12 +268,15 @@ td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
 </body>
 </html>"#,
         now = now,
+        vhost = vhost,
+        viewer_ip = viewer_ip,
         active = stats.active_connections(),
         qps_10 = stats.qps(10),
         qps_60 = stats.qps(60),
         total = stats.total_requests(),
         uptime = uptime_str,
         unique_ips = ip_hits.len(),
+        ips_per_s = stats.unique_ips_in_window(2) as f64 / 2.0,
         ip_rows = ip_rows,
     )
 }
@@ -323,7 +337,7 @@ mod tests {
         let stats = ServerStats::new(2);
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
         stats.record_request(ip);
-        let html = render_status_page(&stats);
+        let html = render_status_page(&stats, "127.0.0.1".parse().unwrap(), "localhost");
         assert!(html.contains("ruph"));
         assert!(html.contains("Active Connections"));
         assert!(html.contains("192.168.1.1"));
