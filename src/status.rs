@@ -177,6 +177,28 @@ impl ServerStats {
     }
 }
 
+/// One-line stats summary for stdout (no ANSI, no newline).
+pub fn format_stats_line(stats: &ServerStats) -> String {
+    let uptime = stats.uptime().as_secs();
+    let d = uptime / 86400;
+    let h = (uptime % 86400) / 3600;
+    let m = (uptime % 3600) / 60;
+    let s = uptime % 60;
+    let up = if d > 0 { format!("{}d{:02}h{:02}m", d, h, m) } else { format!("{}h{:02}m{:02}s", h, m, s) };
+    let ips = stats.ip_hits().len();
+    let ips_2s = stats.unique_ips_in_window(2) as f64 / 2.0;
+    format!(
+        "up {} | conn {} | req {} | q/s {:.1}/{:.1} | IPs {} | IPs/s {:.1}",
+        up,
+        stats.active_connections(),
+        stats.total_requests(),
+        stats.qps(10),
+        stats.qps(60),
+        ips,
+        ips_2s,
+    )
+}
+
 pub fn render_status_page(stats: &ServerStats, viewer_ip: IpAddr, vhost: &str) -> String {
     let uptime = stats.uptime();
     let days = uptime.as_secs() / 86400;

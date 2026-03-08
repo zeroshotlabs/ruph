@@ -222,6 +222,10 @@ struct Cli {
     /// Enable logging to stdout/console (default: off)
     #[arg(long, default_value_t = false)]
     log_console: bool,
+
+    /// Print stats to stdout every N seconds (0 = off, default: 0)
+    #[arg(long, default_value_t = 0)]
+    stdoutstats: u64,
 }
 
 #[tokio::main]
@@ -384,6 +388,20 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // Periodic stats on stdout (--stdoutstats=N, 0 = off)
+    if cli.stdoutstats > 0 {
+        let stats_ref = server_stats.clone();
+        let interval_secs = cli.stdoutstats;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            interval.tick().await; // skip the immediate first tick
+            loop {
+                interval.tick().await;
+                eprintln!("{}", status::format_stats_line(&stats_ref));
+            }
+        });
+    }
 
     loop {
         // When both listeners are active, accept from whichever is ready first
