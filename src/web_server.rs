@@ -115,6 +115,8 @@ pub struct WebServer {
     php_processor: Option<PhpProcessor>,
     /// Callback for routing PHP stderr to domain logs: (domain, message)
     php_error_log: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
+    /// Server stats for injecting RUPH_* vars into PHP $_SERVER
+    stats: Option<Arc<crate::status::ServerStats>>,
 }
 
 impl WebServer {
@@ -199,6 +201,7 @@ impl WebServer {
         php_mode: PhpMode,
         php_binary: Option<String>,
         php_error_log: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
+        stats: Option<Arc<crate::status::ServerStats>>,
     ) -> Result<Self> {
         // Initialize AST-based PHP processor
         let ast_php_processor = match AstPhpProcessor::new() {
@@ -293,6 +296,7 @@ impl WebServer {
             embedded_php_processor,
             php_processor,
             php_error_log,
+            stats,
         })
     }
 
@@ -499,7 +503,7 @@ impl WebServer {
     ///    c. rr_dir + rr_index → serve index file
     ///    d. rr_dir, no index or leaf → 500
     ///    e. nothing matched → 404
-    pub async fn handle_request(&self, req: Request<IncomingBody>) -> Result<Response<RuphBody>> {
+    pub async fn handle_request(&self, req: Request<IncomingBody>, remote_addr: Option<std::net::SocketAddr>) -> Result<Response<RuphBody>> {
         let host = req.headers().get("host")
             .and_then(|v| v.to_str().ok())
             .or_else(|| req.uri().authority().map(|a| a.as_str()))
@@ -537,7 +541,7 @@ impl WebServer {
         if master_path.is_file() {
             // Extract query string and build server vars before consuming the request body
             let query_string = req.uri().query().unwrap_or("").to_string();
-            let mut server_vars = self.build_server_vars(&req, &master_path, &root)?;
+            let mut server_vars = self.build_server_vars_with_addr(&req, &master_path, &root, remote_addr)?;
             for (k, v) in &rr_vars {
                 server_vars.insert(k.clone(), v.clone());
             }
@@ -1083,6 +1087,26 @@ impl WebServer {
         script_path: &Path,
         root: &Path,
     ) -> Result<HashMap<String, String>> {
+        self.build_server_vars_inner(req, script_path, root, None)
+    }
+
+    fn build_server_vars_with_addr(
+        &self,
+        req: &Request<IncomingBody>,
+        script_path: &Path,
+        root: &Path,
+        remote_addr: Option<std::net::SocketAddr>,
+    ) -> Result<HashMap<String, String>> {
+        self.build_server_vars_inner(req, script_path, root, remote_addr)
+    }
+
+    fn build_server_vars_inner(
+        &self,
+        req: &Request<IncomingBody>,
+        script_path: &Path,
+        root: &Path,
+        remote_addr: Option<std::net::SocketAddr>,
+    ) -> Result<HashMap<String, String>> {
         let mut server_vars = HashMap::new();
         let uri = req.uri();
         let query_string = uri.query().unwrap_or("").to_string();
@@ -1133,6 +1157,13 @@ impl WebServer {
             let header_name = format!("HTTP_{}", name.as_str().replace('-', "_").to_uppercase());
             let header_value = value.to_str().unwrap_or("").to_string();
             server_vars.insert(header_name, header_value);
+        }
+
+        // Inject RUPH_* stats vars if stats + remote_addr available
+        if let (Some(stats), Some(addr)) = (&self.stats, remote_addr) {
+            for (k, v) in stats.server_vars(addr.ip()) {
+                server_vars.insert(k, v);
+            }
         }
 
         Ok(server_vars)
@@ -1392,7 +1423,7 @@ mod tests {
     #[tokio::test]
     async fn test_static_file_serving() {
         let temp_dir = TempDir::new().unwrap();
-        let web_server = WebServer::new(temp_dir.path().to_path_buf(), HashMap::new(), Vec::new(), vec!["_index.php".to_string()], PhpMode::Auto, None, None).unwrap();
+        let web_server = WebServer::new(temp_dir.path().to_path_buf(), HashMap::new(), Vec::new(), vec!["_index.php".to_string()], PhpMode::Auto, None, None, None).unwrap();
 
         let html_content = "<html><body>Hello World</body></html>";
         let html_path = temp_dir.path().join("test.html");
@@ -1405,7 +1436,7 @@ mod tests {
     #[test]
     fn test_path_traversal_protection() {
         let temp_dir = TempDir::new().unwrap();
-        let web_server = WebServer::new(temp_dir.path().to_path_buf(), HashMap::new(), Vec::new(), vec!["_index.php".to_string()], PhpMode::Auto, None, None).unwrap();
+        let web_server = WebServer::new(temp_dir.path().to_path_buf(), HashMap::new(), Vec::new(), vec!["_index.php".to_string()], PhpMode::Auto, None, None, None).unwrap();
 
         let result = web_server.resolve_file_path("/../etc/passwd", temp_dir.path());
         // Either fails or the resolved path is not under root
@@ -1423,7 +1454,7 @@ mod tests {
         std::fs::write(temp_dir.path().join("page.html"), "hi").unwrap();
         std::fs::write(temp_dir.path().join("app.php"), "<?php echo 1;").unwrap();
 
-        let web_server = WebServer::new(temp_dir.path().to_path_buf(), HashMap::new(), Vec::new(), vec!["_index.php".to_string()], PhpMode::Auto, None, None).unwrap();
+        let web_server = WebServer::new(temp_dir.path().to_path_buf(), HashMap::new(), Vec::new(), vec!["_index.php".to_string()], PhpMode::Auto, None, None, None).unwrap();
         let root = temp_dir.path();
 
         match web_server.resolve_request_target("/page.html", root, None).unwrap() {
@@ -1445,7 +1476,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         write(temp_dir.path().join("_index.php"), "<?php echo 'Root index'; ?>").await.unwrap();
 
-        let web_server = WebServer::new(temp_dir.path().to_path_buf(), HashMap::new(), Vec::new(), vec!["_index.php".to_string()], PhpMode::Auto, None, None).unwrap();
+        let web_server = WebServer::new(temp_dir.path().to_path_buf(), HashMap::new(), Vec::new(), vec!["_index.php".to_string()], PhpMode::Auto, None, None, None).unwrap();
         let root = temp_dir.path();
         let init_script = root.join("_index.php");
 
@@ -1468,7 +1499,7 @@ mod tests {
         let php_path = temp_dir.path().join("test.php");
         write(&php_path, php_content).await.unwrap();
 
-        let web_server = WebServer::new(temp_dir.path().to_path_buf(), HashMap::new(), Vec::new(), vec!["_index.php".to_string()], PhpMode::Auto, None, None).unwrap();
+        let web_server = WebServer::new(temp_dir.path().to_path_buf(), HashMap::new(), Vec::new(), vec!["_index.php".to_string()], PhpMode::Auto, None, None, None).unwrap();
         let qp = HashMap::new();
         let pp = HashMap::new();
         let sv = HashMap::new();

@@ -70,6 +70,9 @@ pub struct Config {
 
     // Status page
     pub status_page: Option<String>,
+
+    // Rate limit window in seconds (default 2)
+    pub rate_window: u64,
 }
 
 impl Default for Config {
@@ -92,6 +95,7 @@ impl Default for Config {
             php_binary: None,
             ssl_dir: None,
             status_page: None,
+            rate_window: 2,
         }
     }
 }
@@ -133,6 +137,11 @@ impl Config {
             let v = v.trim().to_string();
             if !v.is_empty() {
                 config.status_page = Some(if v.starts_with('/') { v } else { format!("/{}", v) });
+            }
+        }
+        if let Some(v) = ini.get("server", "rate_window") {
+            if let Ok(n) = v.trim().parse::<u64>() {
+                config.rate_window = n;
             }
         }
 

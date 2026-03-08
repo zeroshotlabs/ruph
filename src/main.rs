@@ -111,11 +111,13 @@ impl DomainLogger {
         }
     }
 
-    fn log_request(&self, domain: &str, remote_addr: &SocketAddr, method: &hyper::Method, uri: &hyper::Uri, status: u16) {
+    fn log_request(&self, domain: &str, remote_addr: &SocketAddr, method: &hyper::Method, uri: &hyper::Uri, status: u16, is_tls: bool, redirect_to: Option<&str>) {
         let now = chrono::Local::now();
         let level = if status >= 500 { "ERROR" } else if status >= 400 { " WARN" } else { " INFO" };
         let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
-        self.log(domain, &format!("{} {} [{}] [{}] {} {} {}", now.format("%H:%M:%S"), level, status, domain, remote_addr, method, path));
+        let proto = if is_tls { "S" } else { "-" };
+        let redir = redirect_to.map(|r| format!(" -> {}", r)).unwrap_or_default();
+        self.log(domain, &format!("{} {} [{}] {} [{}] {} {} {}{}", now.format("%H:%M:%S"), level, status, proto, domain, remote_addr, method, path, redir));
     }
 
     fn log_error(&self, domain: &str, remote_addr: &SocketAddr, method: &hyper::Method, uri: &hyper::Uri, err: &str) {
@@ -265,6 +267,8 @@ async fn main() -> Result<()> {
         }))
     };
 
+    let server_stats = Arc::new(status::ServerStats::new(cfg.rate_window));
+
     let web_server = Arc::new(WebServer::new(
         root_dir,
         domain_roots,
@@ -273,9 +277,9 @@ async fn main() -> Result<()> {
         cfg.php_mode.clone(),
         php_binary.clone(),
         php_error_log.clone(),
+        Some(server_stats.clone()),
     )?);
 
-    let server_stats = Arc::new(status::ServerStats::new());
     let status_page_path: Option<String> = cfg.status_page.clone();
     if let Some(ref sp) = status_page_path {
         eprintln!("  status page: {}", sp);
@@ -321,6 +325,7 @@ async fn main() -> Result<()> {
             cfg.php_mode.clone(),
             php_binary,
             php_error_log,
+            Some(server_stats.clone()),
         )?))
     } else {
         None
@@ -467,6 +472,7 @@ async fn handle_request(
         .or_else(|| req.uri().authority().map(|a| a.as_str()))
         .unwrap_or("-")
         .to_string();
+    let is_tls = sni.is_some();
     let domain = sni.unwrap_or_else(|| host.clone());
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -485,13 +491,14 @@ async fn handle_request(
                 .unwrap();
             let status_code = response.status().as_u16();
             let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
-            info!(http = status_code, "[{}] {} {} {}", domain, remote_addr, method, path);
-            domain_logger.log_request(&domain, &remote_addr, &method, &uri, status_code);
+            let proto = if is_tls { "S" } else { "-" };
+            info!(http = status_code, "{} [{}] {} {} {}", proto, domain, remote_addr, method, path);
+            domain_logger.log_request(&domain, &remote_addr, &method, &uri, status_code, is_tls, None);
             return Ok(response);
         }
     }
 
-    let response = match web_server.handle_request(req).await {
+    let response = match web_server.handle_request(req, Some(remote_addr)).await {
         Ok(resp) => resp,
         Err(e) => {
             error!("[{}] {} {} {} - {}", domain, remote_addr, method, uri, e);
@@ -506,8 +513,18 @@ async fn handle_request(
 
     let status = response.status().as_u16();
     let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
-    info!(http = status, "[{}] {} {} {}", domain, remote_addr, method, path);
-    domain_logger.log_request(&domain, &remote_addr, &method, &uri, status);
+    let proto = if is_tls { "S" } else { "-" };
+    let location = if (300..400).contains(&status) {
+        response.headers().get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| format!(" -> {}", v))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    info!(http = status, "{} [{}] {} {} {}{}", proto, domain, remote_addr, method, path, location);
+    domain_logger.log_request(&domain, &remote_addr, &method, &uri, status, is_tls,
+        if location.is_empty() { None } else { Some(&location[4..]) });
 
     Ok(response)
 }

@@ -8,6 +8,53 @@ use std::time::Instant;
 
 const QPS_SLOTS: usize = 60;
 
+/// Per-IP sliding window: ring buffer of per-second counters.
+/// Default window is 2 seconds but configurable.
+const IP_WINDOW_SLOTS: usize = 60;
+
+struct IpWindow {
+    /// Hit count per elapsed-second (ring buffer)
+    slots: [u64; IP_WINDOW_SLOTS],
+    /// Which elapsed-second each slot was last written to
+    epochs: [u64; IP_WINDOW_SLOTS],
+    /// Total hits since startup
+    total: u64,
+}
+
+impl IpWindow {
+    fn new() -> Self {
+        IpWindow {
+            slots: [0; IP_WINDOW_SLOTS],
+            epochs: [0; IP_WINDOW_SLOTS],
+            total: 0,
+        }
+    }
+
+    fn record(&mut self, now_secs: u64) {
+        self.total += 1;
+        let idx = (now_secs as usize) % IP_WINDOW_SLOTS;
+        if self.epochs[idx] == now_secs {
+            self.slots[idx] += 1;
+        } else {
+            self.slots[idx] = 1;
+            self.epochs[idx] = now_secs;
+        }
+    }
+
+    fn hits_in_window(&self, now_secs: u64, window: u64) -> u64 {
+        let window = window.min(IP_WINDOW_SLOTS as u64);
+        let mut total = 0u64;
+        for i in 0..window {
+            let check = now_secs.wrapping_sub(i);
+            let idx = (check as usize) % IP_WINDOW_SLOTS;
+            if self.epochs[idx] == check {
+                total += self.slots[idx];
+            }
+        }
+        total
+    }
+}
+
 pub struct ServerStats {
     start_time: Instant,
     active_connections: AtomicUsize,
@@ -16,11 +63,14 @@ pub struct ServerStats {
     qps_slots: [AtomicU64; QPS_SLOTS],
     /// Which elapsed-second each slot was last written to.
     qps_epochs: [AtomicU64; QPS_SLOTS],
-    ip_hits: Mutex<HashMap<IpAddr, u64>>,
+    /// Per-IP sliding window + total hits
+    ip_windows: Mutex<HashMap<IpAddr, IpWindow>>,
+    /// Configurable rate-limit window in seconds (default 2)
+    rate_window: u64,
 }
 
 impl ServerStats {
-    pub fn new() -> Self {
+    pub fn new(rate_window: u64) -> Self {
         const ZERO: AtomicU64 = AtomicU64::new(0);
         ServerStats {
             start_time: Instant::now(),
@@ -28,7 +78,8 @@ impl ServerStats {
             total_requests: AtomicU64::new(0),
             qps_slots: [ZERO; QPS_SLOTS],
             qps_epochs: [ZERO; QPS_SLOTS],
-            ip_hits: Mutex::new(HashMap::new()),
+            ip_windows: Mutex::new(HashMap::new()),
+            rate_window: rate_window.max(1).min(IP_WINDOW_SLOTS as u64),
         }
     }
 
@@ -53,8 +104,8 @@ impl ServerStats {
             self.qps_epochs[idx].store(now_secs, Ordering::Relaxed);
         }
 
-        if let Ok(mut map) = self.ip_hits.lock() {
-            *map.entry(ip).or_insert(0) += 1;
+        if let Ok(mut map) = self.ip_windows.lock() {
+            map.entry(ip).or_insert_with(IpWindow::new).record(now_secs);
         }
     }
 
@@ -84,11 +135,38 @@ impl ServerStats {
         self.start_time.elapsed()
     }
 
+    /// Returns (total_hits, hits_in_rate_window) for the given IP.
+    pub fn ip_stats(&self, ip: IpAddr) -> (u64, u64) {
+        let now_secs = self.start_time.elapsed().as_secs();
+        let map = self.ip_windows.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(&ip) {
+            Some(w) => (w.total, w.hits_in_window(now_secs, self.rate_window)),
+            None => (0, 0),
+        }
+    }
+
+    /// Returns all IPs sorted by total hits descending.
     pub fn ip_hits(&self) -> Vec<(IpAddr, u64)> {
-        let map = self.ip_hits.lock().unwrap_or_else(|e| e.into_inner());
-        let mut hits: Vec<_> = map.iter().map(|(ip, c)| (*ip, *c)).collect();
+        let map = self.ip_windows.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hits: Vec<_> = map.iter().map(|(ip, w)| (*ip, w.total)).collect();
         hits.sort_by(|a, b| b.1.cmp(&a.1));
         hits
+    }
+
+    /// Returns RUPH_* server vars for a specific request IP.
+    pub fn server_vars(&self, ip: IpAddr) -> HashMap<String, String> {
+        let (ip_total, ip_window) = self.ip_stats(ip);
+        let mut vars = HashMap::new();
+        vars.insert("RUPH_QPS_10".to_string(), format!("{:.1}", self.qps(10)));
+        vars.insert("RUPH_QPS_60".to_string(), format!("{:.1}", self.qps(60)));
+        vars.insert("RUPH_TOTAL_REQUESTS".to_string(), self.total_requests().to_string());
+        vars.insert("RUPH_ACTIVE_CONNECTIONS".to_string(), self.active_connections().to_string());
+        vars.insert("RUPH_UPTIME".to_string(), self.uptime().as_secs().to_string());
+        vars.insert("RUPH_IP_HITS".to_string(), ip_total.to_string());
+        vars.insert("RUPH_IP_HITS_WINDOW".to_string(), ip_window.to_string());
+        vars.insert("RUPH_RATE_WINDOW".to_string(), self.rate_window.to_string());
+        vars.insert("REMOTE_IP".to_string(), ip.to_string());
+        vars
     }
 }
 
@@ -195,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_connection_tracking() {
-        let stats = ServerStats::new();
+        let stats = ServerStats::new(2);
         assert_eq!(stats.active_connections(), 0);
         stats.connection_opened();
         stats.connection_opened();
@@ -206,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_request_counting() {
-        let stats = ServerStats::new();
+        let stats = ServerStats::new(2);
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         stats.record_request(ip);
         stats.record_request(ip);
@@ -218,7 +296,7 @@ mod tests {
 
     #[test]
     fn test_multiple_ips() {
-        let stats = ServerStats::new();
+        let stats = ServerStats::new(2);
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
         let ip2: IpAddr = "10.0.0.2".parse().unwrap();
         for _ in 0..5 { stats.record_request(ip1); }
@@ -231,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_qps_current_second() {
-        let stats = ServerStats::new();
+        let stats = ServerStats::new(2);
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         for _ in 0..100 {
             stats.record_request(ip);
@@ -242,12 +320,39 @@ mod tests {
 
     #[test]
     fn test_render_does_not_panic() {
-        let stats = ServerStats::new();
+        let stats = ServerStats::new(2);
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
         stats.record_request(ip);
         let html = render_status_page(&stats);
         assert!(html.contains("ruph"));
         assert!(html.contains("Active Connections"));
         assert!(html.contains("192.168.1.1"));
+    }
+
+    #[test]
+    fn test_ip_window_hits() {
+        let stats = ServerStats::new(2);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        for _ in 0..10 {
+            stats.record_request(ip);
+        }
+        let (total, window) = stats.ip_stats(ip);
+        assert_eq!(total, 10);
+        assert_eq!(window, 10); // all within same second = within 2s window
+    }
+
+    #[test]
+    fn test_server_vars() {
+        let stats = ServerStats::new(2);
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+        stats.record_request(ip);
+        stats.record_request(ip);
+        let vars = stats.server_vars(ip);
+        assert_eq!(vars.get("RUPH_IP_HITS").unwrap(), "2");
+        assert_eq!(vars.get("RUPH_IP_HITS_WINDOW").unwrap(), "2");
+        assert_eq!(vars.get("RUPH_RATE_WINDOW").unwrap(), "2");
+        assert_eq!(vars.get("REMOTE_IP").unwrap(), "10.0.0.5");
+        assert!(vars.contains_key("RUPH_QPS_10"));
+        assert!(vars.contains_key("RUPH_TOTAL_REQUESTS"));
     }
 }

@@ -189,9 +189,19 @@ impl AstPhpProcessor {
         }
 
         let body = self.response_body_override.clone().unwrap_or(output);
+
+        // Match PHP behavior: Location header without explicit status → 302
+        let status = if self.response_status == 200
+            && self.response_headers.contains_key("location")
+        {
+            302
+        } else {
+            self.response_status
+        };
+
         Ok(PhpExecution {
             body,
-            status: self.response_status,
+            status,
             headers: self.response_headers.clone(),
             exited,
             returned: self.script_returned,
