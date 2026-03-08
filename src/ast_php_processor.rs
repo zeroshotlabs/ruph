@@ -763,9 +763,9 @@ impl AstPhpProcessor {
             _ => {
                 let kind = node.kind();
                 // Log unrecognized statement-level AST nodes
-                if !matches!(kind, "program" | "php_tag" | "comment" | "text_interpolation"
-                    | "expression_statement" | "compound_statement" | "declaration_list"
-                    | "namespace_definition" | "namespace_use_declaration") {
+                if !matches!(kind, "program" | "php_tag" | "php_end_tag" | "comment"
+                    | "text_interpolation" | "expression_statement" | "compound_statement"
+                    | "declaration_list" | "namespace_definition" | "namespace_use_declaration") {
                     let line = node.start_position().row + 1;
                     self.log_error(&format!("Unhandled AST node '{}' at line {}", kind, line));
                 }
@@ -1375,6 +1375,18 @@ impl AstPhpProcessor {
             "function_call_expression" => {
                 self.evaluate_function_call(node).await
             }
+            // Assignment as expression: $a = $b = 5 returns 5
+            "assignment_expression" => {
+                let left = node.child_by_field_name("left");
+                let right = node.child_by_field_name("right");
+                if let (Some(left), Some(right)) = (left, right) {
+                    let value = self.evaluate_expression(right).await?;
+                    self.assign_to(left, value.clone()).await?;
+                    Ok(value)
+                } else {
+                    Ok(PhpValue::Null)
+                }
+            }
             // @ error suppression: evaluate the inner expression, swallow errors
             "error_suppression_expression" => {
                 if let Some(inner) = node.named_child(0) {
@@ -1622,6 +1634,13 @@ impl AstPhpProcessor {
             }
             "is_bool" => {
                 Ok(PhpValue::Bool(matches!(args.first(), Some(PhpValue::Bool(_)))))
+            }
+            "is_scalar" => {
+                Ok(PhpValue::Bool(matches!(args.first(),
+                    Some(PhpValue::Int(_) | PhpValue::Float(_) | PhpValue::String(_) | PhpValue::Bool(_)))))
+            }
+            "is_float" | "is_double" => {
+                Ok(PhpValue::Bool(matches!(args.first(), Some(PhpValue::Float(_)))))
             }
             "gettype" => {
                 let t = match args.first() {
@@ -2432,7 +2451,9 @@ impl AstPhpProcessor {
                     "header" | "http_response_code" | "var_dump" | "print_r" |
                     "parse_url" | "basename" | "dirname" | "pathinfo" | "realpath" |
                     "rtrim" | "ltrim" | "file_get_contents" | "filesize" |
-                    "error_log" | "trigger_error" | "preg_match" | "strpos" | "stripos"
+                    "error_log" | "trigger_error" | "preg_match" | "strpos" | "stripos" |
+                    "is_array" | "is_string" | "is_numeric" | "is_int" | "is_bool" |
+                    "is_scalar" | "is_null" | "is_float" | "gettype" | "file_put_contents"
                 );
                 Ok(PhpValue::Bool(is_builtin || self.user_functions.contains_key(&name)))
             }
@@ -2648,11 +2669,16 @@ impl AstPhpProcessor {
             .map_err(|_| anyhow!("Cannot canonicalize root dir"))?;
 
         let raw_path = if target.starts_with('/') {
-            // Absolute path — check if it's already under root (e.g. __DIR__ . $uri)
             let abs = PathBuf::from(target);
+            // Absolute path — if the file already exists, canonicalize and return it.
             if let Ok(canonical) = abs.canonicalize() {
-                if canonical.starts_with(&canonical_root) {
-                    return Ok(canonical);
+                return Ok(canonical);
+            }
+            // File may not exist yet (e.g. file_put_contents creating a new file).
+            // Validate the parent directory exists.
+            if let Some(parent) = abs.parent() {
+                if parent.is_dir() {
+                    return Ok(abs);
                 }
             }
             // Fall back to treating as docroot-relative
