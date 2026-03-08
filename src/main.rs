@@ -24,58 +24,90 @@ use crate::web_server::{WebServer, RuphBody};
 
 type ResponseBody = RuphBody;
 
+type LogFile = std::sync::Mutex<std::io::BufWriter<std::fs::File>>;
+
 /// Writes per-domain log lines to configured log files (plain text, no ANSI).
 struct DomainLogger {
-    default: Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
-    files: std::collections::HashMap<String, std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
-    prefix_files: Vec<(String, std::sync::Mutex<std::io::BufWriter<std::fs::File>>)>,
+    default: Option<LogFile>,
+    files: std::collections::HashMap<String, LogFile>,
+    prefix_files: Vec<(String, LogFile)>,
+    // Error logs (PHP error_log(), AST warnings, etc.)
+    err_default: Option<LogFile>,
+    err_files: std::collections::HashMap<String, LogFile>,
+    err_prefix_files: Vec<(String, LogFile)>,
 }
 
 impl DomainLogger {
+    fn open_log(path: &str) -> Result<LogFile> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| anyhow!("Cannot open log file '{}': {}", path, e))?;
+        Ok(std::sync::Mutex::new(std::io::BufWriter::new(file)))
+    }
+
     fn new(
         default_log: &Option<String>,
         domain_logs: &std::collections::HashMap<String, String>,
         prefix_logs: &[(String, String)],
+        default_error_log: &Option<String>,
+        domain_error_logs: &std::collections::HashMap<String, String>,
+        prefix_error_logs: &[(String, String)],
     ) -> Result<Self> {
         let default = if let Some(path) = default_log {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|e| anyhow!("Cannot open default log file '{}': {}", path, e))?;
             eprintln!("  log: * -> {}", path);
-            Some(std::sync::Mutex::new(std::io::BufWriter::new(file)))
+            Some(Self::open_log(path)?)
         } else {
             None
         };
         let mut files = std::collections::HashMap::new();
         for (domain, path) in domain_logs {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|e| anyhow!("Cannot open log file '{}' for domain '{}': {}", path, domain, e))?;
             eprintln!("  log: {} -> {}", domain, path);
-            files.insert(domain.clone(), std::sync::Mutex::new(std::io::BufWriter::new(file)));
+            files.insert(domain.clone(), Self::open_log(path)?);
         }
         let mut prefix_files_vec = Vec::new();
         for (prefix, path) in prefix_logs {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|e| anyhow!("Cannot open log file '{}' for prefix '{}': {}", path, prefix, e))?;
             eprintln!("  log: {}* -> {}", prefix, path);
-            prefix_files_vec.push((prefix.clone(), std::sync::Mutex::new(std::io::BufWriter::new(file))));
+            prefix_files_vec.push((prefix.clone(), Self::open_log(path)?));
         }
-        Ok(DomainLogger { default, files, prefix_files: prefix_files_vec })
+
+        // Error logs
+        let err_default = if let Some(path) = default_error_log {
+            eprintln!("  error_log: * -> {}", path);
+            Some(Self::open_log(path)?)
+        } else {
+            None
+        };
+        let mut err_files = std::collections::HashMap::new();
+        for (domain, path) in domain_error_logs {
+            eprintln!("  error_log: {} -> {}", domain, path);
+            err_files.insert(domain.clone(), Self::open_log(path)?);
+        }
+        let mut err_prefix_files_vec = Vec::new();
+        for (prefix, path) in prefix_error_logs {
+            eprintln!("  error_log: {}* -> {}", prefix, path);
+            err_prefix_files_vec.push((prefix.clone(), Self::open_log(path)?));
+        }
+
+        Ok(DomainLogger {
+            default, files, prefix_files: prefix_files_vec,
+            err_default, err_files, err_prefix_files: err_prefix_files_vec,
+        })
     }
 
-    fn log(&self, domain: &str, line: &str) {
+    /// Write a line to the best-matching log file from the given set.
+    fn write_to(
+        domain: &str,
+        line: &str,
+        files: &std::collections::HashMap<String, LogFile>,
+        prefix_files: &[(String, LogFile)],
+        default: &Option<LogFile>,
+    ) {
         use std::io::Write;
         let bare = domain.split(':').next().unwrap_or(domain);
         // 1. Exact match
-        if let Some(mutex) = self.files.get(bare) {
+        if let Some(mutex) = files.get(bare) {
             if let Ok(mut w) = mutex.lock() {
                 let _ = writeln!(w, "{}", line);
                 let _ = w.flush();
@@ -83,9 +115,9 @@ impl DomainLogger {
             return;
         }
         // 2. Prefix match (longest wins)
-        let mut best: Option<&std::sync::Mutex<std::io::BufWriter<std::fs::File>>> = None;
+        let mut best: Option<&LogFile> = None;
         let mut best_len = 0;
-        for (prefix, mutex) in &self.prefix_files {
+        for (prefix, mutex) in prefix_files {
             if prefix.len() > best_len
                 && bare.starts_with(prefix.as_str())
                 && (bare.len() == prefix.len()
@@ -103,11 +135,31 @@ impl DomainLogger {
             return;
         }
         // 3. Default
-        if let Some(mutex) = &self.default {
+        if let Some(mutex) = default {
             if let Ok(mut w) = mutex.lock() {
                 let _ = writeln!(w, "{}", line);
                 let _ = w.flush();
             }
+        }
+    }
+
+    /// Write to the request log for a domain.
+    fn log(&self, domain: &str, line: &str) {
+        Self::write_to(domain, line, &self.files, &self.prefix_files, &self.default);
+    }
+
+    /// Write to the error log for a domain (PHP error_log(), AST warnings, etc.).
+    /// Falls back to request log if no error log is configured.
+    fn log_php_error(&self, domain: &str, line: &str) {
+        let now = chrono::Local::now();
+        let formatted = format!("{} PHP: {}", now.format("%H:%M:%S"), line);
+
+        // If any error log is configured, use the error log chain
+        if self.err_default.is_some() || !self.err_files.is_empty() || !self.err_prefix_files.is_empty() {
+            Self::write_to(domain, &formatted, &self.err_files, &self.err_prefix_files, &self.err_default);
+        } else {
+            // Fallback: write to request log (previous behavior)
+            self.log(domain, &formatted);
         }
     }
 
@@ -198,7 +250,10 @@ async fn main() -> Result<()> {
         init_logging(log_level)?;
     }
 
-    let domain_logger = Arc::new(DomainLogger::new(&cfg.default_log, &cfg.domain_logs, &cfg.prefix_logs)?);
+    let domain_logger = Arc::new(DomainLogger::new(
+        &cfg.default_log, &cfg.domain_logs, &cfg.prefix_logs,
+        &cfg.default_error_log, &cfg.domain_error_logs, &cfg.prefix_error_logs,
+    )?);
 
     if let Err(err) = rustls::crypto::ring::default_provider().install_default() {
         warn!("Failed to install rustls crypto provider: {:?}", err);
@@ -262,8 +317,7 @@ async fn main() -> Result<()> {
     let php_error_log: Option<std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>> = {
         let dl = domain_logger.clone();
         Some(std::sync::Arc::new(move |domain: &str, line: &str| {
-            let now = chrono::Local::now();
-            dl.log(domain, &format!("{} PHP: {}", now.format("%H:%M:%S"), line));
+            dl.log_php_error(domain, line);
         }))
     };
 

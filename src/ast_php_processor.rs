@@ -100,6 +100,8 @@ impl AstPhpProcessor {
                 c.insert("PHP_URL_PATH".to_string(), PhpValue::Int(5));
                 c.insert("PHP_URL_QUERY".to_string(), PhpValue::Int(6));
                 c.insert("PHP_URL_FRAGMENT".to_string(), PhpValue::Int(7));
+                c.insert("FILE_APPEND".to_string(), PhpValue::Int(8));
+                c.insert("LOCK_EX".to_string(), PhpValue::Int(2));
                 c.insert("E_USER_ERROR".to_string(), PhpValue::Int(256));
                 c.insert("E_USER_WARNING".to_string(), PhpValue::Int(512));
                 c.insert("E_USER_NOTICE".to_string(), PhpValue::Int(1024));
@@ -738,6 +740,14 @@ impl AstPhpProcessor {
                 return Ok(ControlFlow::Break(()));
             }
             _ => {
+                let kind = node.kind();
+                // Log unrecognized statement-level AST nodes
+                if !matches!(kind, "program" | "php_tag" | "comment" | "text_interpolation"
+                    | "expression_statement" | "compound_statement" | "declaration_list"
+                    | "namespace_definition" | "namespace_use_declaration") {
+                    let line = node.start_position().row + 1;
+                    self.log_error(&format!("Unhandled AST node '{}' at line {}", kind, line));
+                }
                 // Recursively process child nodes
                 for child in node.named_children(&mut node.walk()) {
                     let flow = self.process_node(child, output).await?;
@@ -1309,6 +1319,17 @@ impl AstPhpProcessor {
             }
             "function_call_expression" => {
                 self.evaluate_function_call(node).await
+            }
+            // @ error suppression: evaluate the inner expression, swallow errors
+            "error_suppression_expression" => {
+                if let Some(inner) = node.named_child(0) {
+                    match self.evaluate_expression(inner).await {
+                        Ok(val) => Ok(val),
+                        Err(_) => Ok(PhpValue::Bool(false)),
+                    }
+                } else {
+                    Ok(PhpValue::Null)
+                }
             }
             _ => {
                 let mut expr_output = String::new();
@@ -2160,8 +2181,22 @@ impl AstPhpProcessor {
                 let path_str = args.first().map_or(String::new(), |a| a.as_string());
                 let content = args.get(1).map_or(String::new(), |a| a.as_string());
                 let path = self.resolve_local_path(&path_str)?;
-                fs::write(&path, &content).await
-                    .map_err(|e| anyhow!("file_put_contents: {}", e))?;
+                // 3rd arg: flags — FILE_APPEND = 8, LOCK_EX = 2
+                let flags = args.get(2).map_or(0, |a| a.as_int());
+                let file_append = (flags & 8) != 0;
+                if file_append {
+                    use std::io::Write;
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .map_err(|e| anyhow!("file_put_contents: {}", e))?;
+                    file.write_all(content.as_bytes())
+                        .map_err(|e| anyhow!("file_put_contents: {}", e))?;
+                } else {
+                    fs::write(&path, &content).await
+                        .map_err(|e| anyhow!("file_put_contents: {}", e))?;
+                }
                 Ok(PhpValue::Int(content.len() as i64))
             }
             "filesize" => {
@@ -2409,7 +2444,7 @@ impl AstPhpProcessor {
                     if let Some(val) = self.constants.get(&func_name) {
                         return Ok(val.clone());
                     }
-                    debug!("Unknown function: {}", func_name);
+                    self.log_error(&format!("Unknown function: {}()", func_name));
                     Ok(PhpValue::Null)
                 }
             }

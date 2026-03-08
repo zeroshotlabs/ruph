@@ -54,12 +54,19 @@ pub struct Config {
     // Index files
     pub index_files: Vec<String>,
 
-    // Logging
+    // Logging (request logs)
     pub default_log: Option<String>,
     /// Exact domain -> log file
     pub domain_logs: HashMap<String, String>,
     /// Prefix -> log file
     pub prefix_logs: Vec<(String, String)>,
+
+    // Error logs (PHP error_log(), AST warnings, etc.)
+    pub default_error_log: Option<String>,
+    /// Exact domain -> error log file
+    pub domain_error_logs: HashMap<String, String>,
+    /// Prefix -> error log file
+    pub prefix_error_logs: Vec<(String, String)>,
 
     // [php]
     pub php_mode: PhpMode,
@@ -91,6 +98,9 @@ impl Default for Config {
             default_log: None,
             domain_logs: HashMap::new(),
             prefix_logs: Vec::new(),
+            default_error_log: None,
+            domain_error_logs: HashMap::new(),
+            prefix_error_logs: Vec::new(),
             php_mode: PhpMode::Auto,
             php_binary: None,
             ssl_dir: None,
@@ -123,6 +133,12 @@ impl Config {
             let v = v.trim().to_string();
             if !v.is_empty() {
                 config.default_log = Some(v);
+            }
+        }
+        if let Some(v) = ini.get("server", "error_log") {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                config.default_error_log = Some(v);
             }
         }
         if let Some(v) = ini.get("server", "index_files") {
@@ -240,6 +256,7 @@ impl Config {
                 if section_name.starts_with("https.") || section_name.contains(",https.") {
                     let docroot = ini.get(section_name, "docroot");
                     let logs = ini.get(section_name, "logs");
+                    let error_log = ini.get(section_name, "error_log");
 
                     // Split comma-separated section names
                     for part in section_name.split(',') {
@@ -266,6 +283,16 @@ impl Config {
                                         config.domain_logs.insert(pattern.to_string(), v.to_string());
                                     } else {
                                         config.prefix_logs.push((pattern.to_string(), v.to_string()));
+                                    }
+                                }
+                            }
+                            if let Some(ref v) = error_log {
+                                let v = v.trim();
+                                if !v.is_empty() {
+                                    if has_dot {
+                                        config.domain_error_logs.insert(pattern.to_string(), v.to_string());
+                                    } else {
+                                        config.prefix_error_logs.push((pattern.to_string(), v.to_string()));
                                     }
                                 }
                             }
