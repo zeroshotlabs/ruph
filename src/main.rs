@@ -20,6 +20,8 @@ mod ssl;
 mod acme;
 mod status;
 mod crawl_rollup;
+mod request_log;
+mod trailhead_client;
 
 use crate::web_server::{WebServer, RuphBody};
 
@@ -49,27 +51,27 @@ impl DomainLogger {
     }
 
     fn new(
-        default_log: &Option<String>,
-        domain_logs: &std::collections::HashMap<String, String>,
-        prefix_logs: &[(String, String)],
+        default_access_log: &Option<String>,
+        domain_access_logs: &std::collections::HashMap<String, String>,
+        prefix_access_logs: &[(String, String)],
         default_error_log: &Option<String>,
         domain_error_logs: &std::collections::HashMap<String, String>,
         prefix_error_logs: &[(String, String)],
     ) -> Result<Self> {
-        let default = if let Some(path) = default_log {
-            eprintln!("  log: * -> {}", path);
+        let default = if let Some(path) = default_access_log {
+            eprintln!("  access_log: * -> {}", path);
             Some(Self::open_log(path)?)
         } else {
             None
         };
         let mut files = std::collections::HashMap::new();
-        for (domain, path) in domain_logs {
-            eprintln!("  log: {} -> {}", domain, path);
+        for (domain, path) in domain_access_logs {
+            eprintln!("  access_log: {} -> {}", domain, path);
             files.insert(domain.clone(), Self::open_log(path)?);
         }
         let mut prefix_files_vec = Vec::new();
-        for (prefix, path) in prefix_logs {
-            eprintln!("  log: {}* -> {}", prefix, path);
+        for (prefix, path) in prefix_access_logs {
+            eprintln!("  access_log: {}* -> {}", prefix, path);
             prefix_files_vec.push((prefix.clone(), Self::open_log(path)?));
         }
 
@@ -256,9 +258,39 @@ async fn main() -> Result<()> {
     }
 
     let domain_logger = Arc::new(DomainLogger::new(
-        &cfg.default_log, &cfg.domain_logs, &cfg.prefix_logs,
+        &cfg.default_access_log, &cfg.domain_access_logs, &cfg.prefix_access_logs,
         &cfg.default_error_log, &cfg.domain_error_logs, &cfg.prefix_error_logs,
     )?);
+
+    // Full request logging to SQLite
+    let request_logger: Option<Arc<request_log::RequestLogger>> = match &cfg.log_full {
+        Some(path) => {
+            match request_log::RequestLogger::open(std::path::Path::new(path)) {
+                Ok(rl) => Some(Arc::new(rl)),
+                Err(e) => {
+                    eprintln!("  log_full: FAILED to open {}: {}", path, e);
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    // Trailhead remote log ingestion
+    let trailhead: Option<Arc<trailhead_client::TrailheadClient>> =
+        if let (Some(url), Some(key)) = (&cfg.trailhead_api_url, &cfg.trailhead_api_key) {
+            let tc = trailhead_client::TrailheadClient::new(
+                url.clone(),
+                key.clone(),
+                cfg.trailhead_domain_owners.clone(),
+                cfg.trailhead_prefix_owners.clone(),
+                cfg.trailhead_default_owner.clone(),
+            );
+            tc.start_flush_task();
+            Some(Arc::new(tc))
+        } else {
+            None
+        };
 
     if let Err(err) = rustls::crypto::ring::default_provider().install_default() {
         warn!("Failed to install rustls crypto provider: {:?}", err);
@@ -425,8 +457,10 @@ async fn main() -> Result<()> {
                     let dl = domain_logger.clone();
                     let stats = server_stats.clone();
                     let sp = status_page_path.clone();
+                    let rl = request_logger.clone();
+                    let th = trailhead.clone();
                     tokio::task::spawn(async move {
-                        serve_connection(stream, remote_addr, web_server, tls_config, dl, stats, sp).await;
+                        serve_connection(stream, remote_addr, web_server, tls_config, dl, stats, sp, rl, th).await;
                     });
                 }
                 result = hl.accept() => {
@@ -435,8 +469,10 @@ async fn main() -> Result<()> {
                     let dl = domain_logger.clone();
                     let stats = server_stats.clone();
                     let sp = status_page_path.clone();
+                    let rl = request_logger.clone();
+                    let th = trailhead.clone();
                     tokio::task::spawn(async move {
-                        serve_connection(stream, remote_addr, ws, None, dl, stats, sp).await;
+                        serve_connection(stream, remote_addr, ws, None, dl, stats, sp, rl, th).await;
                     });
                 }
             }
@@ -447,8 +483,10 @@ async fn main() -> Result<()> {
             let dl = domain_logger.clone();
             let stats = server_stats.clone();
             let sp = status_page_path.clone();
+            let rl = request_logger.clone();
+            let th = trailhead.clone();
             tokio::task::spawn(async move {
-                serve_connection(stream, remote_addr, web_server, tls_config, dl, stats, sp).await;
+                serve_connection(stream, remote_addr, web_server, tls_config, dl, stats, sp, rl, th).await;
             });
         }
     }
@@ -474,6 +512,8 @@ async fn serve_connection(
     domain_logger: Arc<DomainLogger>,
     stats: Arc<status::ServerStats>,
     status_page_path: Option<String>,
+    request_logger: Option<Arc<request_log::RequestLogger>>,
+    trailhead: Option<Arc<trailhead_client::TrailheadClient>>,
 ) {
     stats.connection_opened();
     let conn_stats = stats.clone();
@@ -504,7 +544,9 @@ async fn serve_connection(
                     let dl = domain_logger.clone();
                     let st = stats.clone();
                     let sp = status_page_path.clone();
-                    async move { handle_request(req, ws, remote_addr, Some(sni), dl, st, sp).await }
+                    let rl = request_logger.clone();
+                    let th = trailhead.clone();
+                    async move { handle_request(req, ws, remote_addr, Some(sni), dl, st, sp, rl, th).await }
                 });
                 let builder = http_builder();
                 if let Err(err) = builder.serve_connection(io, service).await {
@@ -522,7 +564,9 @@ async fn serve_connection(
             let dl = domain_logger.clone();
             let st = stats.clone();
             let sp = status_page_path.clone();
-            async move { handle_request(req, ws, remote_addr, None, dl, st, sp).await }
+            let rl = request_logger.clone();
+            let th = trailhead.clone();
+            async move { handle_request(req, ws, remote_addr, None, dl, st, sp, rl, th).await }
         });
         let builder = http_builder();
         if let Err(err) = builder.serve_connection(io, service).await {
@@ -541,7 +585,11 @@ async fn handle_request(
     domain_logger: Arc<DomainLogger>,
     stats: Arc<status::ServerStats>,
     status_page_path: Option<String>,
+    request_logger: Option<Arc<request_log::RequestLogger>>,
+    trailhead: Option<Arc<trailhead_client::TrailheadClient>>,
 ) -> Result<Response<ResponseBody>, Infallible> {
+    let t0 = std::time::Instant::now();
+
     // For TLS requests, make SNI authoritative for vhost routing.
     // This avoids host/:authority edge cases across HTTP versions.
     if let Some(ref sni_name) = sni {
@@ -562,6 +610,15 @@ async fn handle_request(
 
     stats.record_request(remote_addr.ip());
 
+    // Snapshot request headers for full logging (before req is consumed)
+    let needs_snapshot = request_logger.is_some()
+        || trailhead.as_ref().map_or(false, |th| th.resolve_owner(&domain).is_some());
+    let req_snapshot = if needs_snapshot {
+        Some(request_log::RequestSnapshot::capture(&req, remote_addr, is_tls, domain.as_str()))
+    } else {
+        None
+    };
+
     // Status page intercept — before virtual host routing
     if let Some(ref sp) = status_page_path {
         if uri.path() == sp.as_str() {
@@ -576,7 +633,20 @@ async fn handle_request(
             let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
             let proto = if is_tls { "S" } else { "-" };
             info!(http = status_code, "{} [{}] {} {} {}", proto, domain, remote_addr, method, path);
-            domain_logger.log_request(&domain, &remote_addr, &method, &uri, status_code, is_tls, None);
+            let th_owner = trailhead.as_ref().and_then(|th| th.resolve_owner(&domain).map(|o| o.to_string()));
+            if th_owner.is_none() {
+                domain_logger.log_request(&domain, &remote_addr, &method, &uri, status_code, is_tls, None);
+            }
+            if let Some(snap) = req_snapshot {
+                let rec = snap.into_record(status_code, &response.headers(), None, t0.elapsed());
+                if let (Some(ref th), Some(ref owner)) = (&trailhead, &th_owner) {
+                    th.submit(owner, &rec);
+                }
+                if let Some(ref rl) = request_logger {
+                    let rl = rl.clone();
+                    tokio::task::spawn_blocking(move || rl.insert(&rec));
+                }
+            }
             return Ok(response);
         }
     }
@@ -606,8 +676,26 @@ async fn handle_request(
         String::new()
     };
     info!(http = status, "{} [{}] {} {} {}{}", proto, domain, remote_addr, method, path, location);
-    domain_logger.log_request(&domain, &remote_addr, &method, &uri, status, is_tls,
-        if location.is_empty() { None } else { Some(&location[4..]) });
+    let th_owner = trailhead.as_ref().and_then(|th| th.resolve_owner(&domain).map(|o| o.to_string()));
+    if th_owner.is_none() {
+        domain_logger.log_request(&domain, &remote_addr, &method, &uri, status, is_tls,
+            if location.is_empty() { None } else { Some(&location[4..]) });
+    }
+
+    // Full request log (non-blocking)
+    if let Some(snap) = req_snapshot {
+        let resp_size = response.headers().get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<i64>().ok());
+        let rec = snap.into_record(status, response.headers(), resp_size, t0.elapsed());
+        if let (Some(ref th), Some(ref owner)) = (&trailhead, &th_owner) {
+            th.submit(owner, &rec);
+        }
+        if let Some(ref rl) = request_logger {
+            let rl = rl.clone();
+            tokio::task::spawn_blocking(move || rl.insert(&rec));
+        }
+    }
 
     Ok(response)
 }

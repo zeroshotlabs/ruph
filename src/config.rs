@@ -1,7 +1,7 @@
 //! Section-based INI configuration for ruph
 //!
-//! Supports sections: [server], [server.https], [server.http], [php.*],
-//! [http.*], [https.<domain>], [ssl]
+//! Supports sections: [server], [server.https], [server.http], [trailhead],
+//! [php.*], [http.*], [https.<domain>], [ssl]
 //! CLI arguments override config file values.
 
 use std::collections::HashMap;
@@ -54,12 +54,12 @@ pub struct Config {
     // Index files
     pub index_files: Vec<String>,
 
-    // Logging (request logs)
-    pub default_log: Option<String>,
-    /// Exact domain -> log file
-    pub domain_logs: HashMap<String, String>,
-    /// Prefix -> log file
-    pub prefix_logs: Vec<(String, String)>,
+    // Access logs (request logs)
+    pub default_access_log: Option<String>,
+    /// Exact domain -> access log file
+    pub domain_access_logs: HashMap<String, String>,
+    /// Prefix -> access log file
+    pub prefix_access_logs: Vec<(String, String)>,
 
     // Error logs (PHP error_log(), AST warnings, etc.)
     pub default_error_log: Option<String>,
@@ -80,6 +80,19 @@ pub struct Config {
 
     // Rate limit window in seconds (default 2)
     pub rate_window: u64,
+
+    // Full request logging to SQLite (path to .db file, None = disabled)
+    pub log_full: Option<String>,
+
+    // [trailhead] — remote log ingestion API
+    pub trailhead_api_url: Option<String>,
+    pub trailhead_api_key: Option<String>,
+    /// Default owner for sites without a per-domain trailhead_owner
+    pub trailhead_default_owner: Option<String>,
+    /// Exact domain -> trailhead owner
+    pub trailhead_domain_owners: HashMap<String, String>,
+    /// Prefix -> trailhead owner
+    pub trailhead_prefix_owners: Vec<(String, String)>,
 }
 
 impl Default for Config {
@@ -95,9 +108,9 @@ impl Default for Config {
             domain_roots: HashMap::new(),
             prefix_roots: Vec::new(),
             index_files: vec!["_index.php".to_string(), "index.html".to_string(), "index.htm".to_string()],
-            default_log: None,
-            domain_logs: HashMap::new(),
-            prefix_logs: Vec::new(),
+            default_access_log: None,
+            domain_access_logs: HashMap::new(),
+            prefix_access_logs: Vec::new(),
             default_error_log: None,
             domain_error_logs: HashMap::new(),
             prefix_error_logs: Vec::new(),
@@ -106,6 +119,12 @@ impl Default for Config {
             ssl_dir: None,
             status_page: None,
             rate_window: 2,
+            log_full: None,
+            trailhead_api_url: None,
+            trailhead_api_key: None,
+            trailhead_default_owner: None,
+            trailhead_domain_owners: HashMap::new(),
+            trailhead_prefix_owners: Vec::new(),
         }
     }
 }
@@ -129,10 +148,11 @@ impl Config {
         if let Some(v) = ini.get("server", "log_console") {
             config.log_console = parse_bool(&v);
         }
-        if let Some(v) = ini.get("server", "logs") {
+        // access_log (preferred) or logs (legacy alias)
+        if let Some(v) = ini.get("server", "access_log").or_else(|| ini.get("server", "logs")) {
             let v = v.trim().to_string();
             if !v.is_empty() {
-                config.default_log = Some(v);
+                config.default_access_log = Some(v);
             }
         }
         if let Some(v) = ini.get("server", "error_log") {
@@ -158,6 +178,32 @@ impl Config {
         if let Some(v) = ini.get("server", "rate_window") {
             if let Ok(n) = v.trim().parse::<u64>() {
                 config.rate_window = n;
+            }
+        }
+        if let Some(v) = ini.get("server", "log_full") {
+            let v = v.trim().to_string();
+            if !v.is_empty() && v != "false" && v != "0" {
+                config.log_full = Some(v);
+            }
+        }
+
+        // ── [trailhead] — remote log ingestion ──
+        if let Some(v) = ini.get("trailhead", "api_url") {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                config.trailhead_api_url = Some(v);
+            }
+        }
+        if let Some(v) = ini.get("trailhead", "api_key") {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                config.trailhead_api_key = Some(v);
+            }
+        }
+        if let Some(v) = ini.get("trailhead", "default_owner") {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                config.trailhead_default_owner = Some(v);
             }
         }
 
@@ -255,10 +301,11 @@ impl Config {
                 // Supports comma-separated: [https.a.com,https.b.com]
                 if section_name.starts_with("https.") || section_name.contains(",https.") {
                     let docroot = ini.get(section_name, "docroot");
-                    let logs = ini.get(section_name, "logs");
+                    let access_log = ini.get(section_name, "access_log")
+                        .or_else(|| ini.get(section_name, "logs"));
                     let error_log = ini.get(section_name, "error_log");
+                    let th_owner = ini.get(section_name, "trailhead_owner");
 
-                    // Split comma-separated section names
                     for part in section_name.split(',') {
                         let part = part.trim();
                         if let Some(pattern) = part.strip_prefix("https.") {
@@ -276,13 +323,13 @@ impl Config {
                                     }
                                 }
                             }
-                            if let Some(ref v) = logs {
+                            if let Some(ref v) = access_log {
                                 let v = v.trim();
                                 if !v.is_empty() {
                                     if has_dot {
-                                        config.domain_logs.insert(pattern.to_string(), v.to_string());
+                                        config.domain_access_logs.insert(pattern.to_string(), v.to_string());
                                     } else {
-                                        config.prefix_logs.push((pattern.to_string(), v.to_string()));
+                                        config.prefix_access_logs.push((pattern.to_string(), v.to_string()));
                                     }
                                 }
                             }
@@ -293,6 +340,16 @@ impl Config {
                                         config.domain_error_logs.insert(pattern.to_string(), v.to_string());
                                     } else {
                                         config.prefix_error_logs.push((pattern.to_string(), v.to_string()));
+                                    }
+                                }
+                            }
+                            if let Some(ref v) = th_owner {
+                                let v = v.trim();
+                                if !v.is_empty() {
+                                    if has_dot {
+                                        config.trailhead_domain_owners.insert(pattern.to_string(), v.to_string());
+                                    } else {
+                                        config.trailhead_prefix_owners.push((pattern.to_string(), v.to_string()));
                                     }
                                 }
                             }
@@ -320,11 +377,11 @@ impl Config {
                                 config.domain_roots.insert(domain.to_string(), path.to_string());
                             }
                         }
-                    } else if let Some(domain) = key.strip_prefix("logs.") {
+                    } else if let Some(domain) = key.strip_prefix("access_log.").or_else(|| key.strip_prefix("logs.")) {
                         if let Some(path) = value {
                             let path = path.trim();
                             if !path.is_empty() && !domain.is_empty() {
-                                config.domain_logs.insert(domain.to_string(), path.to_string());
+                                config.domain_access_logs.insert(domain.to_string(), path.to_string());
                             }
                         }
                     } else if let Some(domain) = key.strip_prefix("error_log.") {
@@ -354,10 +411,10 @@ impl Config {
                     config.index_files = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
                 }
             }
-            if config.default_log.is_none() {
-                if let Some(v) = ini.get("http", "logs") {
+            if config.default_access_log.is_none() {
+                if let Some(v) = ini.get("http", "access_log").or_else(|| ini.get("http", "logs")) {
                     let v = v.trim().to_string();
-                    if !v.is_empty() { config.default_log = Some(v); }
+                    if !v.is_empty() { config.default_access_log = Some(v); }
                 }
             }
             if config.default_error_log.is_none() {

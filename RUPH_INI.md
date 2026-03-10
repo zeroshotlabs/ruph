@@ -28,10 +28,13 @@ config: /var/www/live/ruph_root/ruph.ini
 | `tls` | `false` | Enable TLS (only if `[server.https]` is absent) |
 | `log_level` | `info` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
 | `log_console` | `false` | Also log to console (in addition to file) |
-| `logs` | — | Default log file path |
+| `access_log` | — | Default access log file path (alias: `logs`) |
+| `error_log` | — | Default error log file path (PHP errors, AST warnings) |
 | `index_files` | `_index.php,index.html,index.htm` | Comma-separated index file names |
 | `docroot` | — | Default document root |
 | `status_page` | — | Path for status endpoint (e.g. `/status`) |
+| `rate_window` | `2` | Sliding window in seconds for per-IP rate limiting |
+| `log_full` | — | Path to SQLite DB for full request logging |
 
 ### [server.https] — HTTPS Listener
 
@@ -61,6 +64,18 @@ config: /var/www/live/ruph_root/ruph.ini
 | AST | `ast` | Built-in AST interpreter only, no fallback |
 | CGI | `cgi`, `external`, `php` | External php-cgi first, then AST/embedded fallback |
 | Embedded | `embedded`, `regex` | Regex-based processor only |
+
+### [trailhead] — Remote Log Ingestion
+
+Ships full request records as NDJSON to the Trailhead API. Batches up to 400 events, flushing every 5 seconds. Requires both `api_url` and `api_key` to enable.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `api_url` | — | Trailhead API endpoint URL |
+| `api_key` | — | API key for authentication |
+| `default_owner` | — | Fallback owner for domains without `trailhead_owner` |
+
+When a domain resolves to a `trailhead_owner` (per-domain or default), file-based access logging is skipped for that domain. Error logs always go to file.
 
 ### [ssl] — TLS Certificate Directory
 
@@ -95,7 +110,9 @@ Exact domain matching (case-insensitive). The domain portion is everything after
 ```ini
 [https.example.com]
 docroot = /var/www/example.com
-logs = /var/log/ruph/example.log
+access_log = /var/log/ruph/example.log
+error_log = /var/log/ruph/example_error.log
+trailhead_owner = example
 ```
 
 **Keys:**
@@ -103,7 +120,9 @@ logs = /var/log/ruph/example.log
 | Key | Description |
 |-----|-------------|
 | `docroot` | Document root for this domain |
-| `logs` | Log file for this domain |
+| `access_log` | Access log file for this domain (alias: `logs`) |
+| `error_log` | Error log file for this domain |
+| `trailhead_owner` | Trailhead log group owner; when set, skips file access_log |
 
 ### Prefix Matching
 
@@ -129,8 +148,16 @@ docroot = /var/www/live/ruph_root/junkometer.com
 ```ini
 ;; Global settings
 [server]
-logs = /var/www/live/ruph_logs/ruph.log
+access_log = /var/www/live/ruph_logs/ruph.log
+error_log = /var/www/live/ruph_logs/ruph_error.log
+log_full = /var/www/live/ruph_logs/requests.db
 index_files = _index.php,index.php,index.html
+
+;; Remote log ingestion (optional — replaces file access_log for matched domains)
+[trailhead]
+api_url = https://your-api-id.execute-api.region.amazonaws.com/v1
+api_key = your-api-key
+default_owner = myserver
 
 ;; HTTPS on port 443
 [server.https]
@@ -158,10 +185,11 @@ docroot = /var/www/live/ruph_root/ruph_http
 ;; Per-domain HTTPS virtual hosts
 [https.example.com]
 docroot = /var/www/live/ruph_root/example.com
+trailhead_owner = example
 
 [https.nyphp.org]
 docroot = /var/www/live/ruph_root/nyphp.org
-logs = /var/www/live/ruph_logs/nyphporg.log
+trailhead_owner = nyphporg
 ```
 
 ## Backward Compatibility
@@ -172,7 +200,7 @@ ruph also supports older-style configuration with a flat `[http]` section using 
 [http]
 docroot = /var/www/html
 docroot.example.com = /var/www/example.com
-logs.example.com = /var/log/example.log
+access_log.example.com = /var/log/example.log
 ```
 
 This format is automatically parsed if no `[https.<domain>]` sections are found.

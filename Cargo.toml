@@ -29,6 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 urlencoding = "2.0"
 configparser = "3.0"
 tempfile = "3.0"
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 # PHP parsing
 tree-sitter = "0.25"
