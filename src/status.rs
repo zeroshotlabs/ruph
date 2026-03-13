@@ -106,6 +106,13 @@ impl ServerStats {
 
         if let Ok(mut map) = self.ip_windows.lock() {
             map.entry(ip).or_insert_with(IpWindow::new).record(now_secs);
+
+            // Prune stale IPs every ~5 minutes to prevent unbounded growth.
+            // Only check when we happen to land on a 300-second boundary.
+            if now_secs % 300 == 0 && map.len() > 1000 {
+                let window = IP_WINDOW_SLOTS as u64;
+                map.retain(|_, w| w.hits_in_window(now_secs, window) > 0);
+            }
         }
     }
 

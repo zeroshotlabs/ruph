@@ -492,11 +492,19 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Max time a connection may stay open (idle or active).  After this
+/// deadline the connection is dropped regardless of keep-alive state.
+/// 5 minutes is generous for real browsers / API clients while still
+/// reaping abandoned or slow-loris connections before FDs pile up.
+const CONNECTION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Shared hyper connection builder with tuned H2 window sizes.
 /// 1 MiB initial windows mean the first response fits in one window
 /// without waiting for flow-control ACKs, reducing TTFB on larger pages.
 fn http_builder() -> AutoBuilder<TokioExecutor> {
     let mut b = AutoBuilder::new(TokioExecutor::new());
+    b.http1()
+        .keep_alive(true);
     b.http2()
         .initial_stream_window_size(1024 * 1024)
         .initial_connection_window_size(2 * 1024 * 1024);
@@ -527,8 +535,13 @@ async fn serve_connection(
 
     if let Some(config) = tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(config);
-        match acceptor.accept(stream).await {
-            Ok(tls_stream) => {
+        // TLS handshake timeout — prevent slow/stalled handshakes from holding FDs
+        let tls_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            acceptor.accept(stream),
+        ).await;
+        match tls_result {
+            Ok(Ok(tls_stream)) => {
                 let sni = tls_stream
                     .get_ref()
                     .1
@@ -549,12 +562,21 @@ async fn serve_connection(
                     async move { handle_request(req, ws, remote_addr, Some(sni), dl, st, sp, rl, th).await }
                 });
                 let builder = http_builder();
-                if let Err(err) = builder.serve_connection(io, service).await {
-                    error!("[{}] TLS error from {}: {}", sni, remote_addr, err);
+                // Connection lifetime cap — prevents infinite keep-alive from leaking FDs
+                match tokio::time::timeout(
+                    CONNECTION_LIFETIME,
+                    builder.serve_connection(io, service),
+                ).await {
+                    Ok(Err(err)) => error!("[{}] TLS error from {}: {}", sni, remote_addr, err),
+                    Err(_) => info!("[{}] connection lifetime exceeded from {}", sni, remote_addr),
+                    _ => {}
                 }
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 error!("TLS handshake failed from {}: {}", remote_addr, err);
+            }
+            Err(_) => {
+                warn!("TLS handshake timeout from {}", remote_addr);
             }
         }
     } else {
@@ -569,8 +591,13 @@ async fn serve_connection(
             async move { handle_request(req, ws, remote_addr, None, dl, st, sp, rl, th).await }
         });
         let builder = http_builder();
-        if let Err(err) = builder.serve_connection(io, service).await {
-            error!("Error serving connection from {}: {}", remote_addr, err);
+        match tokio::time::timeout(
+            CONNECTION_LIFETIME,
+            builder.serve_connection(io, service),
+        ).await {
+            Ok(Err(err)) => error!("Error serving connection from {}: {}", remote_addr, err),
+            Err(_) => info!("Connection lifetime exceeded from {}", remote_addr),
+            _ => {}
         }
     }
 

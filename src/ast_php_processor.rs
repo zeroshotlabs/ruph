@@ -78,7 +78,12 @@ impl AstPhpProcessor {
             response_body_override: None,
             current_template_path: None,
             root_dir: None,
-            http_client: Client::new(),
+            http_client: Client::builder()
+                .pool_max_idle_per_host(2)
+                .pool_idle_timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             included_files: HashSet::new(),
             output_buffers: Vec::new(),
             side_effect_output: None,
