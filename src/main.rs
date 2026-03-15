@@ -451,7 +451,13 @@ async fn main() -> Result<()> {
         if let Some(ref hl) = http_listener {
             tokio::select! {
                 result = listener.accept() => {
-                    let (stream, remote_addr) = result?;
+                    let (stream, remote_addr) = match result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("accept error (HTTPS): {}", e);
+                            continue;
+                        }
+                    };
                     let web_server = web_server.clone();
                     let tls_config = tls_config.clone();
                     let dl = domain_logger.clone();
@@ -464,7 +470,13 @@ async fn main() -> Result<()> {
                     });
                 }
                 result = hl.accept() => {
-                    let (stream, remote_addr) = result?;
+                    let (stream, remote_addr) = match result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("accept error (HTTP): {}", e);
+                            continue;
+                        }
+                    };
                     let ws = http_web_server.as_ref().unwrap().clone();
                     let dl = domain_logger.clone();
                     let stats = server_stats.clone();
@@ -477,7 +489,13 @@ async fn main() -> Result<()> {
                 }
             }
         } else {
-            let (stream, remote_addr) = listener.accept().await?;
+            let (stream, remote_addr) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("accept error: {}", e);
+                    continue;
+                }
+            };
             let web_server = web_server.clone();
             let tls_config = tls_config.clone();
             let dl = domain_logger.clone();
