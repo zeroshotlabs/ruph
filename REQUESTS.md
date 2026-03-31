@@ -1,18 +1,25 @@
-# Request Processing Behavior (Current Implementation)
+# Request Processing Behavior
 
-This document describes how `ruph` currently resolves requests and decides when PHP executes.
+This document is the source of truth for how `ruph` resolves requests and decides when PHP executes.
 
-For `rr_*` server variables and return semantics, see [RETURN_RR_VARS.md](RETURN_RR_VARS.md).
-For configuration, see [RUPH_INI.md](RUPH_INI.md).
+For configuration, see [RUPH_INI.md](RUPH_INI.md). For the built-in PHP language reference, see [RUPH-PHP.md](RUPH-PHP.md).
 
-## TLDR;
+## TLDR
 
-Processing cascade for the _index.php controller files.
+Request flow:
 
-- Master exit / return false / output → response (done)
-- Master return true / silent         → Leaf exit / return false / output → response (done)
-- Master return true / silent         → Leaf return true / silent → Rust serves static file (fast)
-- Master return true / silent         → No leaf → Rust serves static file (fast)
+1. Resolve the effective vhost docroot from the request host.
+2. Populate all `rr_*` values before any PHP runs.
+3. Intercept the status page path, if configured (before any PHP).
+4. Run the global master `/_index.php` from the server root, if present.
+5. Run the effective vhost root `/_index.php`, if present and different from the global master.
+6. Resolve the request target.
+7. If the target is an existing `.php` file, execute that file directly.
+8. Otherwise, if a deepest local leaf `_index.php` exists below the vhost root, execute that single leaf.
+9. If the leaf passes through, deliver the resolved file/index directly.
+10. If nothing resolves, return 404.
+
+Only one local leaf `_index.php` ever runs.
 
 ## 1) Host Resolution and Docroot Selection
 
@@ -20,184 +27,182 @@ Routing host is determined in this order:
 
 1. For TLS requests, SNI is copied into `Host` and used as authoritative routing host.
 2. Otherwise, `Host` header is used if present.
-3. Otherwise, URI authority (`:authority`, relevant for HTTP/2) is used if present.
+3. Otherwise, URI authority (`:authority`) is used if present.
 
 Then effective docroot is chosen in this order:
 
-1. Exact host match in `domain_roots` (`example.com`).
-2. Longest matching host prefix in `prefix_roots` (`www*` style logic).
-3. Fallback to default `root_dir`.
+1. Exact host match in `domain_roots`
+2. Longest matching host prefix in `prefix_roots`
+3. Fallback to default `root_dir`
 
-Host matching for exact and prefix virtual hosts is case-insensitive.
+Host matching for virtual hosts is case-insensitive.
 
-Code: `main::handle_request`, `WebServer::handle_request`, `WebServer::effective_root`.
+## 2) `rr_*` Variables
 
-## 2) `_index.php` Master/Leaf Architecture
+Before any PHP executes, ruph resolves the request URI against the effective vhost docroot and populates these `$_SERVER` keys:
 
-After docroot selection, ruph looks for a master `_index.php` at the docroot root. The middleware index filename is chosen as:
+| Key | Value |
+|-----|-------|
+| `rr_root` | Effective vhost document root |
+| `rr_file` | Realpath of the literal matched file, or empty |
+| `rr_exists` | `"1"` if the literal request path maps to an existing file, else empty |
+| `rr_dir` | Realpath if the literal request path maps to a directory, else empty |
+| `rr_index` | First configured content index file found inside `rr_dir`, else empty |
+| `rr_leaf_idx` | Deepest local `_index.php` below the vhost root relevant to this path, else empty |
+| `rr_mime` | MIME type ruph would use for `rr_file` |
 
-1. first configured `index_files` entry ending in `.php`,
-2. or `_index.php` if none are configured.
+Notes:
 
-At most **two** PHP scripts execute per request:
+- `_index.php` is infrastructure, not content. It is excluded from `rr_file` and `rr_index`.
+- `rr_index` finds the first non-`_index.php` entry from `index_files` (e.g. `index.html`, `index.php`).
+- `rr_leaf_idx` never points at the global master or the vhost-root controller.
+- For missing paths, `rr_leaf_idx` is based on the deepest existing directory on disk.
 
-1. **Master** (`/<docroot>/_index.php`) — always runs first. Server admin controls this.
-2. **Leaf** (`/<subdir>/_index.php`) — runs only if master passes through and a leaf exists in the deepest matching directory.
+### RUPH_* Server Variables
 
-### Handled vs Pass-Through
+In addition to the standard CGI variables (`REQUEST_URI`, `REQUEST_METHOD`, `HTTP_HOST`, `DOCUMENT_ROOT`, `SCRIPT_FILENAME`, `QUERY_STRING`, etc.) and `rr_*` variables, ruph injects live server metrics into `$_SERVER`:
 
-A script is considered to have **handled** the request if any of:
+| Variable | Description |
+|----------|-------------|
+| `REMOTE_IP` | Client's IP address |
+| `RUPH_IP_HITS` | Total requests from this IP since server start |
+| `RUPH_IP_HITS_WINDOW` | Requests from this IP in the last N seconds |
+| `RUPH_RATE_WINDOW` | The rate window size in seconds (from config) |
+| `RUPH_QPS_10` | Server-wide requests/sec (10-second average) |
+| `RUPH_QPS_60` | Server-wide requests/sec (60-second average) |
+| `RUPH_TOTAL_REQUESTS` | Total requests since server start |
+| `RUPH_ACTIVE_CONNECTIONS` | Current open TCP connections |
+| `RUPH_UPTIME` | Server uptime in seconds |
 
-| Signal | Meaning |
-|--------|---------|
-| `exit` / `die` | Hard stop — always handled |
-| `return false` / `return` (bare) | Explicit handled |
-| Non-empty output (echo, readfile) | Auto-detected as handled |
-| `Location` header set | Auto-detected as handled |
-| Non-200 status code | Auto-detected as handled |
+These are available in all three controller layers and in directly-executed PHP files. They enable PHP-side rate limiting without external dependencies — for example, checking `RUPH_IP_HITS_WINDOW > 30` to return 429.
 
-A script **passes through** if:
+## 3) Status Page Intercept
 
-| Signal | Meaning |
-|--------|---------|
-| `return true` | Explicit pass-through |
-| Silent (no output, no headers, status 200, no return) | Auto-detected as pass-through |
+If `status_page` is configured (e.g. `/status`), requests matching that exact path are handled before any PHP runs. The status page returns an HTML dashboard with live server metrics (active connections, QPS, top IPs, uptime). This intercept cannot be overridden by `_index.php`.
 
-Code: `php_handled_request`, `handle_request`.
+## 4) Controller Layers
 
-## 3) Pre-Resolved Filesystem (`rr_*` Variables)
+There are up to three controller opportunities per request:
 
-Before PHP runs, ruph resolves the request URI against the filesystem with path-traversal protection and sets `$_SERVER` keys:
+1. Global master `/_index.php`
+2. Vhost-root `/_index.php`
+3. Deepest local leaf `_index.php`
 
-- `rr_root` — vhost document root
-- `rr_file` — realpath of matched file (never `_index.php`)
-- `rr_exists` — `"1"` if file exists, empty otherwise
-- `rr_dir` — realpath if URI maps to a directory
-- `rr_index` — first matching index file inside `rr_dir`
-- `rr_leaf_idx` — `_index.php` in deepest matching directory
-- `rr_mime` — MIME type for `rr_file`
+### Global master
 
-See [RETURN_RR_VARS.md](RETURN_RR_VARS.md) for full details.
+The global master lives at the server root used to create the `WebServer`.
 
-Code: `resolve_rr_vars`.
+It always runs first when present.
 
-## 4) Standard `$_SERVER` Variables
+Stopping behavior:
 
-All standard CGI/PHP server variables are populated:
+- `exit` / `die` => handled, stop
+- any explicit `return` value => handled, stop
+- output, `Location` header, or non-200 status => handled, stop
+- silent fallthrough => continue
 
-| Variable | Source |
-|----------|--------|
-| `REQUEST_URI` | Normalized path+query (e.g. `/page.html?x=1`) |
-| `REQUEST_METHOD` | `GET`, `POST`, `HEAD` |
-| `QUERY_STRING` | Raw query string |
-| `HTTP_HOST` | From `Host` header |
-| `DOCUMENT_ROOT` | Vhost document root (same as `rr_root`) |
-| `SCRIPT_FILENAME` | Absolute path to the executing PHP script |
-| `PHP_SELF` | URI path of the script |
-| `PATH_INFO` | Extra path segments after script name |
-| `SERVER_NAME` | Hostname |
-| `SERVER_PORT` | Listen port |
-| `HTTPS` | `"on"` for TLS connections |
-| `HTTP_*` | All request headers as `HTTP_` prefixed vars |
+### Vhost-root controller
 
-All HTTP request headers are automatically mapped: `Referer` → `HTTP_REFERER`, `User-Agent` → `HTTP_USER_AGENT`, `Accept` → `HTTP_ACCEPT`, etc.
+The vhost-root controller is `/_index.php` inside the effective vhost docroot.
 
-Code: `build_server_vars`.
+It runs after the global master if present and if it is not the same file.
 
-## 5) Request Target Resolution
+It uses the same stopping behavior as the global master.
 
-For request path `P`, resolution is:
+### Deepest local leaf
 
-1. If `P` exists and is a file:
-   - `.php` extension => `Script`
-   - otherwise => `Static`
-2. Else if `P` exists and is a directory:
-   - scan that directory for first matching `index_files` entry (in configured order)
-   - `.php` index => `Script`
-   - non-php index => `Static`
-3. Else:
-   - if root init/front-controller script exists and is a file => `Script` (fallback)
-   - else => `NotFound`
+This is the deepest `_index.php` below the vhost root in the relevant directory tree.
 
-Code: `resolve_request_target`, `find_index_file`.
+Examples:
 
-## 6) Method Behavior
+- `/assets/app.css` => leaf search uses the containing directory of `app.css`
+- `/users/` => leaf search uses `/users`
+- `/missing/path` => leaf search uses the deepest existing directory on disk
+
+Only this single deepest leaf runs. Intermediate `_index.php` files do not form a chain.
+
+Leaf behavior:
+
+- `return true` => pass through to normal delivery
+- `return false` or bare `return` => handled, stop
+- `exit` / `die` => handled, stop
+- output, `Location` header, or non-200 status => handled, stop
+- silent fallthrough => pass through
+
+For missing paths:
+
+- if a deepest leaf exists, it is expected to finalize the response
+- if it passes through anyway, ruph returns 500 because there is no file/index to deliver
+
+## 5) Target Resolution
+
+After the controller layers above:
+
+### Existing file
+
+If the literal request path exists and is a file:
+
+- `.php` => execute that file directly as PHP
+- anything else => treat as a static file target
+
+Explicit existing `.php` files do not get wrapped by the local leaf `_index.php`.
+
+### Existing directory
+
+If the literal request path exists and is a directory:
+
+- scan `index_files` in configured order, **skipping `_index.php`**
+- first matching `.php` index (e.g. `index.php`) => PHP target
+- first matching non-PHP index (e.g. `index.html`) => static target
+- no matching content index => no direct target
+
+`_index.php` is never selected as a directory index because it has already been handled as a controller. This means a directory with both `_index.php` and `index.html` will serve `index.html` automatically when the controller passes through.
+
+The deepest local leaf may intercept directory requests before the resolved index is delivered.
+
+### Missing path
+
+If the literal request path does not exist:
+
+- no file or directory target exists
+- the deepest local leaf gets one chance to handle it
+- if there is no such leaf, return 404
+
+## 6) Delivery Rules
+
+If processing reaches final delivery:
+
+- static file target => Rust serves the file directly
+- PHP target => execute the PHP file
+- no target => 404
+
+This preserves the fast path:
+
+- existing static files are served directly unless a relevant leaf `_index.php` chooses to intercept
+- existing `.php` files execute as PHP
+
+## 7) HEAD / GET / POST
 
 ### GET
 
-- `Static` => file is served.
-- `Script` => PHP pipeline executes the script.
-- `NotFound` => 404.
-
-Code: `handle_get_request`.
+Follows the full controller + target-resolution flow above.
 
 ### POST
 
-- If resolved target is `Script`, that script executes.
-- If resolved target is `Static` or `NotFound`:
-  - if root init/front-controller script exists and is a file, request is routed to it;
-  - otherwise 404.
-
-So POST to an existing static file can still execute root front controller.
-
-Code: `handle_post_request`.
+Follows the same flow as GET, except parsed form data is available to PHP.
 
 ### HEAD
 
-- `Static` => metadata response (no body).
-- `Script` => 405 (HEAD not supported for scripts).
-- `NotFound` => 404.
+- static targets return headers only
+- PHP targets return `405 Method Not Allowed`
 
-Code: `handle_head_request`.
+## 8) Design Goal
 
-## 7) PHP Execution Order for Script Targets
+The intended mental model is:
 
-When a target is `Script`, `process_php_template` applies:
+- global master = server-wide policy
+- vhost-root `_index.php` = site-wide policy for one vhost
+- deepest local leaf `_index.php` = local interception/routing
+- otherwise ruph serves the resolved file directly
 
-1. If script target is not a file => 404 (`Script not found`).
-2. If no processors available at all => serve PHP file as static bytes.
-3. In `cgi` or `auto` mode, try external PHP streaming first.
-4. If streaming fails, fall back to configured chain (`ast`/`embedded`/`cgi` fallback path).
-
-Important:
-
-- `php_mode` affects script execution and middleware CGI behavior.
-
-Code: `process_php_template`.
-
-## 8) Hierarchy Clarification for `_index.php` + Static Files
-
-Given:
-
-- `/static/_index.php` exists
-- `/static/img.gif` exists
-- request is `GET /static/img.gif`
-
-Current behavior:
-
-1. Master `/_index.php` runs.
-2. If master passes through, leaf `/static/_index.php` runs.
-3. If leaf handles (output, headers, return false, or exit) — static file is **not** served.
-4. If leaf passes through (return true, or silent) — Rust serves `/static/img.gif`.
-
-If `/static/img.gif` does not exist and no script handled:
-
-- 404 is returned.
-
-If `/static/` is requested (directory path):
-
-- The server checks `index_files` inside `/static/` in configured order.
-- That means `index.html`, `_index.php`, etc. precedence is controlled only by `index_files` order.
-
-## 9) Root Front-Controller Fallback
-
-If no file/directory index target matches, request falls back to root front-controller script (same selected middleware PHP index filename at docroot root) when it exists as a file.
-
-## 10) Static File Delivery
-
-When Rust serves a static file (after PHP passes through), it delivers with:
-
-- `Content-Type` — detected from file extension via `mime_guess`
-- `Content-Length` — exact byte count
-
-This is the fastest path — no PHP overhead, direct file read and response.
+That keeps behavior predictable for novice users while preserving the direct static-file fast path.

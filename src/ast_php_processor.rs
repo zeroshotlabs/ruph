@@ -16,8 +16,18 @@ use regex::Regex;
 
 static PHP_TAG_RE: OnceLock<Regex> = OnceLock::new();
 use tokio::fs;
+use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_rustls::TlsConnector;
+use rustls::pki_types::ServerName;
 use reqwest::Client;
 use serde_json::Value as JsonValue;
+
+/// Active TLS socket stream for PHP stream functions
+struct PhpTlsStream {
+    stream: tokio_rustls::client::TlsStream<TcpStream>,
+    eof: bool,
+}
 
 /// AST-based PHP processor using tree-sitter-php
 /// A stored user-defined PHP function
@@ -52,6 +62,12 @@ pub struct AstPhpProcessor {
     accumulated_output: String,
     /// Return value from top-level return statement
     script_returned: Option<bool>,
+    /// Actual PHP value returned by a script (for $x = require 'file.php')
+    script_return_value: Option<PhpValue>,
+    /// Active TLS socket streams keyed by handle ID
+    streams: HashMap<u32, PhpTlsStream>,
+    /// Next stream handle ID
+    next_stream_id: u32,
     /// Per-request error log callback (routes to domain-specific log files)
     error_log_handler: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
@@ -90,6 +106,9 @@ impl AstPhpProcessor {
             user_functions: HashMap::new(),
             accumulated_output: String::new(),
             script_returned: None,
+            script_return_value: None,
+            streams: HashMap::new(),
+            next_stream_id: 1,
             error_log_handler: None,
             constants: {
                 let mut c = HashMap::new();
@@ -120,6 +139,9 @@ impl AstPhpProcessor {
                 c.insert("TRUE".to_string(), PhpValue::Bool(true));
                 c.insert("FALSE".to_string(), PhpValue::Bool(false));
                 c.insert("NULL".to_string(), PhpValue::Null);
+                c.insert("STREAM_CLIENT_CONNECT".to_string(), PhpValue::Int(4));
+                c.insert("STREAM_CLIENT_ASYNC_CONNECT".to_string(), PhpValue::Int(2));
+                c.insert("STREAM_CLIENT_PERSISTENT".to_string(), PhpValue::Int(1));
                 c
             },
         })
@@ -406,9 +428,11 @@ impl AstPhpProcessor {
                     let value = self.evaluate_expression(value_node).await?;
                     self.script_returned = Some(value.is_truthy());
                     self.response_body_override = Some(value.as_string());
+                    self.script_return_value = Some(value);
                 } else {
                     // bare `return;` — treated as return false (handled)
                     self.script_returned = Some(false);
+                    self.script_return_value = None;
                 }
                 return Ok(ControlFlow::Break(()));
             }
@@ -750,7 +774,7 @@ impl AstPhpProcessor {
                     .or_else(|| node.named_child(0));
                 if let Some(target) = target {
                     let value = self.evaluate_expression(target).await?;
-                    let include_output = self.include_file(&value.as_string(), is_once).await?;
+                    let (include_output, _) = self.include_file(&value.as_string(), is_once).await?;
                     self.append_output(output, &include_output);
                 }
             }
@@ -1474,6 +1498,81 @@ impl AstPhpProcessor {
                     Ok(PhpValue::Null)
                 }
             }
+            // require/include as expression: $config = require 'file.php'
+            "include_expression" | "require_expression" | "include_once_expression" | "require_once_expression" => {
+                let is_once = node.kind().contains("_once");
+                let target = node.child_by_field_name("path")
+                    .or_else(|| node.child_by_field_name("argument"))
+                    .or_else(|| node.named_child(0));
+                if let Some(target) = target {
+                    let value = self.evaluate_expression(target).await?;
+                    let (include_output, return_value) = self.include_file(&value.as_string(), is_once).await?;
+                    if !include_output.is_empty() {
+                        self.side_effect_output = Some(include_output);
+                    }
+                    // Return the script's PHP return value, or Bool(true) if it didn't return
+                    Ok(return_value.unwrap_or(PhpValue::Bool(true)))
+                } else {
+                    Ok(PhpValue::Bool(false))
+                }
+            }
+            // augmented assignment as expression (e.g. inside function body re-parsed)
+            "augmented_assignment_expression" => {
+                let left = node.child_by_field_name("left");
+                let right = node.child_by_field_name("right");
+                let operator = {
+                    let source = self.source_code.as_bytes();
+                    let mut op = String::new();
+                    for i in 0..node.child_count() {
+                        if let Some(child) = node.child(i) {
+                            if !child.is_named() {
+                                let text = child.utf8_text(source).unwrap_or("");
+                                if text.ends_with('=') && text.len() >= 2 {
+                                    op = text.to_string();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    op
+                };
+                if let (Some(left), Some(right)) = (left, right) {
+                    let left_val = self.evaluate_expression(left).await?;
+                    let right_val = self.evaluate_expression(right).await?;
+                    let result = match operator.as_str() {
+                        "+=" => if left_val.is_int_like() && right_val.is_int_like() {
+                            PhpValue::Int(left_val.as_int().wrapping_add(right_val.as_int()))
+                        } else {
+                            PhpValue::Float(left_val.as_float() + right_val.as_float())
+                        },
+                        "-=" => if left_val.is_int_like() && right_val.is_int_like() {
+                            PhpValue::Int(left_val.as_int().wrapping_sub(right_val.as_int()))
+                        } else {
+                            PhpValue::Float(left_val.as_float() - right_val.as_float())
+                        },
+                        "*=" => if left_val.is_int_like() && right_val.is_int_like() {
+                            PhpValue::Int(left_val.as_int().wrapping_mul(right_val.as_int()))
+                        } else {
+                            PhpValue::Float(left_val.as_float() * right_val.as_float())
+                        },
+                        "/=" => {
+                            let d = right_val.as_float();
+                            if d == 0.0 { PhpValue::Bool(false) }
+                            else if left_val.is_int_like() && right_val.is_int_like() {
+                                let li = left_val.as_int(); let ri = right_val.as_int();
+                                if ri != 0 && li % ri == 0 { PhpValue::Int(li / ri) } else { PhpValue::Float(left_val.as_float() / d) }
+                            } else { PhpValue::Float(left_val.as_float() / d) }
+                        }
+                        ".=" => PhpValue::String(format!("{}{}", left_val.as_string(), right_val.as_string())),
+                        "??=" => if left_val.is_null() { right_val } else { left_val },
+                        _ => right_val,
+                    };
+                    self.assign_to(left, result.clone()).await?;
+                    Ok(result)
+                } else {
+                    Ok(PhpValue::Null)
+                }
+            }
             _ => {
                 let kind = node.kind();
                 let line = node.start_position().row + 1;
@@ -1799,6 +1898,7 @@ impl AstPhpProcessor {
                     Some(PhpValue::Float(_)) => "double",
                     Some(PhpValue::String(_)) => "string",
                     Some(PhpValue::Array(_)) => "array",
+                    Some(PhpValue::Resource(_)) => "resource",
                 };
                 Ok(PhpValue::String(t.to_string()))
             }
@@ -2732,7 +2832,142 @@ impl AstPhpProcessor {
             // unset() is handled specially before arg evaluation (see above)
             // This fallback handles edge cases where it arrives as a regular call
             "unset" => Ok(PhpValue::Null),
-            "sleep" | "usleep" => Ok(PhpValue::Int(0)),
+            "sleep" => {
+                let secs = args.first().map_or(0, |a| a.as_int() as u64);
+                tokio::time::sleep(std::time::Duration::from_secs(secs.min(30))).await;
+                Ok(PhpValue::Int(0))
+            }
+            "usleep" => {
+                let micros = args.first().map_or(0, |a| a.as_int() as u64);
+                // Cap at 200ms to prevent stalls; real non-blocking loops use small values
+                tokio::time::sleep(std::time::Duration::from_micros(micros.min(200_000))).await;
+                Ok(PhpValue::Int(0))
+            }
+            "flush" | "ob_flush" | "ob_end_flush" => Ok(PhpValue::Null),
+            "getenv" => {
+                let key = args.first().map_or(String::new(), |a| a.as_string());
+                if key.is_empty() {
+                    Ok(PhpValue::Bool(false))
+                } else {
+                    Ok(std::env::var(&key)
+                        .map(PhpValue::String)
+                        .unwrap_or(PhpValue::Bool(false)))
+                }
+            }
+            "stream_context_create" => {
+                // Return a dummy resource (context options ignored; TLS is handled by connect_tls)
+                Ok(PhpValue::Resource(0))
+            }
+            "stream_socket_client" => {
+                // stream_socket_client("ssl://host:port", &$errno, &$errstr, $timeout, $flags, $context)
+                let addr_str = args.first().map_or(String::new(), |a| a.as_string());
+                let is_ssl = addr_str.starts_with("ssl://");
+                let host_port = addr_str
+                    .trim_start_matches("ssl://")
+                    .trim_start_matches("tcp://");
+                let (host, port_str) = if let Some(colon) = host_port.rfind(':') {
+                    (host_port[..colon].to_string(), host_port[colon+1..].to_string())
+                } else {
+                    (host_port.to_string(), if is_ssl { "443".to_string() } else { "80".to_string() })
+                };
+                let port: u16 = port_str.parse().unwrap_or(if is_ssl { 443 } else { 80 });
+                let timeout_secs = args.get(3).map_or(30u64, |a| a.as_int().max(1) as u64);
+
+                let connect_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    self.connect_tls(&host, port)
+                ).await;
+
+                match connect_result {
+                    Ok(Ok(tls_stream)) => {
+                        let id = self.next_stream_id;
+                        self.next_stream_id += 1;
+                        self.streams.insert(id, PhpTlsStream { stream: tls_stream, eof: false });
+                        Ok(PhpValue::Resource(id))
+                    }
+                    Ok(Err(e)) => {
+                        self.log_error(&format!("stream_socket_client failed: {}", e));
+                        Ok(PhpValue::Bool(false))
+                    }
+                    Err(_) => {
+                        self.log_error("stream_socket_client: connection timed out");
+                        Ok(PhpValue::Bool(false))
+                    }
+                }
+            }
+            "stream_set_blocking" => {
+                // No-op: all I/O uses tokio async (inherently non-blocking)
+                Ok(PhpValue::Bool(true))
+            }
+            "fwrite" => {
+                let handle = if let Some(PhpValue::Resource(id)) = args.first() { *id } else { 0 };
+                let data = args.get(1).map_or(String::new(), |a| a.as_string());
+                if handle == 0 { return Ok(PhpValue::Bool(false)); }
+                if let Some(mut php_stream) = self.streams.remove(&handle) {
+                    let bytes = data.into_bytes();
+                    let len = bytes.len() as i64;
+                    let result = php_stream.stream.write_all(&bytes).await;
+                    self.streams.insert(handle, php_stream);
+                    match result {
+                        Ok(_) => Ok(PhpValue::Int(len)),
+                        Err(e) => {
+                            self.log_error(&format!("fwrite failed: {}", e));
+                            Ok(PhpValue::Bool(false))
+                        }
+                    }
+                } else {
+                    Ok(PhpValue::Bool(false))
+                }
+            }
+            "fread" => {
+                let handle = if let Some(PhpValue::Resource(id)) = args.first() { *id } else { 0 };
+                let length = args.get(1).map_or(8192usize, |a| a.as_int().max(1) as usize);
+                if handle == 0 { return Ok(PhpValue::Bool(false)); }
+                if let Some(mut php_stream) = self.streams.remove(&handle) {
+                    let result = if php_stream.eof {
+                        Ok(PhpValue::String(String::new()))
+                    } else {
+                        let mut buf = vec![0u8; length];
+                        // Short timeout simulates non-blocking read (PHP stream_set_blocking false)
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(10),
+                            php_stream.stream.read(&mut buf)
+                        ).await {
+                            Ok(Ok(0)) => {
+                                php_stream.eof = true;
+                                Ok(PhpValue::String(String::new()))
+                            }
+                            Ok(Ok(n)) => {
+                                Ok(PhpValue::String(String::from_utf8_lossy(&buf[..n]).into_owned()))
+                            }
+                            Ok(Err(e)) => {
+                                self.log_error(&format!("fread error: {}", e));
+                                php_stream.eof = true;
+                                Ok(PhpValue::Bool(false))
+                            }
+                            Err(_) => {
+                                // Timeout: no data available yet (non-blocking)
+                                Ok(PhpValue::String(String::new()))
+                            }
+                        }
+                    };
+                    self.streams.insert(handle, php_stream);
+                    result
+                } else {
+                    Ok(PhpValue::Bool(false))
+                }
+            }
+            "feof" => {
+                let handle = if let Some(PhpValue::Resource(id)) = args.first() { *id } else { 0 };
+                if handle == 0 { return Ok(PhpValue::Bool(true)); }
+                let eof = self.streams.get(&handle).map_or(true, |s| s.eof);
+                Ok(PhpValue::Bool(eof))
+            }
+            "fclose" => {
+                let handle = if let Some(PhpValue::Resource(id)) = args.first() { *id } else { 0 };
+                self.streams.remove(&handle);
+                Ok(PhpValue::Bool(true))
+            }
             "php_uname" => Ok(PhpValue::String(std::env::consts::OS.to_string())),
             "php_sapi_name" => Ok(PhpValue::String("ruph-ast".to_string())),
             "ini_get" | "ini_set" => Ok(PhpValue::String(String::new())),
@@ -2803,6 +3038,9 @@ impl AstPhpProcessor {
         self.response_headers.clear();
         self.response_body_override = None;
         self.script_returned = None;
+        self.script_return_value = None;
+        self.streams.clear();
+        self.next_stream_id = 1;
         self.current_template_path = Some(template_path.to_path_buf());
         self.root_dir = Some(root_dir.to_path_buf());
         self.included_files.clear();
@@ -3011,17 +3249,34 @@ impl AstPhpProcessor {
         }
     }
 
+    /// Open a TLS client connection to host:port
+    async fn connect_tls(&self, host: &str, port: u16) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(config));
+        let server_name = ServerName::try_from(host.to_string())
+            .map_err(|e| anyhow!("Invalid TLS server name '{}': {}", host, e))?;
+        let tcp = TcpStream::connect((host, port)).await
+            .map_err(|e| anyhow!("TCP connect to {}:{} failed: {}", host, port, e))?;
+        let tls = connector.connect(server_name, tcp).await
+            .map_err(|e| anyhow!("TLS handshake with {}:{} failed: {}", host, port, e))?;
+        Ok(tls)
+    }
+
     fn take_side_effect_output(&mut self) -> Option<String> {
         self.side_effect_output.take()
     }
 
-    async fn include_file(&mut self, target: &str, once: bool) -> Result<String> {
+    async fn include_file(&mut self, target: &str, once: bool) -> Result<(String, Option<PhpValue>)> {
         let path = self.resolve_local_path(target)?;
         let canonical = path.canonicalize()
             .map_err(|_| anyhow!("Cannot resolve include path"))?;
 
         if once && self.included_files.contains(&canonical) {
-            return Ok(String::new());
+            return Ok((String::new(), None));
         }
 
         let content = fs::read_to_string(&canonical).await
@@ -3029,15 +3284,31 @@ impl AstPhpProcessor {
 
         let previous_source = self.source_code.clone();
         let previous_template = self.current_template_path.clone();
+        // Save and clear return state so the included file's return is captured
+        let saved_script_returned = self.script_returned.take();
+        let saved_return_value = self.script_return_value.take();
+        let saved_body_override = self.response_body_override.take();
+
         self.current_template_path = Some(canonical.clone());
         self.included_files.insert(canonical);
 
         let mut output = String::new();
-        self.process_php_code(&content, &mut output).await?;
+        let result = self.process_php_code(&content, &mut output).await;
 
+        // Capture included file's return value before restoring outer state
+        let return_value = self.script_return_value.take();
+
+        // Restore outer context's return state
+        self.script_returned = saved_script_returned;
+        self.script_return_value = saved_return_value;
+        self.response_body_override = saved_body_override;
         self.source_code = previous_source;
         self.current_template_path = previous_template;
-        Ok(output)
+
+        // Propagate errors (including PhpExit) after restoring state
+        result?;
+
+        Ok((output, return_value))
     }
 }
 
@@ -3088,6 +3359,7 @@ fn php_value_to_json(val: &PhpValue) -> String {
                 format!("[{}]", values.join(","))
             }
         }
+        PhpValue::Resource(_) => "null".to_string(),
     }
 }
 
@@ -3159,6 +3431,8 @@ pub enum PhpValue {
     Bool(bool),
     Array(Vec<PhpArrayItem>),
     Null,
+    /// Opaque resource handle (e.g. socket stream)
+    Resource(u32),
 }
 
 #[derive(Clone, Debug)]
@@ -3190,6 +3464,7 @@ impl PhpValue {
             PhpValue::Bool(b) => if *b { "1".to_string() } else { String::new() },
             PhpValue::Array(_) => "Array".to_string(),
             PhpValue::Null => String::new(),
+            PhpValue::Resource(id) => format!("Resource id #{}", id),
         }
     }
 
@@ -3206,6 +3481,7 @@ impl PhpValue {
             PhpValue::String(s) => s.parse::<i64>().unwrap_or(0),
             PhpValue::Null => 0,
             PhpValue::Array(items) => if items.is_empty() { 0 } else { 1 },
+            PhpValue::Resource(id) => *id as i64,
         }
     }
 
@@ -3217,6 +3493,7 @@ impl PhpValue {
             PhpValue::String(s) => s.parse::<f64>().unwrap_or(0.0),
             PhpValue::Null => 0.0,
             PhpValue::Array(items) => if items.is_empty() { 0.0 } else { 1.0 },
+            PhpValue::Resource(id) => *id as f64,
         }
     }
 
@@ -3228,6 +3505,7 @@ impl PhpValue {
             PhpValue::String(s) => !s.is_empty() && s != "0",
             PhpValue::Array(items) => !items.is_empty(),
             PhpValue::Null => false,
+            PhpValue::Resource(_) => true, // resources are always truthy
         }
     }
 
@@ -3243,6 +3521,7 @@ impl PhpValue {
             PhpValue::Float(f) => *f == 0.0,
             PhpValue::String(s) => s.is_empty() || s == "0",
             PhpValue::Array(items) => items.is_empty(),
+            PhpValue::Resource(_) => false, // resources are never empty
         }
     }
 
@@ -3340,6 +3619,7 @@ impl PhpValue {
                 out
             }
             PhpValue::Null => "NULL".to_string(),
+            PhpValue::Resource(id) => format!("resource({})", id),
         }
     }
 }

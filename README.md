@@ -4,6 +4,8 @@ A single-binary web server with built-in PHP scripting. No PHP installation requ
 
 ruph includes a native PHP interpreter powered by tree-sitter, giving you PHP's familiar syntax and templating for web sites and apps — all compiled into one cross-platform binary. For advanced use cases, ruph can optionally use an external PHP binary as a fallback.
 
+If you just want to get a site running quickly, start with [QUICKSTART.md](QUICKSTART.md).
+
 ## Quick Start
 
 ```bash
@@ -39,32 +41,39 @@ Running `./ruph` with no arguments prints help.
 ```
 Request arrives
     │
+    ├── Select effective vhost docroot
     ├── ruph resolves URI against filesystem
     │   Sets: $_SERVER['rr_file'], rr_dir, rr_index, rr_leaf_idx, rr_mime
     │
-    ├── Execute /_index.php (master)
-    │   ├── exit() → DONE (PHP handled the request)
-    │   └── return  → ruph continues:
+    ├── Execute global /_index.php (master), if present
+    ├── Execute vhost-root /_index.php, if present
     │
-    ├── Static file exists, no leaf _index.php → Rust serves directly (fast)
-    ├── Leaf _index.php exists → execute it → DONE
-    ├── Directory with index.html → Rust serves it
-    ├── Directory with nothing → 500
-    └── Nothing matched → 404
+    ├── Existing .php file target → execute it
+    ├── Existing static/index target + deepest local leaf _index.php
+    │   ├── leaf handles → DONE
+    │   └── leaf passes through → Rust delivers target
+    │
+    ├── Existing static/index target, no leaf → Rust delivers target
+    └── Missing path → deepest local leaf handles, or 404
 ```
 
 ### _index.php Architecture
 
-Every directory can have a `_index.php`. At most **two** PHP files execute per request:
+There are up to **three** controller opportunities per request:
 
-1. **Master** (`/_index.php`) — always runs. Server admin controls this.
-2. **Leaf** (`/subdir/_index.php`) — runs if the request targets that directory.
+1. **Global master** (`/<server-root>/_index.php`)
+2. **Vhost-root controller** (`/<vhost-docroot>/_index.php`)
+3. **Deepest local leaf** (`/subdir/_index.php`)
 
-The master runs first and can:
-- **`exit`** — handle the request entirely (auth gates, redirects, error pages)
-- **return** — let ruph serve static files or execute the leaf
+Only the deepest local leaf runs. Intermediate `_index.php` files do not form a chain.
 
-This gives you a clean authority hierarchy: server admin controls the master, users/sub-groups control their directory's `_index.php`.
+The intended model is:
+- global master = server-wide policy
+- vhost-root `_index.php` = site-wide policy
+- deepest local leaf `_index.php` = local interception/routing
+- otherwise Rust serves the resolved target directly
+
+See [REQUESTS.md](REQUESTS.md) for the exact request flow and controller semantics.
 
 ```php
 <?php
@@ -86,12 +95,12 @@ ruph resolves the filesystem **before** PHP runs and sets these `$_SERVER` keys:
 | `rr_exists` | `"1"` if URI maps to an existing file, or empty |
 | `rr_dir` | Realpath if URI maps to a directory, or empty |
 | `rr_index` | First matching index file inside `rr_dir`, or empty |
-| `rr_leaf_idx` | `_index.php` in the leaf directory, or empty |
+| `rr_leaf_idx` | Deepest relevant local `_index.php` below the vhost root, or empty |
 | `rr_mime` | MIME type ruph would use for `rr_file` |
 
 Plus all standard `$_SERVER` keys: `REQUEST_URI`, `REQUEST_METHOD`, `QUERY_STRING`, `HTTP_HOST`, `DOCUMENT_ROOT`, `SCRIPT_FILENAME`, `PHP_SELF`, `PATH_INFO`, and all `HTTP_*` headers.
 
-For full details on return semantics and `rr_*` variables, see [RETURN_RR_VARS.md](RETURN_RR_VARS.md).
+For full details on request flow, controller behavior, and `rr_*` variables, see [REQUESTS.md](REQUESTS.md).
 
 ## Ruph PHP Reference
 

@@ -151,7 +151,7 @@ Paths are resolved relative to the current template, or absolute from docroot if
 
 | Variable | Contents |
 |----------|----------|
-| `$_SERVER` | Request info: `REQUEST_URI`, `REQUEST_METHOD`, `HTTP_HOST`, `DOCUMENT_ROOT`, `rr_root`, `rr_file`, `rr_exists`, `rr_dir`, `rr_index`, `rr_leaf_idx`, `rr_mime`, all `HTTP_*` headers. See [RETURN_RR_VARS.md](RETURN_RR_VARS.md) for details. |
+| `$_SERVER` | Request info: `REQUEST_URI`, `REQUEST_METHOD`, `HTTP_HOST`, `DOCUMENT_ROOT`, `rr_root`, `rr_file`, `rr_exists`, `rr_dir`, `rr_index`, `rr_leaf_idx`, `rr_mime`, `RUPH_*` metrics, all `HTTP_*` headers. See [REQUESTS.md](REQUESTS.md) for details. |
 | `$_GET` | Query string parameters |
 | `$_POST` | POST body parameters |
 | `$_REQUEST` | Merged `$_GET` + `$_POST` |

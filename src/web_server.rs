@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use hyper::http::request::Parts;
 use hyper::{Request, Response, StatusCode, Method};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::body::{Body, Frame, Incoming as IncomingBody, SizeHint};
@@ -120,6 +121,27 @@ pub struct WebServer {
 }
 
 impl WebServer {
+    fn php_auto_handled(exec: &PhpExecution) -> bool {
+        !exec.body.trim().is_empty()
+            || exec.headers.contains_key("location")
+            || exec.status != 200
+    }
+
+    fn php_stops_controller(exec: &PhpExecution) -> bool {
+        exec.exited || exec.returned.is_some() || Self::php_auto_handled(exec)
+    }
+
+    fn php_leaf_handled(exec: &PhpExecution) -> bool {
+        if exec.exited {
+            return true;
+        }
+        match exec.returned {
+            Some(true) => false,
+            Some(false) => true,
+            None => Self::php_auto_handled(exec),
+        }
+    }
+
     fn apply_safe_headers(
         mut builder: hyper::http::response::Builder,
         headers: &HashMap<String, String>,
@@ -142,26 +164,6 @@ impl WebServer {
             builder = builder.header(header_name, header_value);
         }
         builder
-    }
-
-    /// Determine if a PhpExecution result means "request handled" (true) or "pass through" (false).
-    ///
-    /// - exit → always handled
-    /// - return true → pass through (Rust serves static file)
-    /// - return false / bare return → handled
-    /// - no return (fell off end) → infer from output/headers/status
-    fn php_handled_request(exec: &PhpExecution) -> bool {
-        if exec.exited { return true; }
-        match exec.returned {
-            Some(true) => false,  // return true = pass through to Rust
-            Some(false) => true,  // return false / bare return = handled
-            None => {
-                // No explicit return — auto-detect from output
-                !exec.body.trim().is_empty()
-                    || exec.headers.contains_key("location")
-                    || exec.status != 200
-            }
-        }
     }
 
     /// Build an HTTP response from a PhpExecution result.
@@ -310,11 +312,113 @@ impl WebServer {
     }
 
     /// Find the first PHP file from `index_files` that exists in `root`.
+    #[allow(dead_code)]
     fn find_root_init_script(root: &Path, index_files: &[String]) -> Option<PathBuf> {
         index_files.iter()
             .filter(|name| name.ends_with(".php"))
             .map(|name| root.join(name))
             .find(|p| p.is_file())
+    }
+
+    fn global_master_script(&self) -> Option<PathBuf> {
+        let candidate = self.root_dir.join(&self.middleware_index);
+        candidate.is_file().then_some(candidate)
+    }
+
+    fn vhost_root_script(&self, root: &Path) -> Option<PathBuf> {
+        let candidate = root.join(&self.middleware_index);
+        candidate.is_file().then_some(candidate)
+    }
+
+    fn is_same_canonical_file(a: &Path, b: &Path) -> bool {
+        match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    fn deepest_leaf_for_dir(&self, root: &Path, dir: &Path) -> Option<PathBuf> {
+        let canonical_root = root.canonicalize().ok()?;
+        let canonical_dir = dir.canonicalize().ok()?;
+        let rel = canonical_dir.strip_prefix(&canonical_root).ok()?;
+
+        let mut current = canonical_root.clone();
+        let mut deepest = None;
+        for component in rel.components() {
+            current = current.join(component);
+            let candidate = current.join("_index.php");
+            if candidate.is_file() {
+                deepest = candidate.canonicalize().ok().or(Some(candidate));
+            }
+        }
+        deepest
+    }
+
+    fn request_target_dir(&self, target: &RequestTarget) -> Option<PathBuf> {
+        match target {
+            RequestTarget::Static(path) | RequestTarget::Script(path) => {
+                path.parent().map(|p| p.to_path_buf())
+            }
+            RequestTarget::NotFound => None,
+        }
+    }
+
+    fn target_exists(target: &RequestTarget) -> bool {
+        !matches!(target, RequestTarget::NotFound)
+    }
+
+    async fn deliver_target(
+        &self,
+        target: &RequestTarget,
+        query_params: &HashMap<String, String>,
+        post_params: &HashMap<String, String>,
+        server_vars: &HashMap<String, String>,
+        prefer_sse: bool,
+        stderr_handler: Option<&PhpStderrHandler>,
+        method: &Method,
+    ) -> Result<Response<RuphBody>> {
+        match target {
+            RequestTarget::Static(path) => {
+                if method == Method::HEAD {
+                    let content_type = self.get_content_type(path);
+                    let metadata = match fs::metadata(path).await {
+                        Ok(meta) => meta,
+                        Err(_) => {
+                            return Ok(self.error_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "Cannot read file metadata",
+                            ));
+                        }
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", content_type)
+                        .header("Content-Length", metadata.len().to_string())
+                        .body(RuphBody::empty())
+                        .map_err(|e| anyhow!("Failed to build response: {}", e))
+                } else {
+                    self.serve_static_file(path).await
+                }
+            }
+            RequestTarget::Script(path) => {
+                if method == Method::HEAD {
+                    return Ok(self.error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "HEAD not supported for scripts",
+                    ));
+                }
+                self.process_php_template(
+                    path,
+                    query_params,
+                    post_params,
+                    server_vars,
+                    prefer_sse,
+                    stderr_handler,
+                )
+                .await
+            }
+            RequestTarget::NotFound => Ok(self.error_response(StatusCode::NOT_FOUND, "Not found")),
+        }
     }
 
     /// Return the docroot for a given `Host` header value (port stripped).
@@ -351,6 +455,7 @@ impl WebServer {
     }
 
     /// Return the init script for a given host by scanning `index_files` at request time.
+    #[allow(dead_code)]
     fn effective_init_script(&self, host: &str) -> Option<PathBuf> {
         let root = self.effective_root(host);
         Self::find_root_init_script(root, &self.index_files)
@@ -390,12 +495,10 @@ impl WebServer {
 
     /// Pre-resolve the filesystem for a request URI, producing `rr_*` server variables.
     ///
-    /// Returns (HashMap, leaf_chain) where:
-    /// - HashMap has keys: `rr_file`, `rr_dir`, `rr_index`, `rr_leaf_idx`, `rr_mime`, `rr_exists`, `rr_root`
-    /// - leaf_chain is a Vec of _index.php paths from docroot down to target dir (outermost first)
-    ///
-    /// `rr_leaf_idx` is set to the deepest (last) entry in the chain for backward compat.
-    fn resolve_rr_vars(&self, url_path: &str, root: &Path) -> (HashMap<String, String>, Vec<PathBuf>) {
+    /// Returns a HashMap with keys:
+    /// `rr_file`, `rr_dir`, `rr_index`, `rr_leaf_idx`, `rr_mime`, `rr_exists`, `rr_root`.
+    /// `rr_leaf_idx` is set to the deepest local `_index.php` below the vhost root.
+    fn resolve_rr_vars(&self, url_path: &str, root: &Path) -> HashMap<String, String> {
         let mut rr = HashMap::new();
         rr.insert("rr_file".to_string(), String::new());
         rr.insert("rr_dir".to_string(), String::new());
@@ -405,17 +508,11 @@ impl WebServer {
         rr.insert("rr_exists".to_string(), String::new());
         rr.insert("rr_root".to_string(), root.to_string_lossy().to_string());
 
-        // The master _index.php path — leaves should never include this.
-        // Master lives at the global root_dir, not the per-domain docroot.
-        let master_path = self.root_dir.join(&self.middleware_index);
-        let master_canonical = master_path.canonicalize().ok();
-
         let file_path = match self.resolve_file_path(url_path, root) {
             Ok(p) => p,
-            Err(_) => return (rr, Vec::new()),
+            Err(_) => return rr,
         };
 
-        // Determine the target directory for _index.php chain collection
         let target_dir = if file_path.is_file() {
             let fname = file_path.file_name().and_then(|f| f.to_str()).unwrap_or("");
             if fname != "_index.php" {
@@ -445,7 +542,6 @@ impl WebServer {
             }
             Some(file_path.clone())
         } else {
-            // URI doesn't map to anything on disk — walk down to find the deepest existing dir
             let decoded = decode(url_path).unwrap_or_default();
             let clean = decoded.trim_start_matches('/');
             let parts: Vec<&str> = clean.split('/').filter(|p| !p.is_empty()).collect();
@@ -461,74 +557,36 @@ impl WebServer {
             Some(deepest)
         };
 
-        // Build the _index.php cascade chain: walk from docroot down to target_dir,
-        // collecting every _index.php found along the way (outermost first).
-        let mut leaf_chain: Vec<PathBuf> = Vec::new();
         if let Some(target) = target_dir {
-            let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-
-            // Get the relative path segments from docroot to target
-            let target_canon = target.canonicalize().unwrap_or_else(|_| target.clone());
-            if let Ok(rel) = target_canon.strip_prefix(&canonical_root) {
-                // Walk down from docroot, checking each level
-                let mut current = canonical_root.clone();
-                // Check docroot itself first
-                let leaf = current.join("_index.php");
-                if leaf.is_file() {
-                    if let Ok(real) = leaf.canonicalize() {
-                        if master_canonical.as_ref() != Some(&real) {
-                            leaf_chain.push(real);
-                        }
-                    }
-                }
-                // Then each subdirectory component
-                for component in rel.components() {
-                    current = current.join(component);
-                    let leaf = current.join("_index.php");
-                    if leaf.is_file() {
-                        if let Ok(real) = leaf.canonicalize() {
-                            if master_canonical.as_ref() != Some(&real) {
-                                leaf_chain.push(real);
-                            }
-                        }
-                    }
-                }
+            if let Some(deepest) = self.deepest_leaf_for_dir(root, &target) {
+                rr.insert("rr_leaf_idx".to_string(), deepest.to_string_lossy().to_string());
             }
         }
 
-        // rr_leaf_idx = deepest leaf (backward compat)
-        if let Some(deepest) = leaf_chain.last() {
-            rr.insert("rr_leaf_idx".to_string(), deepest.to_string_lossy().to_string());
-        }
-
-        (rr, leaf_chain)
+        rr
     }
 
-    /// Handle HTTP web requests using the master/leaf _index.php architecture.
+    /// Handle HTTP web requests using the global-master / vhost-root / deepest-leaf architecture.
     ///
     /// Flow:
     /// 1. Resolve rr_* variables (filesystem pre-resolution)
-    /// 2. Run master /_index.php (if it exists)
-    ///    - exit → request fully handled, return response
-    ///    - return → continue to default handling
-    /// 3. Default handling:
-    ///    a. rr_leaf_idx exists → execute leaf _index.php
-    ///    b. rr_file exists, no leaf → serve static file
-    ///    c. rr_dir + rr_index → serve index file
-    ///    d. rr_dir, no index or leaf → 500
-    ///    e. nothing matched → 404
+    /// 2. Run the global master and vhost-root controllers, if present.
+    /// 3. Resolve the target.
+    /// 4. For non-PHP targets, optionally run the deepest local leaf `_index.php`.
+    /// 5. Deliver the resolved target directly, or 404.
     pub async fn handle_request(&self, req: Request<IncomingBody>, remote_addr: Option<std::net::SocketAddr>, is_tls: bool) -> Result<Response<RuphBody>> {
-        let host = req.headers().get("host")
+        let (parts, body) = req.into_parts();
+        let host = parts.headers.get("host")
             .and_then(|v| v.to_str().ok())
-            .or_else(|| req.uri().authority().map(|a| a.as_str()))
+            .or_else(|| parts.uri.authority().map(|a| a.as_str()))
             .unwrap_or("")
             .to_string();
 
         let root = self.effective_root(&host).clone();
         let stderr_handler = self.stderr_handler_for(&host);
 
-        let method = req.method().clone();
-        let path = req.uri().path().to_string();
+        let method = parts.method.clone();
+        let path = parts.uri.path().to_string();
 
         debug!("Web request: {} {}", method, path);
 
@@ -542,27 +600,29 @@ impl WebServer {
             return Ok(self.error_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed"));
         }
 
-        // HEAD: handle separately (no body needed)
-        if method == Method::HEAD {
-            return self.handle_head_request(req, &root, self.effective_init_script(&host).as_deref(), stderr_handler.as_ref()).await;
-        }
-
         // ── Step 1: Pre-resolve filesystem → rr_* variables ──
-        let (rr_vars, leaf_chain) = self.resolve_rr_vars(&path, &root);
-        debug!("rr_vars: leaf_chain={:?} file={} dir={} index={}",
-            leaf_chain.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+        let rr_vars = self.resolve_rr_vars(&path, &root);
+        debug!("rr_vars: file={} dir={} index={} leaf={}",
             rr_vars.get("rr_file").unwrap_or(&String::new()),
             rr_vars.get("rr_dir").unwrap_or(&String::new()),
-            rr_vars.get("rr_index").unwrap_or(&String::new()));
+            rr_vars.get("rr_index").unwrap_or(&String::new()),
+            rr_vars.get("rr_leaf_idx").unwrap_or(&String::new()));
 
-        // ── Step 2: Find and run master /_index.php ──
-        // Master always lives at the global root_dir, not the per-domain docroot.
-        // Per-domain _index.php files are discovered as leaves.
-        let master_path = self.root_dir.join(&self.middleware_index);
-        if master_path.is_file() {
-            // Extract query string and build server vars before consuming the request body
-            let query_string = req.uri().query().unwrap_or("").to_string();
-            let mut server_vars = self.build_server_vars_with_addr(&req, &master_path, &root, remote_addr)?;
+        let query_string = parts.uri.query().unwrap_or("").to_string();
+        let query_params = self.parse_query_string(&query_string);
+        let post_params = if method == Method::POST {
+            let body_bytes = match body.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(_) => return Ok(self.error_response(StatusCode::BAD_REQUEST, "Invalid request body")),
+            };
+            self.parse_post_data(&body_bytes)
+        } else {
+            HashMap::new()
+        };
+
+        // ── Step 2: Global master /_index.php ──
+        if let Some(master_path) = self.global_master_script() {
+            let mut server_vars = self.build_server_vars_from_parts_with_addr(&parts, &master_path, &root, remote_addr)?;
             if is_tls {
                 server_vars.insert("HTTPS".to_string(), "on".to_string());
             }
@@ -570,101 +630,175 @@ impl WebServer {
                 server_vars.insert(k.clone(), v.clone());
             }
 
-            // Parse query/post params
-            let query_params = self.parse_query_string(&query_string);
-            let post_params = if method == Method::POST {
-                let body_bytes = match req.collect().await {
-                    Ok(collected) => collected.to_bytes(),
-                    Err(_) => return Ok(self.error_response(StatusCode::BAD_REQUEST, "Invalid request body")),
-                };
-                self.parse_post_data(&body_bytes)
-            } else {
-                HashMap::new()
-            };
-
-            // Execute master _index.php
-            let master_result = self.run_php_buffered(
-                &master_path, &query_params, &post_params, &server_vars, stderr_handler.as_ref()
-            ).await;
-
-            match master_result {
+            match self
+                .run_php_buffered(&master_path, &query_params, &post_params, &server_vars, stderr_handler.as_ref())
+                .await
+            {
                 Ok(exec) => {
-                    if Self::php_handled_request(&exec) {
-                        debug!("Master _index.php handled request (exited={}, returned={:?})", exec.exited, exec.returned);
+                    if Self::php_stops_controller(&exec) {
                         return Self::build_php_response(&exec);
                     }
-                    debug!("Master _index.php passed through — continuing to default handling");
                 }
-                Err(e) => {
-                    warn!("Master _index.php failed: {} — continuing to default handling", e);
-                }
+                Err(e) => warn!("Global master _index.php failed: {} — continuing", e),
             }
+        }
 
-            // ── Step 3: Default handling ──
-            let rr_file = &rr_vars["rr_file"];
-            let rr_dir = &rr_vars["rr_dir"];
-            let rr_index = &rr_vars["rr_index"];
-
-            // ── Leaf chain execution: run _index.php files from docroot down ──
-            // Each can exit (request handled) or return/fall-through to continue to the next.
-            for leaf_path in &leaf_chain {
-                let mut leaf_sv = self.build_server_vars_from_existing(&server_vars, leaf_path, &root);
+        // ── Step 3: Vhost-root _index.php ──
+        if let Some(vhost_path) = self.vhost_root_script(&root) {
+            let skip = self
+                .global_master_script()
+                .as_ref()
+                .map(|master| Self::is_same_canonical_file(master, &vhost_path))
+                .unwrap_or(false);
+            if !skip {
+                let mut server_vars =
+                    self.build_server_vars_from_parts_with_addr(&parts, &vhost_path, &root, remote_addr)?;
+                if is_tls {
+                    server_vars.insert("HTTPS".to_string(), "on".to_string());
+                }
                 for (k, v) in &rr_vars {
-                    leaf_sv.insert(k.clone(), v.clone());
+                    server_vars.insert(k.clone(), v.clone());
                 }
 
-                let leaf_result = self.run_php_buffered(
-                    leaf_path, &query_params, &post_params, &leaf_sv, stderr_handler.as_ref()
-                ).await;
-
-                match leaf_result {
+                match self
+                    .run_php_buffered(&vhost_path, &query_params, &post_params, &server_vars, stderr_handler.as_ref())
+                    .await
+                {
                     Ok(exec) => {
-                        if Self::php_handled_request(&exec) {
-                            debug!("Leaf {:?} handled request (exited={}, returned={:?})", leaf_path, exec.exited, exec.returned);
+                        if Self::php_stops_controller(&exec) {
                             return Self::build_php_response(&exec);
                         }
-                        debug!("Leaf {:?} passed through — continuing chain", leaf_path);
                     }
-                    Err(e) => {
-                        warn!("Leaf {:?} failed: {} — continuing chain", leaf_path, e);
-                    }
+                    Err(e) => warn!("Vhost-root _index.php failed: {} — continuing", e),
                 }
             }
+        }
 
-            // ── Static file / directory index / error ──
-            if !rr_file.is_empty() {
-                return self.serve_static_file(&PathBuf::from(rr_file)).await;
+        // ── Step 4: Resolve the actual request target ──
+        let target = self.resolve_request_target(&path, &root, None)?;
+        let prefer_sse = parts
+            .headers
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("text/event-stream"))
+            .unwrap_or(false);
+
+        // Existing .php file requests execute directly, without leaf interception.
+        if !rr_vars["rr_file"].is_empty()
+            && matches!(target, RequestTarget::Script(ref path) if path.extension().and_then(|s| s.to_str()) == Some("php") && path.is_file())
+        {
+            let mut sv = self.build_server_vars_from_parts_with_addr(
+                &parts,
+                match &target { RequestTarget::Script(path) => path, _ => unreachable!() },
+                &root,
+                remote_addr,
+            )?;
+            if is_tls {
+                sv.insert("HTTPS".to_string(), "on".to_string());
             }
+            for (k, v) in &rr_vars {
+                sv.insert(k.clone(), v.clone());
+            }
+            return self
+                .deliver_target(
+                    &target,
+                    &query_params,
+                    &post_params,
+                    &sv,
+                    prefer_sse,
+                    stderr_handler.as_ref(),
+                    &method,
+                )
+                .await;
+        }
 
-            if !rr_dir.is_empty() && !rr_index.is_empty() {
-                let index_path = PathBuf::from(rr_index);
-                if index_path.extension().and_then(|s| s.to_str()) == Some("php") {
-                    let mut idx_sv = self.build_server_vars_from_existing(&server_vars, &index_path, &root);
-                    for (k, v) in &rr_vars {
-                        idx_sv.insert(k.clone(), v.clone());
+        let target_dir = self.request_target_dir(&target).or_else(|| {
+            let file_path = self.resolve_file_path(&path, &root).ok()?;
+            if file_path.is_dir() {
+                // Existing directory with no content index — use it for the leaf search.
+                // This covers requests like `/search/` where `search/_index.php` exists
+                // but there is no `search/index.html` or `search/index.php`.
+                Some(file_path)
+            } else if !file_path.exists() {
+                // Path does not exist on disk — walk to the deepest existing directory.
+                let clean = decode(&path).unwrap_or_default();
+                let clean = clean.trim_start_matches('/');
+                let parts: Vec<&str> = clean.split('/').filter(|p| !p.is_empty()).collect();
+                let mut deepest = root.clone();
+                for part in &parts {
+                    let next = deepest.join(part);
+                    if next.is_dir() {
+                        deepest = next;
+                    } else {
+                        break;
                     }
-                    return self.process_php_template(&index_path, &query_params, &post_params, &idx_sv, false, stderr_handler.as_ref()).await;
                 }
-                return self.serve_static_file(&index_path).await;
+                Some(deepest)
+            } else {
+                None
+            }
+        });
+
+        let leaf_path = target_dir
+            .as_ref()
+            .and_then(|dir| self.deepest_leaf_for_dir(&root, dir));
+
+        if let Some(leaf_path) = leaf_path {
+            let mut leaf_sv =
+                self.build_server_vars_from_parts_with_addr(&parts, &leaf_path, &root, remote_addr)?;
+            if is_tls {
+                leaf_sv.insert("HTTPS".to_string(), "on".to_string());
+            }
+            for (k, v) in &rr_vars {
+                leaf_sv.insert(k.clone(), v.clone());
             }
 
-            if !rr_dir.is_empty() {
-                return Ok(self.error_response(StatusCode::INTERNAL_SERVER_ERROR, "Directory requires a _index.php"));
+            match self
+                .run_php_buffered(&leaf_path, &query_params, &post_params, &leaf_sv, stderr_handler.as_ref())
+                .await
+            {
+                Ok(exec) => {
+                    if Self::php_leaf_handled(&exec) {
+                        return Self::build_php_response(&exec);
+                    }
+                }
+                Err(e) => warn!("Leaf _index.php failed: {} — continuing", e),
             }
 
-            return Ok(self.error_response(StatusCode::NOT_FOUND, "Not found"));
+            if !Self::target_exists(&target) {
+                return Ok(self.error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Leaf _index.php must handle unmatched paths",
+                ));
+            }
         }
 
-        // No master _index.php — fall back to legacy request handling
-        let init_script = self.effective_init_script(&host);
-        match method {
-            Method::GET => self.handle_get_request(req, &root, init_script.as_deref(), stderr_handler.as_ref()).await,
-            Method::POST => self.handle_post_request(req, &root, init_script.as_deref(), stderr_handler.as_ref()).await,
-            _ => Ok(self.error_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed")),
+        let deliver_path = match &target {
+            RequestTarget::Static(path) | RequestTarget::Script(path) => path,
+            RequestTarget::NotFound => &root,
+        };
+        let mut sv = self.build_server_vars_from_parts_with_addr(&parts, deliver_path, &root, remote_addr)?;
+        if is_tls {
+            sv.insert("HTTPS".to_string(), "on".to_string());
         }
+        for (k, v) in &rr_vars {
+            sv.insert(k.clone(), v.clone());
+        }
+
+        self.deliver_target(
+            &target,
+            &query_params,
+            &post_params,
+            &sv,
+            prefer_sse,
+            stderr_handler.as_ref(),
+            &method,
+        )
+        .await
     }
 
     /// Handle GET requests
+    #[allow(dead_code)]
     async fn handle_get_request(&self, req: Request<IncomingBody>, root: &Path, init_script: Option<&Path>, stderr_handler: Option<&PhpStderrHandler>) -> Result<Response<RuphBody>> {
         let uri = req.uri();
         let path = uri.path();
@@ -687,6 +821,7 @@ impl WebServer {
     }
 
     /// Handle POST requests
+    #[allow(dead_code)]
     async fn handle_post_request(&self, req: Request<IncomingBody>, root: &Path, init_script: Option<&Path>, stderr_handler: Option<&PhpStderrHandler>) -> Result<Response<RuphBody>> {
         let uri = req.uri().clone();
         let path = uri.path();
@@ -723,6 +858,7 @@ impl WebServer {
     }
 
     /// Handle HEAD requests
+    #[allow(dead_code)]
     async fn handle_head_request(&self, req: Request<IncomingBody>, root: &Path, init_script: Option<&Path>, _stderr_handler: Option<&PhpStderrHandler>) -> Result<Response<RuphBody>> {
         let uri = req.uri();
         let path = uri.path();
@@ -1090,8 +1226,12 @@ impl WebServer {
     }
 
     /// Try each entry in `index_files` in order; return the first one that exists.
+    /// Skips the middleware index (`_index.php`) since it's already handled as a controller.
     fn find_index_file(&self, dir: &Path) -> Option<RequestTarget> {
         for name in &self.index_files {
+            if name == &self.middleware_index {
+                continue;
+            }
             let candidate = dir.join(name);
             if candidate.exists() && candidate.is_file() {
                 if candidate.extension().and_then(|s| s.to_str()) == Some("php") {
@@ -1113,6 +1253,7 @@ impl WebServer {
         self.build_server_vars_inner(req, script_path, root, None)
     }
 
+    #[allow(dead_code)]
     fn build_server_vars_with_addr(
         &self,
         req: &Request<IncomingBody>,
@@ -1193,7 +1334,76 @@ impl WebServer {
         Ok(server_vars)
     }
 
+    fn build_server_vars_from_parts_with_addr(
+        &self,
+        parts: &Parts,
+        script_path: &Path,
+        root: &Path,
+        remote_addr: Option<std::net::SocketAddr>,
+    ) -> Result<HashMap<String, String>> {
+        let mut server_vars = HashMap::new();
+        let uri = &parts.uri;
+        let query_string = uri.query().unwrap_or("").to_string();
+
+        server_vars.insert("SERVER_SOFTWARE".to_string(), "ruph/0.1.0".to_string());
+        server_vars.insert("SERVER_NAME".to_string(), "localhost".to_string());
+        server_vars.insert("SERVER_PORT".to_string(), "8082".to_string());
+        server_vars.insert("REQUEST_METHOD".to_string(), parts.method.to_string());
+        let script_name = script_path
+            .strip_prefix(root)
+            .unwrap_or(script_path.file_name().map(Path::new).unwrap_or(script_path))
+            .to_string_lossy()
+            .replace('\\', "/");
+        let script_name = if script_name.starts_with('/') {
+            script_name
+        } else {
+            format!("/{}", script_name)
+        };
+
+        server_vars.insert("SCRIPT_NAME".to_string(), script_name.clone());
+        server_vars.insert("SCRIPT_FILENAME".to_string(), script_path.to_string_lossy().to_string());
+        server_vars.insert("DOCUMENT_ROOT".to_string(), root.to_string_lossy().to_string());
+        let request_uri = uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or_else(|| uri.path())
+            .to_string();
+        server_vars.insert("REQUEST_URI".to_string(), request_uri);
+        server_vars.insert("QUERY_STRING".to_string(), query_string);
+        server_vars.insert("PHP_SELF".to_string(), script_name.clone());
+
+        let request_path = uri.path();
+        let path_info = if let Some(dir) = script_name.rsplitn(2, '/').last() {
+            if dir.is_empty() {
+                request_path.to_string()
+            } else if request_path.starts_with(dir) {
+                let remainder = &request_path[dir.len()..];
+                if remainder.is_empty() { "".to_string() } else { remainder.to_string() }
+            } else {
+                "".to_string()
+            }
+        } else {
+            "".to_string()
+        };
+        server_vars.insert("PATH_INFO".to_string(), path_info);
+
+        for (name, value) in &parts.headers {
+            let header_name = format!("HTTP_{}", name.as_str().replace('-', "_").to_uppercase());
+            let header_value = value.to_str().unwrap_or("").to_string();
+            server_vars.insert(header_name, header_value);
+        }
+
+        if let (Some(stats), Some(addr)) = (&self.stats, remote_addr) {
+            for (k, v) in stats.server_vars(addr.ip()) {
+                server_vars.insert(k, v);
+            }
+        }
+
+        Ok(server_vars)
+    }
+
     /// Build server vars for a leaf/index script reusing existing request info.
+    #[allow(dead_code)]
     fn build_server_vars_from_existing(
         &self,
         existing: &HashMap<String, String>,
@@ -1493,6 +1703,64 @@ mod tests {
             RequestTarget::NotFound => {}
             other => panic!("Expected NotFound, got {:?}", std::mem::discriminant(&other)),
         }
+    }
+
+    #[test]
+    fn test_vhost_root_script_uses_effective_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let default_root = temp_dir.path().join("default");
+        let vhost_root = temp_dir.path().join("example");
+        std::fs::create_dir_all(&default_root).unwrap();
+        std::fs::create_dir_all(&vhost_root).unwrap();
+        std::fs::write(default_root.join("_index.php"), "<?php return false;").unwrap();
+        std::fs::write(vhost_root.join("_index.php"), "<?php return false;").unwrap();
+
+        let mut domains = HashMap::new();
+        domains.insert("example.com".to_string(), vhost_root.clone());
+        let web_server = WebServer::new(
+            default_root,
+            domains,
+            Vec::new(),
+            vec!["_index.php".to_string()],
+            PhpMode::Auto,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let effective = web_server.effective_root("example.com");
+        let vhost_script = web_server.vhost_root_script(effective).unwrap();
+        assert_eq!(vhost_script, vhost_root.join("_index.php"));
+    }
+
+    #[test]
+    fn test_rr_leaf_is_deepest_below_vhost_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        std::fs::create_dir_all(root.join("users/admin")).unwrap();
+        std::fs::write(root.join("_index.php"), "<?php return false;").unwrap();
+        std::fs::write(root.join("users/_index.php"), "<?php return false;").unwrap();
+        std::fs::write(root.join("users/admin/_index.php"), "<?php return false;").unwrap();
+        std::fs::write(root.join("users/admin/profile.html"), "ok").unwrap();
+
+        let web_server = WebServer::new(
+            root.to_path_buf(),
+            HashMap::new(),
+            Vec::new(),
+            vec!["_index.php".to_string()],
+            PhpMode::Auto,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rr = web_server.resolve_rr_vars("/users/admin/profile.html", root);
+        assert_eq!(
+            rr.get("rr_leaf_idx").map(|s| s.as_str()),
+            Some(root.join("users/admin/_index.php").to_string_lossy().as_ref())
+        );
     }
 
     #[tokio::test]

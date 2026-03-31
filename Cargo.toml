@@ -30,6 +30,7 @@ urlencoding = "2.0"
 configparser = "3.0"
 tempfile = "3.0"
 rusqlite = { version = "0.31", features = ["bundled"] }
+webpki-roots = "0.26"
 
 # PHP parsing
 tree-sitter = "0.25"
