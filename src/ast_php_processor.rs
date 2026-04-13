@@ -18,9 +18,11 @@ static PHP_TAG_RE: OnceLock<Regex> = OnceLock::new();
 use tokio::fs;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::TlsConnector;
 use rustls::pki_types::ServerName;
 use reqwest::Client;
+use bytes::Bytes;
 use serde_json::Value as JsonValue;
 
 /// Active TLS socket stream for PHP stream functions
@@ -70,6 +72,14 @@ pub struct AstPhpProcessor {
     next_stream_id: u32,
     /// Per-request error log callback (routes to domain-specific log files)
     error_log_handler: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    /// Set to true when a `continue` statement is hit inside a loop body
+    loop_continue: bool,
+    /// Streaming mode: channel sender for body chunks (set before execute_chain)
+    flush_tx: Option<mpsc::Sender<Result<Bytes, std::io::Error>>>,
+    /// Streaming mode: oneshot for sending response headers on first flush
+    headers_tx: Option<oneshot::Sender<(HashMap<String, String>, u16)>>,
+    /// Streaming mode: accumulates echo output between flush() calls
+    streaming_buf: String,
 }
 
 impl AstPhpProcessor {
@@ -110,6 +120,10 @@ impl AstPhpProcessor {
             streams: HashMap::new(),
             next_stream_id: 1,
             error_log_handler: None,
+            loop_continue: false,
+            flush_tx: None,
+            headers_tx: None,
+            streaming_buf: String::new(),
             constants: {
                 let mut c = HashMap::new();
                 c.insert("PATHINFO_DIRNAME".to_string(), PhpValue::Int(1));
@@ -194,13 +208,17 @@ impl AstPhpProcessor {
         request_params.extend(post_params.clone());
         self.superglobals.insert("_REQUEST".to_string(), request_params);
 
-        // Prepare the output buffer
         let mut output = String::new();
         self.accumulated_output.clear();
 
+        self.execute_php_body(php_code, &mut output).await
+    }
+
+    /// Shared execution body used by both execute_php_with_handler and execute_php_continue.
+    async fn execute_php_body(&mut self, php_code: &str, output: &mut String) -> Result<PhpExecution> {
         // Process the PHP code — catch exit/die as normal termination
         let mut exited = false;
-        match self.process_php_code(php_code, &mut output).await {
+        match self.process_php_code(php_code, output).await {
             Ok(_) => {}
             Err(e) => {
                 if e.downcast_ref::<PhpExit>().is_some() {
@@ -209,7 +227,7 @@ impl AstPhpProcessor {
                     exited = true;
                     // Merge accumulated output from nested calls that was saved before exit
                     if output.is_empty() && !self.accumulated_output.is_empty() {
-                        output = std::mem::take(&mut self.accumulated_output);
+                        *output = std::mem::take(&mut self.accumulated_output);
                     }
                 } else {
                     return Err(e);
@@ -217,7 +235,7 @@ impl AstPhpProcessor {
             }
         }
 
-        let body = self.response_body_override.clone().unwrap_or(output);
+        let body = self.response_body_override.clone().unwrap_or_else(|| output.clone());
 
         // Match PHP behavior: Location header without explicit status → 302
         let status = if self.response_status == 200
@@ -568,7 +586,18 @@ impl AstPhpProcessor {
                         let cond_val = self.evaluate_expression(condition).await?;
                         if !cond_val.is_truthy() { break; }
                         let flow = self.process_node(body, output).await?;
-                        if let ControlFlow::Break(()) = flow { return Ok(flow); }
+                        if let ControlFlow::Break(()) = flow {
+                            if self.loop_continue {
+                                self.loop_continue = false;
+                                // continue: recheck condition and iterate
+                            } else if self.script_returned.is_some() {
+                                // return inside loop: propagate upward
+                                return Ok(flow);
+                            } else {
+                                // break: exit loop
+                                break;
+                            }
+                        }
                         iterations += 1;
                         if iterations > 100_000 {
                             warn!("while loop exceeded 100k iterations, breaking");
@@ -597,7 +626,16 @@ impl AstPhpProcessor {
                     }
                     if let Some(body) = body {
                         let flow = self.process_node(body, output).await?;
-                        if let ControlFlow::Break(()) = flow { return Ok(flow); }
+                        if let ControlFlow::Break(()) = flow {
+                            if self.loop_continue {
+                                self.loop_continue = false;
+                                // continue: run update then recheck condition
+                            } else if self.script_returned.is_some() {
+                                return Ok(flow);
+                            } else {
+                                break;
+                            }
+                        }
                     }
                     if let Some(update) = update {
                         self.evaluate_expression(update).await?;
@@ -681,7 +719,17 @@ impl AstPhpProcessor {
                             }
 
                             let flow = self.process_node(body, output).await?;
-                            if let ControlFlow::Break(()) = flow { return Ok(flow); }
+                            if let ControlFlow::Break(()) = flow {
+                                if self.loop_continue {
+                                    self.loop_continue = false;
+                                    // continue: move to next element
+                                } else if self.script_returned.is_some() {
+                                    return Ok(flow);
+                                } else {
+                                    // break: exit foreach
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -786,7 +834,12 @@ impl AstPhpProcessor {
                 }
             }
             // ── break / continue (within loops) ─────────────────────────
-            "break_statement" | "continue_statement" => {
+            "break_statement" => {
+                self.loop_continue = false;
+                return Ok(ControlFlow::Break(()));
+            }
+            "continue_statement" => {
+                self.loop_continue = true;
                 return Ok(ControlFlow::Break(()));
             }
             // ── const declarations ───────────────────────────────────────
@@ -1196,28 +1249,21 @@ impl AstPhpProcessor {
                     .or_else(|| node.child_by_field_name("offset"))
                     .or_else(|| node.named_child(1));
                 if let (Some(target), Some(index)) = (target, index) {
-                    let target_name = if let Some(id) = self.get_identifier(target) {
-                        id
-                    } else {
-                        let source = self.source_code.as_bytes();
-                        target.utf8_text(source)?.to_string().trim_start_matches('$').to_string()
-                    };
                     let key = self.evaluate_expression(index).await?.as_string();
-                    if let Some(superglobal) = self.superglobals.get(&target_name) {
-                        if let Some(value) = superglobal.get(&key) {
-                            return Ok(PhpValue::String(value.clone()));
-                        }
-                    }
-                    if let Some(PhpValue::Array(items)) = self.variables.get(&target_name) {
-                        if let Ok(index) = key.parse::<usize>() {
-                            if let Some(item) = items.get(index) {
+                    // Evaluate target as an expression — handles chains like $a['b']['c'],
+                    // function_call()['key'], etc. Superglobals are returned as Array by
+                    // the variable handler so they work transparently here.
+                    let target_val = self.evaluate_expression(target).await?;
+                    if let PhpValue::Array(items) = target_val {
+                        if let Ok(idx) = key.parse::<usize>() {
+                            if let Some(item) = items.get(idx) {
                                 match item {
                                     PhpArrayItem::KeyValue(_, value) => return Ok(value.clone()),
                                     PhpArrayItem::Value(value) => return Ok(value.clone()),
                                 }
                             }
                         }
-                        for item in items {
+                        for item in &items {
                             if let PhpArrayItem::KeyValue(item_key, value) = item {
                                 if item_key == &key {
                                     return Ok(value.clone());
@@ -1606,6 +1652,11 @@ impl AstPhpProcessor {
             // Strip leading backslash from namespace-qualified calls like \is_scalar()
             raw.trim_start_matches('\\').to_string()
         };
+
+        // Handle preg_match / preg_match_all — 3rd arg is a by-ref output variable
+        if func_name == "preg_match" || func_name == "preg_match_all" {
+            return self.call_preg_match_family(&func_name, args_node).await;
+        }
 
         // Handle unset() specially — needs raw AST nodes to find variable/key references
         if func_name == "unset" {
@@ -2136,14 +2187,9 @@ impl AstPhpProcessor {
                     .replace('"', "&quot;")
                     .replace('\'', "&#039;")))
             }
-            "htmlspecialchars_decode" => {
+            "htmlspecialchars_decode" | "html_entity_decode" => {
                 let s = args.first().map_or(String::new(), |a| a.as_string());
-                Ok(PhpValue::String(s
-                    .replace("&amp;", "&")
-                    .replace("&lt;", "<")
-                    .replace("&gt;", ">")
-                    .replace("&quot;", "\"")
-                    .replace("&#039;", "'")))
+                Ok(PhpValue::String(html_entity_decode_basic(&s)))
             }
             "urlencode" => {
                 let s = args.first().map_or(String::new(), |a| a.as_string());
@@ -2717,25 +2763,14 @@ impl AstPhpProcessor {
             }
 
             // ── Regex ───────────────────────────────────────────────────
-            "preg_match" => {
-                let pattern = args.first().map_or(String::new(), |a| a.as_string());
-                let subject = args.get(1).map_or(String::new(), |a| a.as_string());
-                // Strip PHP delimiters: /pattern/flags -> pattern
-                let (pattern, _flags) = strip_php_regex_delimiters(&pattern);
-                match Regex::new(&pattern) {
-                    Ok(re) => {
-                        let matched = re.is_match(&subject);
-                        Ok(PhpValue::Int(if matched { 1 } else { 0 }))
-                    }
-                    Err(_) => Ok(PhpValue::Bool(false)),
-                }
-            }
+            // preg_match / preg_match_all are handled earlier in evaluate_function_call
+            // (they need raw args_node to write captures into the 3rd argument variable)
             "preg_replace" => {
                 let pattern = args.first().map_or(String::new(), |a| a.as_string());
                 let replacement = args.get(1).map_or(String::new(), |a| a.as_string());
                 let subject = args.get(2).map_or(String::new(), |a| a.as_string());
-                let (pattern, _flags) = strip_php_regex_delimiters(&pattern);
-                match Regex::new(&pattern) {
+                let re_str = build_regex_with_flags(&pattern);
+                match Regex::new(&re_str) {
                     Ok(re) => Ok(PhpValue::String(re.replace_all(&subject, replacement.as_str()).to_string())),
                     Err(_) => Ok(PhpValue::String(subject)),
                 }
@@ -2743,8 +2778,8 @@ impl AstPhpProcessor {
             "preg_split" => {
                 let pattern = args.first().map_or(String::new(), |a| a.as_string());
                 let subject = args.get(1).map_or(String::new(), |a| a.as_string());
-                let (pattern, _flags) = strip_php_regex_delimiters(&pattern);
-                match Regex::new(&pattern) {
+                let re_str = build_regex_with_flags(&pattern);
+                match Regex::new(&re_str) {
                     Ok(re) => {
                         let parts: Vec<PhpArrayItem> = re.split(&subject)
                             .map(|s| PhpArrayItem::Value(PhpValue::String(s.to_string())))
@@ -2753,6 +2788,12 @@ impl AstPhpProcessor {
                     }
                     Err(_) => Ok(PhpValue::Array(vec![PhpArrayItem::Value(PhpValue::String(subject))]))
                 }
+            }
+            "strip_tags" => {
+                let s = args.first().map_or(String::new(), |a| a.as_string());
+                // Remove all HTML tags using a simple regex
+                let out = Regex::new(r"<[^>]+>").map(|re| re.replace_all(&s, "").to_string()).unwrap_or(s);
+                Ok(PhpValue::String(out))
             }
 
             // ── Misc ────────────────────────────────────────────────────
@@ -2843,7 +2884,20 @@ impl AstPhpProcessor {
                 tokio::time::sleep(std::time::Duration::from_micros(micros.min(200_000))).await;
                 Ok(PhpValue::Int(0))
             }
-            "flush" | "ob_flush" | "ob_end_flush" => Ok(PhpValue::Null),
+            "flush" | "ob_flush" | "ob_end_flush" => {
+                if let Some(tx) = self.flush_tx.clone() {
+                    // On first flush: commit response headers to the waiting caller
+                    if let Some(htx) = self.headers_tx.take() {
+                        let _ = htx.send((self.response_headers.clone(), self.response_status));
+                    }
+                    // Send accumulated echo output as a body chunk
+                    let chunk = std::mem::take(&mut self.streaming_buf);
+                    if !chunk.is_empty() {
+                        let _ = tx.send(Ok(Bytes::from(chunk.into_bytes()))).await;
+                    }
+                }
+                Ok(PhpValue::Null)
+            }
             "getenv" => {
                 let key = args.first().map_or(String::new(), |a| a.as_string());
                 if key.is_empty() {
@@ -3049,6 +3103,173 @@ impl AstPhpProcessor {
         // Preserve user_functions and constants across requests (like opcache)
     }
 
+    /// Execute a chain of PHP scripts as a single request context.
+    ///
+    /// All scripts share variables, constants, functions, and the include-once registry —
+    /// identical to how PHP itself handles a single entry script that includes others.
+    ///
+    /// Controllers (master, vhost-root) stop the chain on exit, return, or auto-handled output.
+    /// Leaf (_index.php) runs last; `return true` means pass-through, anything else = handled.
+    pub async fn execute_chain(
+        &mut self,
+        controllers: &[(PathBuf, HashMap<String, String>)],
+        leaf: Option<&(PathBuf, HashMap<String, String>)>,
+        get_params: &HashMap<String, String>,
+        post_params: &HashMap<String, String>,
+        root_dir: &Path,
+        error_handler: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    ) -> Result<PhpExecution> {
+        let first = controllers.first()
+            .map(|(p, sv)| (p, sv))
+            .or_else(|| leaf.map(|(p, sv)| (p, sv)));
+
+        let Some((first_path, first_sv)) = first else {
+            return Ok(PhpExecution { body: String::new(), status: 200, headers: HashMap::new(), exited: false, returned: None });
+        };
+
+        // Single reset for the entire request chain
+        self.reset_request_state(first_path, root_dir);
+        self.error_log_handler = error_handler;
+        self.accumulated_output.clear();
+
+        self.superglobals.insert("_GET".to_string(), get_params.clone());
+        self.superglobals.insert("_POST".to_string(), post_params.clone());
+        self.superglobals.insert("_SERVER".to_string(), first_sv.clone());
+        let mut req_params = get_params.clone();
+        req_params.extend(post_params.clone());
+        self.superglobals.insert("_REQUEST".to_string(), req_params);
+
+        let mut total_output = String::new();
+        let mut exited = false;
+        let mut chain_stopped = false;
+        let mut chain_returned: Option<bool> = None;
+
+        // ── Controllers ──────────────────────────────────────────────────────
+        for (script_path, server_vars) in controllers {
+            self.current_template_path = Some(script_path.clone());
+            self.superglobals.insert("_SERVER".to_string(), server_vars.clone());
+            // Clear per-script signals; preserve variables/constants/headers/status
+            self.script_returned = None;
+            self.script_return_value = None;
+            self.response_body_override = None;
+
+            let content = fs::read_to_string(script_path).await
+                .map_err(|e| anyhow!("Cannot read {:?}: {}", script_path, e))?;
+
+            let mut script_output = String::new();
+            match self.process_php_code(&content, &mut script_output).await {
+                Ok(_) => {}
+                Err(e) if e.downcast_ref::<PhpExit>().is_some() => {
+                    exited = true;
+                    chain_stopped = true;
+                    total_output.push_str(&script_output);
+                    if total_output.is_empty() && !self.accumulated_output.is_empty() {
+                        total_output = std::mem::take(&mut self.accumulated_output);
+                    }
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+
+            total_output.push_str(&script_output);
+
+            // Stop if script returned a value, produced output, changed status, or set Location
+            let auto_handled = !script_output.trim().is_empty()
+                || self.response_status != 200
+                || self.response_headers.contains_key("location");
+
+            if self.script_returned.is_some() || auto_handled {
+                chain_returned = self.script_returned;
+                chain_stopped = true;
+                break;
+            }
+        }
+
+        // ── Leaf ─────────────────────────────────────────────────────────────
+        if !chain_stopped {
+            if let Some((leaf_path, leaf_sv)) = leaf {
+                self.current_template_path = Some(leaf_path.clone());
+                self.superglobals.insert("_SERVER".to_string(), leaf_sv.clone());
+                self.script_returned = None;
+                self.script_return_value = None;
+                self.response_body_override = None;
+
+                let content = fs::read_to_string(leaf_path).await
+                    .map_err(|e| anyhow!("Cannot read {:?}: {}", leaf_path, e))?;
+
+                let mut leaf_output = String::new();
+                match self.process_php_code(&content, &mut leaf_output).await {
+                    Ok(_) => {
+                        total_output.push_str(&leaf_output);
+                        chain_returned = self.script_returned;
+                    }
+                    Err(e) if e.downcast_ref::<PhpExit>().is_some() => {
+                        exited = true;
+                        total_output.push_str(&leaf_output);
+                        if total_output.is_empty() && !self.accumulated_output.is_empty() {
+                            total_output = std::mem::take(&mut self.accumulated_output);
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        // ── Final streaming flush ─────────────────────────────────────────────
+        // If in streaming mode, commit headers (if not yet sent) and flush remaining output
+        if let Some(tx) = self.flush_tx.clone() {
+            if let Some(htx) = self.headers_tx.take() {
+                let _ = htx.send((self.response_headers.clone(), self.response_status));
+            }
+            let chunk = std::mem::take(&mut self.streaming_buf);
+            if !chunk.is_empty() {
+                let _ = tx.send(Ok(Bytes::from(chunk.into_bytes()))).await;
+            }
+            // flush_tx drop happens when AstPhpProcessor is dropped, closing the channel
+        }
+
+        // return-signals (true/false) are not response content — use accumulated echo output
+        let body = if chain_returned.is_some() {
+            total_output
+        } else {
+            self.response_body_override.clone().unwrap_or(total_output)
+        };
+
+        let status = if self.response_status == 200 && self.response_headers.contains_key("location") {
+            302
+        } else {
+            self.response_status
+        };
+
+        Ok(PhpExecution {
+            body,
+            status,
+            headers: self.response_headers.clone(),
+            exited,
+            returned: chain_returned,
+        })
+    }
+
+    /// Set up streaming mode: echo output is buffered and flushed to `flush_tx` on each flush() call.
+    /// `headers_tx` receives response headers on the first flush() (or end of chain).
+    pub fn init_streaming(
+        &mut self,
+        flush_tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
+        headers_tx: oneshot::Sender<(HashMap<String, String>, u16)>,
+    ) {
+        self.flush_tx = Some(flush_tx);
+        self.headers_tx = Some(headers_tx);
+        self.streaming_buf = String::new();
+    }
+
+    /// Copy compiled state (functions, constants) from another processor.
+    /// Used to seed a fresh streaming processor with already-parsed definitions.
+    pub fn borrow_compiled_state(&mut self, other: &AstPhpProcessor) {
+        self.user_functions = other.user_functions.clone();
+        self.constants = other.constants.clone();
+        self.global_variables = other.global_variables.clone();
+    }
+
     pub async fn execute_init(
         &mut self,
         php_code: &str,
@@ -3244,8 +3465,85 @@ impl AstPhpProcessor {
     fn append_output(&mut self, output: &mut String, text: &str) {
         if let Some(buffer) = self.output_buffers.last_mut() {
             buffer.push_str(text);
+        } else if self.flush_tx.is_some() {
+            // Streaming mode: accumulate in streaming_buf; flush() drains it to the channel
+            self.streaming_buf.push_str(text);
         } else {
             output.push_str(text);
+        }
+    }
+
+    /// Handle preg_match() and preg_match_all() — writes captures into the 3rd argument variable.
+    async fn call_preg_match_family(&mut self, func_name: &str, args_node: Option<Node<'_>>) -> Result<PhpValue> {
+        // Collect argument nodes
+        let mut arg_nodes: Vec<Node> = Vec::new();
+        if let Some(an) = args_node {
+            for child in an.named_children(&mut an.walk()) {
+                let n = if child.kind() == "argument" { child.named_child(0).unwrap_or(child) } else { child };
+                arg_nodes.push(n);
+            }
+        }
+
+        let pattern = if let Some(n) = arg_nodes.first() {
+            self.evaluate_expression(*n).await?.as_string()
+        } else { return Ok(PhpValue::Int(0)); };
+
+        let subject = if let Some(n) = arg_nodes.get(1) {
+            self.evaluate_expression(*n).await?.as_string()
+        } else { return Ok(PhpValue::Int(0)); };
+
+        let re_str = build_regex_with_flags(&pattern);
+        let re = match Regex::new(&re_str) {
+            Ok(r) => r,
+            Err(e) => {
+                self.log_error(&format!("preg regex error: {}", e));
+                return Ok(PhpValue::Bool(false));
+            }
+        };
+
+        // Optional 3rd arg: variable name to store captures
+        let captures_var: Option<String> = arg_nodes.get(2).and_then(|n| self.get_identifier(*n));
+
+        if func_name == "preg_match_all" {
+            // Build PHP-style $matches: [[full_match, ...], [group1, ...], ...]
+            let num_groups = re.captures_len();
+            let mut groups: Vec<Vec<String>> = vec![Vec::new(); num_groups];
+            for cap in re.captures_iter(&subject) {
+                for i in 0..num_groups {
+                    groups[i].push(cap.get(i).map(|m| m.as_str().to_string()).unwrap_or_default());
+                }
+            }
+            let count = groups.first().map(|g| g.len()).unwrap_or(0);
+            if let Some(var) = captures_var {
+                let outer: Vec<PhpArrayItem> = groups.into_iter()
+                    .map(|g| PhpArrayItem::Value(PhpValue::Array(
+                        g.into_iter().map(|s| PhpArrayItem::Value(PhpValue::String(s))).collect()
+                    )))
+                    .collect();
+                self.variables.insert(var, PhpValue::Array(outer));
+            }
+            Ok(PhpValue::Int(count as i64))
+        } else {
+            // preg_match: first match only
+            match re.captures(&subject) {
+                Some(caps) => {
+                    if let Some(var) = captures_var {
+                        let items: Vec<PhpArrayItem> = (0..caps.len())
+                            .map(|i| PhpArrayItem::Value(PhpValue::String(
+                                caps.get(i).map(|m| m.as_str().to_string()).unwrap_or_default()
+                            )))
+                            .collect();
+                        self.variables.insert(var, PhpValue::Array(items));
+                    }
+                    Ok(PhpValue::Int(1))
+                }
+                None => {
+                    if let Some(var) = captures_var {
+                        self.variables.insert(var, PhpValue::Array(vec![]));
+                    }
+                    Ok(PhpValue::Int(0))
+                }
+            }
         }
     }
 
@@ -3312,7 +3610,72 @@ impl AstPhpProcessor {
     }
 }
 
-/// Strip PHP regex delimiters: /pattern/flags -> (pattern, flags)
+//// Build a Rust regex string from a PHP regex literal (with delimiter + flags).
+/// Converts PHP flags i/s/m/x to Rust inline group (?ism).
+fn build_regex_with_flags(input: &str) -> String {
+    let s = input.trim();
+    if s.len() < 2 { return s.to_string(); }
+    let delim = s.as_bytes()[0];
+    if !matches!(delim, b'/' | b'#' | b'~' | b'|' | b'@' | b'!') {
+        return s.to_string();
+    }
+    if let Some(end_pos) = s[1..].rfind(delim as char) {
+        let pattern = &s[1..end_pos + 1];
+        let flags: String = s[end_pos + 2..].chars()
+            .filter(|c| matches!(c, 'i' | 's' | 'm' | 'x'))
+            .collect();
+        if flags.is_empty() {
+            pattern.to_string()
+        } else {
+            format!("(?{}){}", flags, pattern)
+        }
+    } else {
+        s.to_string()
+    }
+}
+
+/// Basic HTML entity decoding for common named + numeric entities.
+fn html_entity_decode_basic(s: &str) -> String {
+    let mut out = s.to_string();
+    // Named entities
+    out = out.replace("&amp;", "&")
+             .replace("&lt;", "<")
+             .replace("&gt;", ">")
+             .replace("&quot;", "\"")
+             .replace("&apos;", "'")
+             .replace("&nbsp;", "\u{00A0}")
+             .replace("&mdash;", "—")
+             .replace("&ndash;", "–")
+             .replace("&laquo;", "«")
+             .replace("&raquo;", "»")
+             .replace("&hellip;", "…")
+             .replace("&copy;", "©")
+             .replace("&reg;", "®")
+             .replace("&trade;", "™");
+    // Numeric decimal: &#123;
+    if let Ok(re) = Regex::new(r"&#(\d+);") {
+        out = re.replace_all(&out, |caps: &regex::Captures| {
+            caps[1].parse::<u32>()
+                .ok()
+                .and_then(char::from_u32)
+                .map(|c| c.to_string())
+                .unwrap_or_default()
+        }).to_string();
+    }
+    // Numeric hex: &#x1F;
+    if let Ok(re) = Regex::new(r"(?i)&#x([0-9a-f]+);") {
+        out = re.replace_all(&out, |caps: &regex::Captures| {
+            u32::from_str_radix(&caps[1], 16)
+                .ok()
+                .and_then(char::from_u32)
+                .map(|c| c.to_string())
+                .unwrap_or_default()
+        }).to_string();
+    }
+    out
+}
+
+// Strip PHP regex delimiters: /pattern/flags -> (pattern, flags)
 fn strip_php_regex_delimiters(input: &str) -> (String, String) {
     let s = input.trim();
     if s.len() < 2 { return (s.to_string(), String::new()); }

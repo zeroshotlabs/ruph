@@ -17,7 +17,7 @@ use bytes::Bytes;
 use mime_guess::from_path;
 use urlencoding::decode;
 use tokio::fs;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use anyhow::{Result, anyhow};
 use tracing::{debug, info, warn, error};
 use crate::embedded_php_processor::EmbeddedPhpProcessor;
@@ -354,6 +354,7 @@ impl WebServer {
         deepest
     }
 
+    #[allow(dead_code)]
     fn request_target_dir(&self, target: &RequestTarget) -> Option<PathBuf> {
         match target {
             RequestTarget::Static(path) | RequestTarget::Script(path) => {
@@ -506,6 +507,7 @@ impl WebServer {
         rr.insert("rr_leaf_idx".to_string(), String::new());
         rr.insert("rr_mime".to_string(), String::new());
         rr.insert("rr_exists".to_string(), String::new());
+        rr.insert("rr_is_static".to_string(), String::new());
         rr.insert("rr_root".to_string(), root.to_string_lossy().to_string());
 
         let file_path = match self.resolve_file_path(url_path, root) {
@@ -521,6 +523,10 @@ impl WebServer {
                     rr.insert("rr_exists".to_string(), "1".to_string());
                     let mime = from_path(&real).first_or_octet_stream().to_string();
                     rr.insert("rr_mime".to_string(), mime);
+                    let ext = real.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if ext != "php" {
+                        rr.insert("rr_is_static".to_string(), "1".to_string());
+                    }
                 }
             }
             file_path.parent().map(|p| p.to_path_buf())
@@ -620,62 +626,12 @@ impl WebServer {
             HashMap::new()
         };
 
-        // ── Step 2: Global master /_index.php ──
-        if let Some(master_path) = self.global_master_script() {
-            let mut server_vars = self.build_server_vars_from_parts_with_addr(&parts, &master_path, &root, remote_addr)?;
-            if is_tls {
-                server_vars.insert("HTTPS".to_string(), "on".to_string());
-            }
-            for (k, v) in &rr_vars {
-                server_vars.insert(k.clone(), v.clone());
-            }
+        // ── Steps 2–5: Build and execute the master→vhost-root→leaf chain ──────
+        //
+        // All scripts run in a single PHP context: shared variables, constants,
+        // functions, and require-once registry — same as one PHP process including files.
+        // rr_* vars are pre-resolved so the full chain is known before any PHP runs.
 
-            match self
-                .run_php_buffered(&master_path, &query_params, &post_params, &server_vars, stderr_handler.as_ref())
-                .await
-            {
-                Ok(exec) => {
-                    if Self::php_stops_controller(&exec) {
-                        return Self::build_php_response(&exec);
-                    }
-                }
-                Err(e) => warn!("Global master _index.php failed: {} — continuing", e),
-            }
-        }
-
-        // ── Step 3: Vhost-root _index.php ──
-        if let Some(vhost_path) = self.vhost_root_script(&root) {
-            let skip = self
-                .global_master_script()
-                .as_ref()
-                .map(|master| Self::is_same_canonical_file(master, &vhost_path))
-                .unwrap_or(false);
-            if !skip {
-                let mut server_vars =
-                    self.build_server_vars_from_parts_with_addr(&parts, &vhost_path, &root, remote_addr)?;
-                if is_tls {
-                    server_vars.insert("HTTPS".to_string(), "on".to_string());
-                }
-                for (k, v) in &rr_vars {
-                    server_vars.insert(k.clone(), v.clone());
-                }
-
-                match self
-                    .run_php_buffered(&vhost_path, &query_params, &post_params, &server_vars, stderr_handler.as_ref())
-                    .await
-                {
-                    Ok(exec) => {
-                        if Self::php_stops_controller(&exec) {
-                            return Self::build_php_response(&exec);
-                        }
-                    }
-                    Err(e) => warn!("Vhost-root _index.php failed: {} — continuing", e),
-                }
-            }
-        }
-
-        // ── Step 4: Resolve the actual request target ──
-        let target = self.resolve_request_target(&path, &root, None)?;
         let prefer_sse = parts
             .headers
             .get("accept")
@@ -683,94 +639,89 @@ impl WebServer {
             .map(|v| v.contains("text/event-stream"))
             .unwrap_or(false);
 
-        // Existing .php file requests execute directly, without leaf interception.
-        if !rr_vars["rr_file"].is_empty()
-            && matches!(target, RequestTarget::Script(ref path) if path.extension().and_then(|s| s.to_str()) == Some("php") && path.is_file())
-        {
-            let mut sv = self.build_server_vars_from_parts_with_addr(
-                &parts,
-                match &target { RequestTarget::Script(path) => path, _ => unreachable!() },
-                &root,
-                remote_addr,
-            )?;
-            if is_tls {
-                sv.insert("HTTPS".to_string(), "on".to_string());
+        // ── Build controller list ──
+        let mut controllers: Vec<(PathBuf, HashMap<String, String>)> = Vec::new();
+
+        let build_sv = |script: &Path| -> Result<HashMap<String, String>> {
+            let mut sv = self.build_server_vars_from_parts_with_addr(&parts, script, &root, remote_addr)?;
+            if is_tls { sv.insert("HTTPS".to_string(), "on".to_string()); }
+            for (k, v) in &rr_vars { sv.insert(k.clone(), v.clone()); }
+            Ok(sv)
+        };
+
+        if let Some(master_path) = self.global_master_script() {
+            controllers.push((master_path.clone(), build_sv(&master_path)?));
+        }
+        if let Some(vhost_path) = self.vhost_root_script(&root) {
+            let is_dup = self.global_master_script()
+                .as_ref()
+                .map(|m| Self::is_same_canonical_file(m, &vhost_path))
+                .unwrap_or(false);
+            if !is_dup {
+                controllers.push((vhost_path.clone(), build_sv(&vhost_path)?));
             }
-            for (k, v) in &rr_vars {
-                sv.insert(k.clone(), v.clone());
-            }
-            return self
-                .deliver_target(
-                    &target,
-                    &query_params,
-                    &post_params,
-                    &sv,
-                    prefer_sse,
-                    stderr_handler.as_ref(),
-                    &method,
-                )
-                .await;
         }
 
-        let target_dir = self.request_target_dir(&target).or_else(|| {
-            let file_path = self.resolve_file_path(&path, &root).ok()?;
-            if file_path.is_dir() {
-                // Existing directory with no content index — use it for the leaf search.
-                // This covers requests like `/search/` where `search/_index.php` exists
-                // but there is no `search/index.html` or `search/index.php`.
-                Some(file_path)
-            } else if !file_path.exists() {
-                // Path does not exist on disk — walk to the deepest existing directory.
-                let clean = decode(&path).unwrap_or_default();
-                let clean = clean.trim_start_matches('/');
-                let parts: Vec<&str> = clean.split('/').filter(|p| !p.is_empty()).collect();
-                let mut deepest = root.clone();
-                for part in &parts {
-                    let next = deepest.join(part);
-                    if next.is_dir() {
-                        deepest = next;
-                    } else {
-                        break;
-                    }
-                }
-                Some(deepest)
+        // ── Resolve target and leaf ──
+        let target = self.resolve_request_target(&path, &root, None)?;
+
+        // Direct .php file: no leaf interception (matches original behavior)
+        let is_direct_php = !rr_vars["rr_file"].is_empty()
+            && matches!(&target, RequestTarget::Script(p) if p.extension().and_then(|s| s.to_str()) == Some("php") && p.is_file());
+
+        let leaf: Option<(PathBuf, HashMap<String, String>)> = if is_direct_php {
+            None
+        } else {
+            let leaf_str = rr_vars.get("rr_leaf_idx").map(|s| s.as_str()).unwrap_or("");
+            if !leaf_str.is_empty() {
+                let lp = PathBuf::from(leaf_str);
+                Some((lp.clone(), build_sv(&lp)?))
             } else {
                 None
             }
-        });
+        };
 
-        let leaf_path = target_dir
-            .as_ref()
-            .and_then(|dir| self.deepest_leaf_for_dir(&root, dir));
-
-        if let Some(leaf_path) = leaf_path {
-            let mut leaf_sv =
-                self.build_server_vars_from_parts_with_addr(&parts, &leaf_path, &root, remote_addr)?;
-            if is_tls {
-                leaf_sv.insert("HTTPS".to_string(), "on".to_string());
+        // ── Execute chain ──
+        let has_php = !controllers.is_empty() || leaf.is_some();
+        // PHP headers to merge into a static file response when the leaf falls through
+        let mut php_passthrough_headers: HashMap<String, String> = HashMap::new();
+        if has_php {
+            // For SSE requests use streaming mode: PHP output flows to client as flush() is called
+            if prefer_sse {
+                match self.run_php_chain_streaming(&controllers, leaf.as_ref(), &query_params, &post_params, stderr_handler.as_ref()).await {
+                    Ok(Some(response)) => return Ok(response),
+                    Ok(None) => {} // fall through to buffered execution
+                    Err(e) => warn!("SSE streaming chain failed: {} — falling back to buffered", e),
+                }
             }
-            for (k, v) in &rr_vars {
-                leaf_sv.insert(k.clone(), v.clone());
-            }
-
-            match self
-                .run_php_buffered(&leaf_path, &query_params, &post_params, &leaf_sv, stderr_handler.as_ref())
-                .await
-            {
+            match self.run_php_chain(&controllers, leaf.as_ref(), &query_params, &post_params, stderr_handler.as_ref()).await {
                 Ok(exec) => {
-                    if Self::php_leaf_handled(&exec) {
+                    let chain_handled = if leaf.is_some() {
+                        Self::php_leaf_handled(&exec)
+                    } else {
+                        Self::php_stops_controller(&exec)
+                    };
+                    if chain_handled {
                         return Self::build_php_response(&exec);
                     }
+                    if leaf.is_some() && !Self::target_exists(&target) {
+                        return Ok(self.error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Leaf _index.php must handle unmatched paths",
+                        ));
+                    }
+                    // Leaf fell through to static delivery — carry PHP headers forward
+                    php_passthrough_headers = exec.headers;
                 }
-                Err(e) => warn!("Leaf _index.php failed: {} — continuing", e),
+                Err(e) => warn!("PHP chain failed: {} — continuing", e),
             }
+        }
 
-            if !Self::target_exists(&target) {
-                return Ok(self.error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Leaf _index.php must handle unmatched paths",
-                ));
-            }
+        // ── Direct .php file execution (after controllers passed through) ──
+        if is_direct_php {
+            let php_path = match &target { RequestTarget::Script(p) => p, _ => unreachable!() };
+            let sv = build_sv(php_path)?;
+            return self.deliver_target(&target, &query_params, &post_params, &sv, prefer_sse, stderr_handler.as_ref(), &method).await;
         }
 
         let deliver_path = match &target {
@@ -785,7 +736,7 @@ impl WebServer {
             sv.insert(k.clone(), v.clone());
         }
 
-        self.deliver_target(
+        let mut response = self.deliver_target(
             &target,
             &query_params,
             &post_params,
@@ -794,7 +745,22 @@ impl WebServer {
             stderr_handler.as_ref(),
             &method,
         )
-        .await
+        .await?;
+
+        // Merge PHP headers set by the leaf before it fell through to static delivery
+        for (name, value) in &php_passthrough_headers {
+            let header_name = match HeaderName::from_bytes(name.trim().as_bytes()) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let header_value = match HeaderValue::from_str(value.trim()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            response.headers_mut().insert(header_name, header_value);
+        }
+
+        Ok(response)
     }
 
     /// Handle GET requests
@@ -1427,9 +1393,111 @@ impl WebServer {
         sv
     }
 
+    /// Run the PHP chain in streaming mode for SSE responses.
+    /// Creates a fresh AstPhpProcessor, seeds it with compiled state, and runs execute_chain
+    /// in a background task. Returns a streaming response as soon as PHP calls flush().
+    /// Returns None if the AST processor is unavailable or if PHP doesn't flush in time.
+    async fn run_php_chain_streaming(
+        &self,
+        controllers: &[(PathBuf, HashMap<String, String>)],
+        leaf: Option<&(PathBuf, HashMap<String, String>)>,
+        query_params: &HashMap<String, String>,
+        post_params: &HashMap<String, String>,
+        stderr_handler: Option<&PhpStderrHandler>,
+    ) -> Result<Option<Response<RuphBody>>> {
+        let Some(shared_ast) = &self.ast_php_processor else {
+            return Ok(None);
+        };
+
+        // Create a fresh processor for this request (avoids blocking the shared mutex)
+        let mut ast = match AstPhpProcessor::new() {
+            Ok(a) => a,
+            Err(e) => { warn!("Failed to create streaming processor: {}", e); return Ok(None); }
+        };
+
+        // Seed with compiled functions/constants from the shared processor
+        {
+            let shared = shared_ast.lock().await;
+            ast.borrow_compiled_state(&shared);
+        }
+
+        let (body_tx, body_rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+        let (headers_tx, headers_rx) = oneshot::channel::<(HashMap<String, String>, u16)>();
+
+        ast.init_streaming(body_tx, headers_tx);
+
+        // Clone data for the background task
+        let controllers = controllers.to_vec();
+        let leaf_owned: Option<(PathBuf, HashMap<String, String>)> = leaf.map(|(p, sv)| (p.clone(), sv.clone()));
+        let get_params = query_params.clone();
+        let post_params = post_params.clone();
+        let root_dir = self.root_dir.clone();
+        let error_handler = stderr_handler.cloned();
+
+        tokio::spawn(async move {
+            let _ = ast.execute_chain(
+                &controllers,
+                leaf_owned.as_ref(),
+                &get_params,
+                &post_params,
+                &root_dir,
+                error_handler,
+            ).await;
+            // ast drop closes flush_tx, signalling end of stream to the channel receiver
+        });
+
+        // Wait for PHP to call flush() and commit its headers (with timeout)
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            headers_rx,
+        ).await {
+            Ok(Ok((headers, status))) => {
+                let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+                let mut builder = Response::builder().status(status_code);
+                builder = Self::apply_safe_headers(builder, &headers);
+                let response = builder
+                    .body(RuphBody::streaming(body_rx))
+                    .map_err(|e| anyhow!("Failed to build streaming response: {}", e))?;
+                Ok(Some(response))
+            }
+            _ => {
+                warn!("SSE streaming: PHP did not call flush() within 30s timeout");
+                Ok(None)
+            }
+        }
+    }
+
     /// Execute the master _index.php script, returning its PhpExecution result.
     /// Run a PHP script in buffered mode, returning a PhpExecution with exit/return info.
     /// Used for both master and leaf _index.php scripts.
+    /// Execute the full master→vhost-root→leaf chain as a single PHP context.
+    /// Controllers and leaf share variables, constants, and the require-once registry.
+    async fn run_php_chain(
+        &self,
+        controllers: &[(PathBuf, HashMap<String, String>)],
+        leaf: Option<&(PathBuf, HashMap<String, String>)>,
+        query_params: &HashMap<String, String>,
+        post_params: &HashMap<String, String>,
+        stderr_handler: Option<&PhpStderrHandler>,
+    ) -> Result<PhpExecution> {
+        if let Some(ast) = &self.ast_php_processor {
+            let mut ast = ast.lock().await;
+            return ast.execute_chain(controllers, leaf, query_params, post_params, &self.root_dir, stderr_handler.cloned()).await;
+        }
+        // CGI fallback: run each script separately (no shared variable context)
+        for (script_path, server_vars) in controllers {
+            match self.run_php_buffered(script_path, query_params, post_params, server_vars, stderr_handler).await {
+                Ok(exec) if Self::php_stops_controller(&exec) => return Ok(exec),
+                Ok(_) => {}
+                Err(e) => warn!("CGI chain controller failed: {}", e),
+            }
+        }
+        if let Some((leaf_path, leaf_sv)) = leaf {
+            return self.run_php_buffered(leaf_path, query_params, post_params, leaf_sv, stderr_handler).await;
+        }
+        Ok(PhpExecution { body: String::new(), status: 200, headers: HashMap::new(), exited: false, returned: None })
+    }
+
     async fn run_php_buffered(
         &self,
         script_path: &Path,
