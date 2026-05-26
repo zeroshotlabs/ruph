@@ -3,27 +3,30 @@
 //! This module provides robust PHP execution capabilities by parsing PHP code
 //! into an Abstract Syntax Tree (AST) using tree-sitter-php and then interpreting it.
 
+use anyhow::{anyhow, Result};
+use async_recursion::async_recursion;
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use async_recursion::async_recursion;
-use anyhow::{Result, anyhow};
 use tracing::{debug, warn};
-use tree_sitter::{Parser, Node};
+use tree_sitter::{Node, Parser};
 use tree_sitter_php;
-use regex::Regex;
+
+use bytes::Bytes;
+use reqwest::Client;
+use rustls::pki_types::ServerName;
+use serde_json::Value as JsonValue;
+use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio_rustls::TlsConnector;
 
 static PHP_TAG_RE: OnceLock<Regex> = OnceLock::new();
-use tokio::fs;
-use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
-use tokio_rustls::TlsConnector;
-use rustls::pki_types::ServerName;
-use reqwest::Client;
-use bytes::Bytes;
-use serde_json::Value as JsonValue;
+static SESSION_LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
+    OnceLock::new();
 
 /// Active TLS socket stream for PHP stream functions
 struct PhpTlsStream {
@@ -80,6 +83,12 @@ pub struct AstPhpProcessor {
     headers_tx: Option<oneshot::Sender<(HashMap<String, String>, u16)>>,
     /// Streaming mode: accumulates echo output between flush() calls
     streaming_buf: String,
+    /// Active ruph session id for the current request, set by ruph_session_start($id)
+    session_id: Option<String>,
+    /// Whether the current ruph session was destroyed during the request
+    session_destroyed: bool,
+    /// Per-process lock held while a ruph session is active in this request
+    session_lock: Option<OwnedMutexGuard<()>>,
 }
 
 impl AstPhpProcessor {
@@ -124,6 +133,9 @@ impl AstPhpProcessor {
             flush_tx: None,
             headers_tx: None,
             streaming_buf: String::new(),
+            session_id: None,
+            session_destroyed: false,
+            session_lock: None,
             constants: {
                 let mut c = HashMap::new();
                 c.insert("PATHINFO_DIRNAME".to_string(), PhpValue::Int(1));
@@ -147,9 +159,18 @@ impl AstPhpProcessor {
                 c.insert("PHP_EOL".to_string(), PhpValue::String("\n".to_string()));
                 c.insert("PHP_INT_MAX".to_string(), PhpValue::Int(i64::MAX));
                 c.insert("PHP_INT_MIN".to_string(), PhpValue::Int(i64::MIN));
-                c.insert("DIRECTORY_SEPARATOR".to_string(), PhpValue::String("/".to_string()));
-                c.insert("PHP_SAPI".to_string(), PhpValue::String("ruph-ast".to_string()));
-                c.insert("PHP_VERSION".to_string(), PhpValue::String("8.4.0-ruph".to_string()));
+                c.insert(
+                    "DIRECTORY_SEPARATOR".to_string(),
+                    PhpValue::String("/".to_string()),
+                );
+                c.insert(
+                    "PHP_SAPI".to_string(),
+                    PhpValue::String("ruph-ast".to_string()),
+                );
+                c.insert(
+                    "PHP_VERSION".to_string(),
+                    PhpValue::String("8.4.0-ruph".to_string()),
+                );
                 c.insert("TRUE".to_string(), PhpValue::Bool(true));
                 c.insert("FALSE".to_string(), PhpValue::Bool(false));
                 c.insert("NULL".to_string(), PhpValue::Null);
@@ -180,7 +201,16 @@ impl AstPhpProcessor {
         template_path: &Path,
         root_dir: &Path,
     ) -> Result<PhpExecution> {
-        self.execute_php_with_handler(php_code, get_params, post_params, server_vars, template_path, root_dir, None).await
+        self.execute_php_with_handler(
+            php_code,
+            get_params,
+            post_params,
+            server_vars,
+            template_path,
+            root_dir,
+            None,
+        )
+        .await
     }
 
     /// Execute PHP code with an optional error log handler for domain-specific logging.
@@ -200,13 +230,23 @@ impl AstPhpProcessor {
         self.error_log_handler = error_handler;
 
         // Set up superglobals
-        self.superglobals.insert("_GET".to_string(), get_params.clone());
-        self.superglobals.insert("_POST".to_string(), post_params.clone());
-        self.superglobals.insert("_SERVER".to_string(), server_vars.clone());
+        self.superglobals
+            .insert("_GET".to_string(), get_params.clone());
+        self.superglobals
+            .insert("_POST".to_string(), post_params.clone());
+        self.superglobals
+            .insert("_SERVER".to_string(), server_vars.clone());
+        self.superglobals.insert(
+            "_COOKIE".to_string(),
+            Self::parse_cookie_header(server_vars),
+        );
+        self.superglobals
+            .insert("_SESSION".to_string(), HashMap::new());
 
         let mut request_params = get_params.clone();
         request_params.extend(post_params.clone());
-        self.superglobals.insert("_REQUEST".to_string(), request_params);
+        self.superglobals
+            .insert("_REQUEST".to_string(), request_params);
 
         let mut output = String::new();
         self.accumulated_output.clear();
@@ -215,7 +255,11 @@ impl AstPhpProcessor {
     }
 
     /// Shared execution body used by both execute_php_with_handler and execute_php_continue.
-    async fn execute_php_body(&mut self, php_code: &str, output: &mut String) -> Result<PhpExecution> {
+    async fn execute_php_body(
+        &mut self,
+        php_code: &str,
+        output: &mut String,
+    ) -> Result<PhpExecution> {
         // Process the PHP code — catch exit/die as normal termination
         let mut exited = false;
         match self.process_php_code(php_code, output).await {
@@ -235,16 +279,20 @@ impl AstPhpProcessor {
             }
         }
 
-        let body = self.response_body_override.clone().unwrap_or_else(|| output.clone());
+        let body = self
+            .response_body_override
+            .clone()
+            .unwrap_or_else(|| output.clone());
 
         // Match PHP behavior: Location header without explicit status → 302
-        let status = if self.response_status == 200
-            && self.response_headers.contains_key("location")
-        {
-            302
-        } else {
-            self.response_status
-        };
+        let status =
+            if self.response_status == 200 && self.response_headers.contains_key("location") {
+                302
+            } else {
+                self.response_status
+            };
+
+        self.finalize_session().await;
 
         Ok(PhpExecution {
             body,
@@ -260,7 +308,8 @@ impl AstPhpProcessor {
         let mut current_pos = 0;
 
         // Find PHP tags (both <?php ... ?> and <?= ... ?>)
-        let php_tag_regex = PHP_TAG_RE.get_or_init(|| Regex::new(r"(?s)<\?(php|=)?(.*?)\?>").unwrap());
+        let php_tag_regex =
+            PHP_TAG_RE.get_or_init(|| Regex::new(r"(?s)<\?(php|=)?(.*?)\?>").unwrap());
 
         let mut found_tag = false;
 
@@ -318,7 +367,9 @@ impl AstPhpProcessor {
             .map_err(|_| anyhow!("Error loading PHP grammar"))?;
 
         // Parse the PHP code into AST
-        let tree = self.parser.parse(&wrapped_code, None)
+        let tree = self
+            .parser
+            .parse(&wrapped_code, None)
             .ok_or_else(|| anyhow!("Failed to parse PHP code"))?;
 
         if tree.root_node().has_error() {
@@ -362,7 +413,9 @@ impl AstPhpProcessor {
             .map_err(|_| anyhow!("Error loading PHP grammar"))?;
 
         self.source_code = wrapped_code.clone();
-        let tree = self.parser.parse(&wrapped_code, None)
+        let tree = self
+            .parser
+            .parse(&wrapped_code, None)
             .ok_or_else(|| anyhow!("Failed to parse PHP code"))?;
 
         if tree.root_node().has_error() {
@@ -400,10 +453,13 @@ impl AstPhpProcessor {
         Ok(output)
     }
 
-
     /// Process a node in the AST
     #[async_recursion]
-    async fn process_node(&mut self, node: Node<'async_recursion>, output: &mut String) -> Result<ControlFlow<()>> {
+    async fn process_node(
+        &mut self,
+        node: Node<'async_recursion>,
+        output: &mut String,
+    ) -> Result<ControlFlow<()>> {
         match node.kind() {
             "text" | "inline_html" => {
                 let text = {
@@ -439,7 +495,8 @@ impl AstPhpProcessor {
                 }
             }
             "return_statement" => {
-                let return_value = node.child_by_field_name("argument")
+                let return_value = node
+                    .child_by_field_name("argument")
                     .or_else(|| node.child_by_field_name("value"))
                     .or_else(|| node.named_child(0));
                 if let Some(value_node) = return_value {
@@ -505,21 +562,27 @@ impl AstPhpProcessor {
                     let left_val = self.evaluate_expression(left).await?;
                     let right_val = self.evaluate_expression(right).await?;
                     let result = match operator.as_str() {
-                        "+=" => if left_val.is_int_like() && right_val.is_int_like() {
-                            PhpValue::Int(left_val.as_int().wrapping_add(right_val.as_int()))
-                        } else {
-                            PhpValue::Float(left_val.as_float() + right_val.as_float())
-                        },
-                        "-=" => if left_val.is_int_like() && right_val.is_int_like() {
-                            PhpValue::Int(left_val.as_int().wrapping_sub(right_val.as_int()))
-                        } else {
-                            PhpValue::Float(left_val.as_float() - right_val.as_float())
-                        },
-                        "*=" => if left_val.is_int_like() && right_val.is_int_like() {
-                            PhpValue::Int(left_val.as_int().wrapping_mul(right_val.as_int()))
-                        } else {
-                            PhpValue::Float(left_val.as_float() * right_val.as_float())
-                        },
+                        "+=" => {
+                            if left_val.is_int_like() && right_val.is_int_like() {
+                                PhpValue::Int(left_val.as_int().wrapping_add(right_val.as_int()))
+                            } else {
+                                PhpValue::Float(left_val.as_float() + right_val.as_float())
+                            }
+                        }
+                        "-=" => {
+                            if left_val.is_int_like() && right_val.is_int_like() {
+                                PhpValue::Int(left_val.as_int().wrapping_sub(right_val.as_int()))
+                            } else {
+                                PhpValue::Float(left_val.as_float() - right_val.as_float())
+                            }
+                        }
+                        "*=" => {
+                            if left_val.is_int_like() && right_val.is_int_like() {
+                                PhpValue::Int(left_val.as_int().wrapping_mul(right_val.as_int()))
+                            } else {
+                                PhpValue::Float(left_val.as_float() * right_val.as_float())
+                            }
+                        }
                         "/=" => {
                             let d = right_val.as_float();
                             if d == 0.0 {
@@ -528,13 +591,27 @@ impl AstPhpProcessor {
                             } else if left_val.is_int_like() && right_val.is_int_like() {
                                 let li = left_val.as_int();
                                 let ri = right_val.as_int();
-                                if ri != 0 && li % ri == 0 { PhpValue::Int(li / ri) } else { PhpValue::Float(left_val.as_float() / d) }
+                                if ri != 0 && li % ri == 0 {
+                                    PhpValue::Int(li / ri)
+                                } else {
+                                    PhpValue::Float(left_val.as_float() / d)
+                                }
                             } else {
                                 PhpValue::Float(left_val.as_float() / d)
                             }
                         }
-                        ".=" => PhpValue::String(format!("{}{}", left_val.as_string(), right_val.as_string())),
-                        "??=" => if left_val.is_null() { right_val } else { left_val },
+                        ".=" => PhpValue::String(format!(
+                            "{}{}",
+                            left_val.as_string(),
+                            right_val.as_string()
+                        )),
+                        "??=" => {
+                            if left_val.is_null() {
+                                right_val
+                            } else {
+                                left_val
+                            }
+                        }
                         _ => right_val,
                     };
                     self.assign_to(left, result).await?;
@@ -576,7 +653,8 @@ impl AstPhpProcessor {
             }
             // ── while loop ──────────────────────────────────────────────
             "while_statement" => {
-                let condition = node.child_by_field_name("condition")
+                let condition = node
+                    .child_by_field_name("condition")
                     .or_else(|| node.child_by_field_name("test"));
                 let body = node.child_by_field_name("body");
 
@@ -584,7 +662,9 @@ impl AstPhpProcessor {
                     let mut iterations = 0;
                     loop {
                         let cond_val = self.evaluate_expression(condition).await?;
-                        if !cond_val.is_truthy() { break; }
+                        if !cond_val.is_truthy() {
+                            break;
+                        }
                         let flow = self.process_node(body, output).await?;
                         if let ControlFlow::Break(()) = flow {
                             if self.loop_continue {
@@ -622,7 +702,9 @@ impl AstPhpProcessor {
                 loop {
                     if let Some(condition) = condition {
                         let cond_val = self.evaluate_expression(condition).await?;
-                        if !cond_val.is_truthy() { break; }
+                        if !cond_val.is_truthy() {
+                            break;
+                        }
                     }
                     if let Some(body) = body {
                         let flow = self.process_node(body, output).await?;
@@ -660,9 +742,13 @@ impl AstPhpProcessor {
                 for child in node.named_children(&mut node.walk()) {
                     match child.kind() {
                         // first variable/expression child is the collection
-                        "variable" | "variable_name" | "subscript_expression"
-                        | "member_access_expression" | "function_call_expression"
-                        | "array_creation_expression" | "parenthesized_expression"
+                        "variable"
+                        | "variable_name"
+                        | "subscript_expression"
+                        | "member_access_expression"
+                        | "function_call_expression"
+                        | "array_creation_expression"
+                        | "parenthesized_expression"
                             if collection_node.is_none() =>
                         {
                             collection_node = Some(child);
@@ -711,8 +797,12 @@ impl AstPhpProcessor {
                             if let Some(key_node) = key_var_node {
                                 if let Some(key_name) = self.get_identifier(key_node) {
                                     let key_value = match item {
-                                        PhpArrayItem::KeyValue(key, _) => PhpValue::String(key.clone()),
-                                        PhpArrayItem::Value(_) => PhpValue::String(index.to_string()),
+                                        PhpArrayItem::KeyValue(key, _) => {
+                                            PhpValue::String(key.clone())
+                                        }
+                                        PhpArrayItem::Value(_) => {
+                                            PhpValue::String(index.to_string())
+                                        }
                                     };
                                     self.variables.insert(key_name, key_value);
                                 }
@@ -736,7 +826,8 @@ impl AstPhpProcessor {
             }
             // ── switch ──────────────────────────────────────────────────
             "switch_statement" => {
-                let test = node.child_by_field_name("value")
+                let test = node
+                    .child_by_field_name("value")
                     .or_else(|| node.child_by_field_name("condition"));
                 if let Some(test) = test {
                     let test_val = self.evaluate_expression(test).await?;
@@ -748,8 +839,10 @@ impl AstPhpProcessor {
                             match child.kind() {
                                 "switch_case" => {
                                     if !fell_through {
-                                        if let Some(value_node) = child.child_by_field_name("value") {
-                                            let case_val = self.evaluate_expression(value_node).await?;
+                                        if let Some(value_node) = child.child_by_field_name("value")
+                                        {
+                                            let case_val =
+                                                self.evaluate_expression(value_node).await?;
                                             if test_val.loose_eq(&case_val) {
                                                 matched = true;
                                             }
@@ -764,16 +857,22 @@ impl AstPhpProcessor {
                                                 break;
                                             }
                                             let flow = self.process_node(stmt, output).await?;
-                                            if let ControlFlow::Break(()) = flow { return Ok(flow); }
+                                            if let ControlFlow::Break(()) = flow {
+                                                return Ok(flow);
+                                            }
                                         }
                                     }
                                 }
                                 "switch_default" => {
                                     if !matched {
                                         for stmt in child.named_children(&mut child.walk()) {
-                                            if stmt.kind() == "break_statement" { break; }
+                                            if stmt.kind() == "break_statement" {
+                                                break;
+                                            }
                                             let flow = self.process_node(stmt, output).await?;
-                                            if let ControlFlow::Break(()) = flow { return Ok(flow); }
+                                            if let ControlFlow::Break(()) = flow {
+                                                return Ok(flow);
+                                            }
                                         }
                                     }
                                 }
@@ -790,17 +889,25 @@ impl AstPhpProcessor {
                 let body_node = node.child_by_field_name("body");
 
                 if let (Some(name_node), Some(body_node)) = (name_node, body_node) {
-                    let func_name = name_node.utf8_text(self.source_code.as_bytes())?.to_string();
-                    let body_source = body_node.utf8_text(self.source_code.as_bytes())?.to_string();
+                    let func_name = name_node
+                        .utf8_text(self.source_code.as_bytes())?
+                        .to_string();
+                    let body_source = body_node
+                        .utf8_text(self.source_code.as_bytes())?
+                        .to_string();
 
                     let mut params = Vec::new();
                     if let Some(params_node) = params_node {
                         for child in params_node.named_children(&mut params_node.walk()) {
                             if child.kind() == "simple_parameter" || child.kind() == "parameter" {
                                 if let Some(name) = child.child_by_field_name("name") {
-                                    let pname = name.utf8_text(self.source_code.as_bytes())?
-                                        .trim_start_matches('$').to_string();
-                                    let default = if let Some(def) = child.child_by_field_name("default_value") {
+                                    let pname = name
+                                        .utf8_text(self.source_code.as_bytes())?
+                                        .trim_start_matches('$')
+                                        .to_string();
+                                    let default = if let Some(def) =
+                                        child.child_by_field_name("default_value")
+                                    {
                                         Some(self.evaluate_expression(def).await?)
                                     } else {
                                         None
@@ -811,18 +918,29 @@ impl AstPhpProcessor {
                         }
                     }
 
-                    self.user_functions.insert(func_name, PhpFunction { params, body_source });
+                    self.user_functions.insert(
+                        func_name,
+                        PhpFunction {
+                            params,
+                            body_source,
+                        },
+                    );
                 }
             }
             // ── include / require ───────────────────────────────────────
-            "include_expression" | "require_expression" | "include_once_expression" | "require_once_expression" => {
+            "include_expression"
+            | "require_expression"
+            | "include_once_expression"
+            | "require_once_expression" => {
                 let is_once = node.kind().contains("_once");
-                let target = node.child_by_field_name("path")
+                let target = node
+                    .child_by_field_name("path")
                     .or_else(|| node.child_by_field_name("argument"))
                     .or_else(|| node.named_child(0));
                 if let Some(target) = target {
                     let value = self.evaluate_expression(target).await?;
-                    let (include_output, _) = self.include_file(&value.as_string(), is_once).await?;
+                    let (include_output, _) =
+                        self.include_file(&value.as_string(), is_once).await?;
                     self.append_output(output, &include_output);
                 }
             }
@@ -830,7 +948,9 @@ impl AstPhpProcessor {
             "compound_statement" => {
                 for child in node.named_children(&mut node.walk()) {
                     let flow = self.process_node(child, output).await?;
-                    if let ControlFlow::Break(()) = flow { return Ok(flow); }
+                    if let ControlFlow::Break(()) = flow {
+                        return Ok(flow);
+                    }
                 }
             }
             // ── break / continue (within loops) ─────────────────────────
@@ -847,9 +967,11 @@ impl AstPhpProcessor {
                 // const FOO = 'bar'; or const FOO = ['a','b'];
                 for child in node.named_children(&mut node.walk()) {
                     if child.kind() == "const_element" {
-                        let name_node = child.child_by_field_name("name")
+                        let name_node = child
+                            .child_by_field_name("name")
                             .or_else(|| child.named_child(0));
-                        let value_node = child.child_by_field_name("value")
+                        let value_node = child
+                            .child_by_field_name("value")
                             .or_else(|| child.named_child(1));
                         if let (Some(name_n), Some(val_n)) = (name_node, value_node) {
                             let name = name_n.utf8_text(self.source_code.as_bytes())?.to_string();
@@ -863,19 +985,34 @@ impl AstPhpProcessor {
                 let kind = node.kind();
                 // Expression-like nodes that ended up in process_node:
                 // evaluate as expression (discarding result) instead of recursing into children
-                if kind.ends_with("_expression") || kind == "array_element_initializer"
-                    || kind == "string" || kind == "string_content" || kind == "integer"
-                    || kind == "float" || kind == "encapsed_string" {
+                if kind.ends_with("_expression")
+                    || kind == "array_element_initializer"
+                    || kind == "string"
+                    || kind == "string_content"
+                    || kind == "integer"
+                    || kind == "float"
+                    || kind == "encapsed_string"
+                {
                     let _ = self.evaluate_expression(node).await.ok();
                     if let Some(out) = self.take_side_effect_output() {
                         self.append_output(output, &out);
                     }
                 } else {
                     // Log unrecognized statement-level AST nodes
-                    if !matches!(kind, "program" | "php_tag" | "php_end_tag" | "comment"
-                        | "text_interpolation" | "expression_statement" | "compound_statement"
-                        | "declaration_list" | "namespace_definition" | "namespace_use_declaration"
-                        | "const_element") {
+                    if !matches!(
+                        kind,
+                        "program"
+                            | "php_tag"
+                            | "php_end_tag"
+                            | "comment"
+                            | "text_interpolation"
+                            | "expression_statement"
+                            | "compound_statement"
+                            | "declaration_list"
+                            | "namespace_definition"
+                            | "namespace_use_declaration"
+                            | "const_element"
+                    ) {
                         let line = node.start_position().row + 1;
                         self.log_error(&format!("Unhandled AST node '{}' at line {}", kind, line));
                     }
@@ -894,11 +1031,16 @@ impl AstPhpProcessor {
 
     /// Process an argument list (used in echo statements)
     #[async_recursion]
-    async fn process_argument_list(&mut self, node: Node<'async_recursion>, output: &mut String) -> Result<()> {
+    async fn process_argument_list(
+        &mut self,
+        node: Node<'async_recursion>,
+        output: &mut String,
+    ) -> Result<()> {
         for child in node.named_children(&mut node.walk()) {
             if child.kind() == "string" {
                 // Handle string literals
-                let text = child.utf8_text(self.source_code.as_bytes())
+                let text = child
+                    .utf8_text(self.source_code.as_bytes())
                     .map_err(|_| anyhow!("Failed to get text"))?;
                 // Remove surrounding quotes
                 let trimmed = text.trim_matches(|c| c == '\'' || c == '"');
@@ -920,7 +1062,11 @@ impl AstPhpProcessor {
 
     /// Process if/elseif/else statement
     #[async_recursion]
-    async fn process_if_statement(&mut self, node: Node<'async_recursion>, output: &mut String) -> Result<ControlFlow<()>> {
+    async fn process_if_statement(
+        &mut self,
+        node: Node<'async_recursion>,
+        output: &mut String,
+    ) -> Result<ControlFlow<()>> {
         // Evaluate the condition
         let condition = node.child_by_field_name("condition");
         let body = node.child_by_field_name("body");
@@ -962,7 +1108,9 @@ impl AstPhpProcessor {
                     // Fallback: process all named children of else clause
                     for child in alt.named_children(&mut alt.walk()) {
                         let flow = self.process_node(child, output).await?;
-                        if let ControlFlow::Break(()) = flow { return Ok(flow); }
+                        if let ControlFlow::Break(()) = flow {
+                            return Ok(flow);
+                        }
                     }
                 }
                 "else_if_clause" | "if_statement" => {
@@ -983,7 +1131,9 @@ impl AstPhpProcessor {
                     "else_clause" => {
                         for inner in child.named_children(&mut child.walk()) {
                             let flow = self.process_node(inner, output).await?;
-                            if let ControlFlow::Break(()) = flow { return Ok(flow); }
+                            if let ControlFlow::Break(()) = flow {
+                                return Ok(flow);
+                            }
                         }
                         found_else = true;
                     }
@@ -1008,10 +1158,12 @@ impl AstPhpProcessor {
             }
             "subscript_expression" => {
                 // $arr['key'] = value or $arr[] = value
-                let target = left.child_by_field_name("value")
+                let target = left
+                    .child_by_field_name("value")
                     .or_else(|| left.child_by_field_name("array"))
                     .or_else(|| left.named_child(0));
-                let index = left.child_by_field_name("index")
+                let index = left
+                    .child_by_field_name("index")
                     .or_else(|| left.child_by_field_name("offset"))
                     .or_else(|| left.named_child(1));
 
@@ -1019,14 +1171,24 @@ impl AstPhpProcessor {
                     let target_name = if let Some(id) = self.get_identifier(target) {
                         id
                     } else {
-                        target.utf8_text(self.source_code.as_bytes())?.trim_start_matches('$').to_string()
+                        target
+                            .utf8_text(self.source_code.as_bytes())?
+                            .trim_start_matches('$')
+                            .to_string()
                     };
 
                     if let Some(index) = index {
                         let key = self.evaluate_expression(index).await?.as_string();
 
+                        if let Some(superglobal) = self.superglobals.get_mut(&target_name) {
+                            superglobal.insert(key, value.as_string());
+                            return Ok(());
+                        }
+
                         // Update existing array or create new one
-                        let mut arr = if let Some(PhpValue::Array(items)) = self.variables.get(&target_name) {
+                        let mut arr = if let Some(PhpValue::Array(items)) =
+                            self.variables.get(&target_name)
+                        {
                             items.clone()
                         } else {
                             Vec::new()
@@ -1048,8 +1210,16 @@ impl AstPhpProcessor {
                         }
                         self.variables.insert(target_name, PhpValue::Array(arr));
                     } else {
+                        if let Some(superglobal) = self.superglobals.get_mut(&target_name) {
+                            let key = superglobal.len().to_string();
+                            superglobal.insert(key, value.as_string());
+                            return Ok(());
+                        }
+
                         // $arr[] = value (append)
-                        let mut arr = if let Some(PhpValue::Array(items)) = self.variables.get(&target_name) {
+                        let mut arr = if let Some(PhpValue::Array(items)) =
+                            self.variables.get(&target_name)
+                        {
                             items.clone()
                         } else {
                             Vec::new()
@@ -1078,10 +1248,12 @@ impl AstPhpProcessor {
                 }
             }
             "subscript_expression" => {
-                let target = node.child_by_field_name("value")
+                let target = node
+                    .child_by_field_name("value")
                     .or_else(|| node.child_by_field_name("array"))
                     .or_else(|| node.named_child(0));
-                let index = node.child_by_field_name("index")
+                let index = node
+                    .child_by_field_name("index")
                     .or_else(|| node.child_by_field_name("offset"))
                     .or_else(|| node.named_child(1));
 
@@ -1089,9 +1261,17 @@ impl AstPhpProcessor {
                     let target_name = if let Some(id) = self.get_identifier(target) {
                         id
                     } else {
-                        target.utf8_text(self.source_code.as_bytes())?.trim_start_matches('$').to_string()
+                        target
+                            .utf8_text(self.source_code.as_bytes())?
+                            .trim_start_matches('$')
+                            .to_string()
                     };
                     let key = self.evaluate_expression(index).await?.as_string();
+
+                    if let Some(superglobal) = self.superglobals.get_mut(&target_name) {
+                        superglobal.remove(&key);
+                        return Ok(());
+                    }
 
                     if let Some(PhpValue::Array(items)) = self.variables.get(&target_name) {
                         let mut new_items = Vec::new();
@@ -1101,7 +1281,8 @@ impl AstPhpProcessor {
                                 _ => new_items.push(item.clone()),
                             }
                         }
-                        self.variables.insert(target_name, PhpValue::Array(new_items));
+                        self.variables
+                            .insert(target_name, PhpValue::Array(new_items));
                     }
                 }
             }
@@ -1151,13 +1332,15 @@ impl AstPhpProcessor {
             }
             "string_content" => {
                 let source = self.source_code.as_bytes();
-                let raw = node.utf8_text(source)
+                let raw = node
+                    .utf8_text(source)
                     .map_err(|_| anyhow!("Failed to get text"))?;
                 return Ok(PhpValue::String(raw.to_string()));
             }
             "escape_sequence" => {
                 let source = self.source_code.as_bytes();
-                let raw = node.utf8_text(source)
+                let raw = node
+                    .utf8_text(source)
                     .map_err(|_| anyhow!("Failed to get text"))?;
                 if raw.contains("$") {
                     let cleaned = raw.trim_matches(|c| c == '{' || c == '}' || c == '$');
@@ -1172,7 +1355,10 @@ impl AstPhpProcessor {
                     if let Some(superglobal) = self.superglobals.get(&id) {
                         let mut items = Vec::new();
                         for (key, value) in superglobal {
-                            items.push(PhpArrayItem::KeyValue(key.clone(), PhpValue::String(value.clone())));
+                            items.push(PhpArrayItem::KeyValue(
+                                key.clone(),
+                                PhpValue::String(value.clone()),
+                            ));
                         }
                         return Ok(PhpValue::Array(items));
                     }
@@ -1188,15 +1374,23 @@ impl AstPhpProcessor {
                     // Magic constants
                     match id.as_str() {
                         "__DIR__" => {
-                            return Ok(PhpValue::String(self.current_template_path.as_ref()
-                                .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
-                                .map_or(String::new(), |p| p.to_string_lossy().to_string())));
+                            return Ok(PhpValue::String(
+                                self.current_template_path
+                                    .as_ref()
+                                    .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
+                                    .map_or(String::new(), |p| p.to_string_lossy().to_string()),
+                            ));
                         }
                         "__FILE__" => {
-                            return Ok(PhpValue::String(self.current_template_path.as_ref()
-                                .map_or(String::new(), |p| p.to_string_lossy().to_string())));
+                            return Ok(PhpValue::String(
+                                self.current_template_path
+                                    .as_ref()
+                                    .map_or(String::new(), |p| p.to_string_lossy().to_string()),
+                            ));
                         }
-                        "__LINE__" => return Ok(PhpValue::Int(node.start_position().row as i64 + 1)),
+                        "__LINE__" => {
+                            return Ok(PhpValue::Int(node.start_position().row as i64 + 1))
+                        }
                         _ => {}
                     }
                     if let Some(val) = self.constants.get(&id) {
@@ -1207,34 +1401,47 @@ impl AstPhpProcessor {
                 return Ok(PhpValue::Null);
             }
             "single_quoted_string" | "double_quoted_string" => {
-                let text = node.utf8_text(self.source_code.as_bytes())
+                let text = node
+                    .utf8_text(self.source_code.as_bytes())
                     .map_err(|_| anyhow!("Failed to get text"))?;
-                return Ok(PhpValue::String(text.trim_matches(|c| c == '\'' || c == '"').to_string()));
+                return Ok(PhpValue::String(
+                    text.trim_matches(|c| c == '\'' || c == '"').to_string(),
+                ));
             }
             "string" => {
-                let text = node.utf8_text(self.source_code.as_bytes())
+                let text = node
+                    .utf8_text(self.source_code.as_bytes())
                     .map_err(|_| anyhow!("Failed to get text"))?;
-                Ok(PhpValue::String(text.trim_matches(|c| c == '\'' || c == '"').to_string()))
+                Ok(PhpValue::String(
+                    text.trim_matches(|c| c == '\'' || c == '"').to_string(),
+                ))
             }
             "integer" => {
-                let text = node.utf8_text(self.source_code.as_bytes())
+                let text = node
+                    .utf8_text(self.source_code.as_bytes())
                     .map_err(|_| anyhow!("Failed to get number"))?;
                 Ok(PhpValue::Int(text.parse::<i64>().unwrap_or(0)))
             }
             "float" => {
-                let text = node.utf8_text(self.source_code.as_bytes())
+                let text = node
+                    .utf8_text(self.source_code.as_bytes())
                     .map_err(|_| anyhow!("Failed to get number"))?;
                 Ok(PhpValue::Float(text.parse::<f64>().unwrap_or(0.0)))
             }
             "variable" => {
-                let var_name = node.utf8_text(self.source_code.as_bytes())?
-                    .trim_start_matches('$').to_string();
+                let var_name = node
+                    .utf8_text(self.source_code.as_bytes())?
+                    .trim_start_matches('$')
+                    .to_string();
                 if let Some(value) = self.variables.get(&var_name) {
                     Ok(value.clone())
                 } else if let Some(superglobal) = self.superglobals.get(&var_name) {
                     let mut items = Vec::new();
                     for (key, value) in superglobal {
-                        items.push(PhpArrayItem::KeyValue(key.clone(), PhpValue::String(value.clone())));
+                        items.push(PhpArrayItem::KeyValue(
+                            key.clone(),
+                            PhpValue::String(value.clone()),
+                        ));
                     }
                     Ok(PhpValue::Array(items))
                 } else {
@@ -1242,10 +1449,12 @@ impl AstPhpProcessor {
                 }
             }
             "subscript_expression" => {
-                let target = node.child_by_field_name("value")
+                let target = node
+                    .child_by_field_name("value")
                     .or_else(|| node.child_by_field_name("array"))
                     .or_else(|| node.named_child(0));
-                let index = node.child_by_field_name("index")
+                let index = node
+                    .child_by_field_name("index")
                     .or_else(|| node.child_by_field_name("offset"))
                     .or_else(|| node.named_child(1));
                 if let (Some(target), Some(index)) = (target, index) {
@@ -1275,8 +1484,12 @@ impl AstPhpProcessor {
                 Ok(PhpValue::Null)
             }
             "binary_expression" => {
-                let left = node.child_by_field_name("left").or_else(|| node.named_child(0));
-                let right = node.child_by_field_name("right").or_else(|| node.named_child(1));
+                let left = node
+                    .child_by_field_name("left")
+                    .or_else(|| node.named_child(0));
+                let right = node
+                    .child_by_field_name("right")
+                    .or_else(|| node.named_child(1));
                 let operator = {
                     let source = self.source_code.as_bytes();
                     node.child_by_field_name("operator")
@@ -1288,19 +1501,25 @@ impl AstPhpProcessor {
                     // Short-circuit for logical operators
                     if operator == "&&" || operator == "and" {
                         let left_val = self.evaluate_expression(left).await?;
-                        if !left_val.is_truthy() { return Ok(PhpValue::Bool(false)); }
+                        if !left_val.is_truthy() {
+                            return Ok(PhpValue::Bool(false));
+                        }
                         let right_val = self.evaluate_expression(right).await?;
                         return Ok(PhpValue::Bool(right_val.is_truthy()));
                     }
                     if operator == "||" || operator == "or" {
                         let left_val = self.evaluate_expression(left).await?;
-                        if left_val.is_truthy() { return Ok(PhpValue::Bool(true)); }
+                        if left_val.is_truthy() {
+                            return Ok(PhpValue::Bool(true));
+                        }
                         let right_val = self.evaluate_expression(right).await?;
                         return Ok(PhpValue::Bool(right_val.is_truthy()));
                     }
                     if operator == "??" {
                         let left_val = self.evaluate_expression(left).await?;
-                        if !left_val.is_null() { return Ok(left_val); }
+                        if !left_val.is_null() {
+                            return Ok(left_val);
+                        }
                         return self.evaluate_expression(right).await;
                     }
 
@@ -1308,7 +1527,11 @@ impl AstPhpProcessor {
                     let right_val = self.evaluate_expression(right).await?;
 
                     match operator.as_str() {
-                        "." => Ok(PhpValue::String(format!("{}{}", left_val.as_string(), right_val.as_string()))),
+                        "." => Ok(PhpValue::String(format!(
+                            "{}{}",
+                            left_val.as_string(),
+                            right_val.as_string()
+                        ))),
                         // Comparison
                         "==" => Ok(PhpValue::Bool(left_val.loose_eq(&right_val))),
                         "!=" | "<>" => Ok(PhpValue::Bool(!left_val.loose_eq(&right_val))),
@@ -1353,10 +1576,15 @@ impl AstPhpProcessor {
                         }
                         "%" => {
                             let d = right_val.as_int();
-                            if d == 0 { Ok(PhpValue::Bool(false)) }
-                            else { Ok(PhpValue::Int(left_val.as_int() % d)) }
+                            if d == 0 {
+                                Ok(PhpValue::Bool(false))
+                            } else {
+                                Ok(PhpValue::Int(left_val.as_int() % d))
+                            }
                         }
-                        "**" => Ok(PhpValue::Float(left_val.as_float().powf(right_val.as_float()))),
+                        "**" => Ok(PhpValue::Float(
+                            left_val.as_float().powf(right_val.as_float()),
+                        )),
                         // Bitwise
                         "&" => Ok(PhpValue::Int(left_val.as_int() & right_val.as_int())),
                         "|" => Ok(PhpValue::Int(left_val.as_int() | right_val.as_int())),
@@ -1365,7 +1593,9 @@ impl AstPhpProcessor {
                         ">>" => Ok(PhpValue::Int(left_val.as_int() >> right_val.as_int())),
                         // instanceof — classes not supported in AST mode
                         "instanceof" => {
-                            self.log_error("instanceof is not supported in AST mode (always returns false)");
+                            self.log_error(
+                                "instanceof is not supported in AST mode (always returns false)",
+                            );
                             Ok(PhpValue::Bool(false))
                         }
                         _ => Ok(PhpValue::Null),
@@ -1394,8 +1624,16 @@ impl AstPhpProcessor {
                     let val = self.evaluate_expression(operand).await?;
                     match operator.as_str() {
                         "!" => Ok(PhpValue::Bool(!val.is_truthy())),
-                        "-" => Ok(if val.is_int_like() { PhpValue::Int(-val.as_int()) } else { PhpValue::Float(-val.as_float()) }),
-                        "+" => Ok(if val.is_int_like() { PhpValue::Int(val.as_int()) } else { PhpValue::Float(val.as_float()) }),
+                        "-" => Ok(if val.is_int_like() {
+                            PhpValue::Int(-val.as_int())
+                        } else {
+                            PhpValue::Float(-val.as_float())
+                        }),
+                        "+" => Ok(if val.is_int_like() {
+                            PhpValue::Int(val.as_int())
+                        } else {
+                            PhpValue::Float(val.as_float())
+                        }),
                         "~" => Ok(PhpValue::Int(!val.as_int())),
                         _ => Ok(val),
                     }
@@ -1405,11 +1643,14 @@ impl AstPhpProcessor {
             }
             // ── ternary / conditional ────────────────────────────────────
             "conditional_expression" | "ternary_expression" => {
-                let condition = node.child_by_field_name("condition")
+                let condition = node
+                    .child_by_field_name("condition")
                     .or_else(|| node.named_child(0));
-                let if_true = node.child_by_field_name("body")
+                let if_true = node
+                    .child_by_field_name("body")
                     .or_else(|| node.named_child(1));
-                let if_false = node.child_by_field_name("alternative")
+                let if_false = node
+                    .child_by_field_name("alternative")
                     .or_else(|| node.named_child(2));
 
                 if let Some(condition) = condition {
@@ -1428,11 +1669,15 @@ impl AstPhpProcessor {
             }
             // ── cast expressions ─────────────────────────────────────────
             "cast_expression" => {
-                let cast_type = node.child_by_field_name("type")
+                let cast_type = node
+                    .child_by_field_name("type")
                     .and_then(|n| n.utf8_text(self.source_code.as_bytes()).ok())
                     .unwrap_or("")
                     .to_string();
-                let value = if let Some(operand) = node.child_by_field_name("value").or_else(|| node.named_child(0)) {
+                let value = if let Some(operand) = node
+                    .child_by_field_name("value")
+                    .or_else(|| node.named_child(0))
+                {
                     self.evaluate_expression(operand).await?
                 } else {
                     PhpValue::Null
@@ -1458,20 +1703,28 @@ impl AstPhpProcessor {
                 if let Some(var_node) = node.named_child(0) {
                     let val = self.evaluate_expression(var_node).await?;
                     let new_val = match &val {
-                        PhpValue::Float(f) => if is_increment {
-                            PhpValue::Float(f + 1.0)
-                        } else {
-                            PhpValue::Float(f - 1.0)
-                        },
-                        _ => if is_increment {
-                            PhpValue::Int(val.as_int() + 1)
-                        } else {
-                            PhpValue::Int(val.as_int() - 1)
-                        },
+                        PhpValue::Float(f) => {
+                            if is_increment {
+                                PhpValue::Float(f + 1.0)
+                            } else {
+                                PhpValue::Float(f - 1.0)
+                            }
+                        }
+                        _ => {
+                            if is_increment {
+                                PhpValue::Int(val.as_int() + 1)
+                            } else {
+                                PhpValue::Int(val.as_int() - 1)
+                            }
+                        }
                     };
                     let is_prefix = raw.starts_with("++") || raw.starts_with("--");
                     self.assign_to(var_node, new_val.clone()).await?;
-                    if is_prefix { Ok(new_val) } else { Ok(val) }
+                    if is_prefix {
+                        Ok(new_val)
+                    } else {
+                        Ok(val)
+                    }
                 } else {
                     Ok(PhpValue::Null)
                 }
@@ -1518,9 +1771,7 @@ impl AstPhpProcessor {
                 }
                 Ok(PhpValue::Array(items))
             }
-            "function_call_expression" => {
-                self.evaluate_function_call(node).await
-            }
+            "function_call_expression" => self.evaluate_function_call(node).await,
             // Assignment as expression: $a = $b = 5 returns 5
             "assignment_expression" => {
                 let left = node.child_by_field_name("left");
@@ -1545,14 +1796,19 @@ impl AstPhpProcessor {
                 }
             }
             // require/include as expression: $config = require 'file.php'
-            "include_expression" | "require_expression" | "include_once_expression" | "require_once_expression" => {
+            "include_expression"
+            | "require_expression"
+            | "include_once_expression"
+            | "require_once_expression" => {
                 let is_once = node.kind().contains("_once");
-                let target = node.child_by_field_name("path")
+                let target = node
+                    .child_by_field_name("path")
                     .or_else(|| node.child_by_field_name("argument"))
                     .or_else(|| node.named_child(0));
                 if let Some(target) = target {
                     let value = self.evaluate_expression(target).await?;
-                    let (include_output, return_value) = self.include_file(&value.as_string(), is_once).await?;
+                    let (include_output, return_value) =
+                        self.include_file(&value.as_string(), is_once).await?;
                     if !include_output.is_empty() {
                         self.side_effect_output = Some(include_output);
                     }
@@ -1586,31 +1842,55 @@ impl AstPhpProcessor {
                     let left_val = self.evaluate_expression(left).await?;
                     let right_val = self.evaluate_expression(right).await?;
                     let result = match operator.as_str() {
-                        "+=" => if left_val.is_int_like() && right_val.is_int_like() {
-                            PhpValue::Int(left_val.as_int().wrapping_add(right_val.as_int()))
-                        } else {
-                            PhpValue::Float(left_val.as_float() + right_val.as_float())
-                        },
-                        "-=" => if left_val.is_int_like() && right_val.is_int_like() {
-                            PhpValue::Int(left_val.as_int().wrapping_sub(right_val.as_int()))
-                        } else {
-                            PhpValue::Float(left_val.as_float() - right_val.as_float())
-                        },
-                        "*=" => if left_val.is_int_like() && right_val.is_int_like() {
-                            PhpValue::Int(left_val.as_int().wrapping_mul(right_val.as_int()))
-                        } else {
-                            PhpValue::Float(left_val.as_float() * right_val.as_float())
-                        },
+                        "+=" => {
+                            if left_val.is_int_like() && right_val.is_int_like() {
+                                PhpValue::Int(left_val.as_int().wrapping_add(right_val.as_int()))
+                            } else {
+                                PhpValue::Float(left_val.as_float() + right_val.as_float())
+                            }
+                        }
+                        "-=" => {
+                            if left_val.is_int_like() && right_val.is_int_like() {
+                                PhpValue::Int(left_val.as_int().wrapping_sub(right_val.as_int()))
+                            } else {
+                                PhpValue::Float(left_val.as_float() - right_val.as_float())
+                            }
+                        }
+                        "*=" => {
+                            if left_val.is_int_like() && right_val.is_int_like() {
+                                PhpValue::Int(left_val.as_int().wrapping_mul(right_val.as_int()))
+                            } else {
+                                PhpValue::Float(left_val.as_float() * right_val.as_float())
+                            }
+                        }
                         "/=" => {
                             let d = right_val.as_float();
-                            if d == 0.0 { PhpValue::Bool(false) }
-                            else if left_val.is_int_like() && right_val.is_int_like() {
-                                let li = left_val.as_int(); let ri = right_val.as_int();
-                                if ri != 0 && li % ri == 0 { PhpValue::Int(li / ri) } else { PhpValue::Float(left_val.as_float() / d) }
-                            } else { PhpValue::Float(left_val.as_float() / d) }
+                            if d == 0.0 {
+                                PhpValue::Bool(false)
+                            } else if left_val.is_int_like() && right_val.is_int_like() {
+                                let li = left_val.as_int();
+                                let ri = right_val.as_int();
+                                if ri != 0 && li % ri == 0 {
+                                    PhpValue::Int(li / ri)
+                                } else {
+                                    PhpValue::Float(left_val.as_float() / d)
+                                }
+                            } else {
+                                PhpValue::Float(left_val.as_float() / d)
+                            }
                         }
-                        ".=" => PhpValue::String(format!("{}{}", left_val.as_string(), right_val.as_string())),
-                        "??=" => if left_val.is_null() { right_val } else { left_val },
+                        ".=" => PhpValue::String(format!(
+                            "{}{}",
+                            left_val.as_string(),
+                            right_val.as_string()
+                        )),
+                        "??=" => {
+                            if left_val.is_null() {
+                                right_val
+                            } else {
+                                left_val
+                            }
+                        }
                         _ => right_val,
                     };
                     self.assign_to(left, result.clone()).await?;
@@ -1622,7 +1902,10 @@ impl AstPhpProcessor {
             _ => {
                 let kind = node.kind();
                 let line = node.start_position().row + 1;
-                self.log_error(&format!("Unhandled expression node '{}' at line {}", kind, line));
+                self.log_error(&format!(
+                    "Unhandled expression node '{}' at line {}",
+                    kind, line
+                ));
                 let mut expr_output = String::new();
                 let _ = self.process_node(node, &mut expr_output).await?;
                 if expr_output.is_empty() {
@@ -1635,7 +1918,8 @@ impl AstPhpProcessor {
     }
 
     async fn evaluate_function_call(&mut self, node: Node<'_>) -> Result<PhpValue> {
-        let function = node.child_by_field_name("function")
+        let function = node
+            .child_by_field_name("function")
             .ok_or_else(|| anyhow!("Function node missing"))?;
         let mut args_node = node.child_by_field_name("arguments");
         if args_node.is_none() {
@@ -1735,9 +2019,15 @@ impl AstPhpProcessor {
                             let y = dt.format("%Y").to_string().parse::<i32>().unwrap_or(2000);
                             let m = dt.format("%m").to_string().parse::<u32>().unwrap_or(1);
                             let days = match m {
-                                1|3|5|7|8|10|12 => 31,
-                                4|6|9|11 => 30,
-                                2 => if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 29 } else { 28 },
+                                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                                4 | 6 | 9 | 11 => 30,
+                                2 => {
+                                    if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+                                        29
+                                    } else {
+                                        28
+                                    }
+                                }
                                 _ => 30,
                             };
                             out.push_str(&days.to_string());
@@ -1752,10 +2042,7 @@ impl AstPhpProcessor {
                 if let Some(header_line) = args.get(0) {
                     let header_line = header_line.as_string();
                     if let Some((name, value)) = header_line.split_once(':') {
-                        self.response_headers.insert(
-                            name.trim().to_lowercase(),
-                            value.trim().to_string(),
-                        );
+                        self.add_response_header(name, value.trim().to_string());
                     }
                 }
                 // 3rd arg: HTTP response code (e.g. header("Location: ...", true, 301))
@@ -1806,7 +2093,9 @@ impl AstPhpProcessor {
             }
             "var_dump" => {
                 if args.is_empty() {
-                    self.log_error("var_dump called with no args (parser did not capture arguments)");
+                    self.log_error(
+                        "var_dump called with no args (parser did not capture arguments)",
+                    );
                 }
                 let mut out = String::new();
                 for (idx, arg) in args.iter().enumerate() {
@@ -1841,7 +2130,8 @@ impl AstPhpProcessor {
                         return Err(anyhow!("exe: path not found: {}", target_str));
                     };
 
-                    let content = fs::read_to_string(&script).await
+                    let content = fs::read_to_string(&script)
+                        .await
                         .map_err(|_| anyhow!("exe: cannot read {}", script.display()))?;
 
                     let previous_source = self.source_code.clone();
@@ -1858,7 +2148,10 @@ impl AstPhpProcessor {
                 Ok(PhpValue::Null)
             }
             "http_request" => {
-                let method = args.get(0).map(|s| s.as_string()).unwrap_or("GET".to_string());
+                let method = args
+                    .get(0)
+                    .map(|s| s.as_string())
+                    .unwrap_or("GET".to_string());
                 let url = args.get(1).map(|s| s.as_string()).unwrap_or_default();
                 let headers = args.get(2);
                 let body = args.get(3).map(|s| s.as_string()).unwrap_or_default();
@@ -1870,16 +2163,17 @@ impl AstPhpProcessor {
 
             // ── exit / die (as function call) ───────────────────────────
             "exit" | "die" => {
-                let code = args.first().map(|a| {
-                    match a {
+                let code = args
+                    .first()
+                    .map(|a| match a {
                         PhpValue::Int(n) => *n as i32,
                         PhpValue::String(s) => {
                             self.side_effect_output = Some(s.clone());
                             0
                         }
                         _ => 0,
-                    }
-                }).unwrap_or(0);
+                    })
+                    .unwrap_or(0);
                 return Err(anyhow!(PhpExit { code }));
             }
 
@@ -1898,7 +2192,8 @@ impl AstPhpProcessor {
                 if let Some(target) = args.first() {
                     let path_str = target.as_string();
                     let path = self.resolve_local_path(&path_str)?;
-                    let content = fs::read_to_string(&path).await
+                    let content = fs::read_to_string(&path)
+                        .await
                         .map_err(|_| anyhow!("readfile: cannot read {}", path.display()))?;
                     self.side_effect_output = Some(content.clone());
                     return Ok(PhpValue::Int(content.len() as i64));
@@ -1907,40 +2202,41 @@ impl AstPhpProcessor {
             }
 
             // ── Type checking ───────────────────────────────────────────
-            "isset" => {
-                Ok(PhpValue::Bool(args.iter().all(|a| !a.is_null())))
-            }
-            "empty" => {
-                Ok(PhpValue::Bool(args.first().map_or(true, |a| a.is_empty_value())))
-            }
-            "is_null" => {
-                Ok(PhpValue::Bool(args.first().map_or(true, |a| a.is_null())))
-            }
-            "is_array" => {
-                Ok(PhpValue::Bool(matches!(args.first(), Some(PhpValue::Array(_)))))
-            }
-            "is_string" => {
-                Ok(PhpValue::Bool(matches!(args.first(), Some(PhpValue::String(_)))))
-            }
-            "is_numeric" => {
-                Ok(PhpValue::Bool(args.first().map_or(false, |a| {
-                    matches!(a, PhpValue::Int(_) | PhpValue::Float(_)) ||
-                    matches!(a, PhpValue::String(s) if s.parse::<f64>().is_ok())
-                })))
-            }
-            "is_int" | "is_integer" | "is_long" => {
-                Ok(PhpValue::Bool(matches!(args.first(), Some(PhpValue::Int(_)))))
-            }
-            "is_bool" => {
-                Ok(PhpValue::Bool(matches!(args.first(), Some(PhpValue::Bool(_)))))
-            }
-            "is_scalar" => {
-                Ok(PhpValue::Bool(matches!(args.first(),
-                    Some(PhpValue::Int(_) | PhpValue::Float(_) | PhpValue::String(_) | PhpValue::Bool(_)))))
-            }
-            "is_float" | "is_double" => {
-                Ok(PhpValue::Bool(matches!(args.first(), Some(PhpValue::Float(_)))))
-            }
+            "isset" => Ok(PhpValue::Bool(args.iter().all(|a| !a.is_null()))),
+            "empty" => Ok(PhpValue::Bool(
+                args.first().map_or(true, |a| a.is_empty_value()),
+            )),
+            "is_null" => Ok(PhpValue::Bool(args.first().map_or(true, |a| a.is_null()))),
+            "is_array" => Ok(PhpValue::Bool(matches!(
+                args.first(),
+                Some(PhpValue::Array(_))
+            ))),
+            "is_string" => Ok(PhpValue::Bool(matches!(
+                args.first(),
+                Some(PhpValue::String(_))
+            ))),
+            "is_numeric" => Ok(PhpValue::Bool(args.first().map_or(false, |a| {
+                matches!(a, PhpValue::Int(_) | PhpValue::Float(_))
+                    || matches!(a, PhpValue::String(s) if s.parse::<f64>().is_ok())
+            }))),
+            "is_int" | "is_integer" | "is_long" => Ok(PhpValue::Bool(matches!(
+                args.first(),
+                Some(PhpValue::Int(_))
+            ))),
+            "is_bool" => Ok(PhpValue::Bool(matches!(
+                args.first(),
+                Some(PhpValue::Bool(_))
+            ))),
+            "is_scalar" => Ok(PhpValue::Bool(matches!(
+                args.first(),
+                Some(
+                    PhpValue::Int(_) | PhpValue::Float(_) | PhpValue::String(_) | PhpValue::Bool(_)
+                )
+            ))),
+            "is_float" | "is_double" => Ok(PhpValue::Bool(matches!(
+                args.first(),
+                Some(PhpValue::Float(_))
+            ))),
             "gettype" => {
                 let t = match args.first() {
                     Some(PhpValue::Null) | None => "NULL",
@@ -1955,9 +2251,17 @@ impl AstPhpProcessor {
             }
 
             // ── String functions ─────────────────────────────────────────
-            "strlen" => Ok(PhpValue::Int(args.first().map_or(0, |a| a.as_string().len() as i64))),
-            "strtolower" => Ok(PhpValue::String(args.first().map_or(String::new(), |a| a.as_string().to_lowercase()))),
-            "strtoupper" => Ok(PhpValue::String(args.first().map_or(String::new(), |a| a.as_string().to_uppercase()))),
+            "strlen" => Ok(PhpValue::Int(
+                args.first().map_or(0, |a| a.as_string().len() as i64),
+            )),
+            "strtolower" => Ok(PhpValue::String(
+                args.first()
+                    .map_or(String::new(), |a| a.as_string().to_lowercase()),
+            )),
+            "strtoupper" => Ok(PhpValue::String(
+                args.first()
+                    .map_or(String::new(), |a| a.as_string().to_uppercase()),
+            )),
             "trim" => {
                 let s = args.first().map_or(String::new(), |a| a.as_string());
                 let chars = args.get(1).map(|a| a.as_string());
@@ -1970,7 +2274,11 @@ impl AstPhpProcessor {
                 let s = args.first().map_or(String::new(), |a| a.as_string());
                 let mask = args.get(1).map(|a| a.as_string());
                 Ok(PhpValue::String(match mask {
-                    Some(m) => { let chars: Vec<char> = m.chars().collect(); s.trim_start_matches(|c: char| chars.contains(&c)).to_string() }
+                    Some(m) => {
+                        let chars: Vec<char> = m.chars().collect();
+                        s.trim_start_matches(|c: char| chars.contains(&c))
+                            .to_string()
+                    }
                     None => s.trim_start().to_string(),
                 }))
             }
@@ -1978,7 +2286,10 @@ impl AstPhpProcessor {
                 let s = args.first().map_or(String::new(), |a| a.as_string());
                 let mask = args.get(1).map(|a| a.as_string());
                 Ok(PhpValue::String(match mask {
-                    Some(m) => { let chars: Vec<char> = m.chars().collect(); s.trim_end_matches(|c: char| chars.contains(&c)).to_string() }
+                    Some(m) => {
+                        let chars: Vec<char> = m.chars().collect();
+                        s.trim_end_matches(|c: char| chars.contains(&c)).to_string()
+                    }
                     None => s.trim_end().to_string(),
                 }))
             }
@@ -2050,7 +2361,8 @@ impl AstPhpProcessor {
                     Some(n) if n > 0 => string.splitn(n as usize, &delimiter).collect(),
                     _ => string.split(&delimiter).collect(),
                 };
-                let items: Vec<PhpArrayItem> = parts.into_iter()
+                let items: Vec<PhpArrayItem> = parts
+                    .into_iter()
                     .map(|s| PhpArrayItem::Value(PhpValue::String(s.to_string())))
                     .collect();
                 Ok(PhpValue::Array(items))
@@ -2060,10 +2372,13 @@ impl AstPhpProcessor {
                 let empty_arr = PhpValue::Array(vec![]);
                 let pieces = args.get(1).unwrap_or(&empty_arr);
                 if let PhpValue::Array(items) = pieces {
-                    let strs: Vec<String> = items.iter().map(|item| match item {
-                        PhpArrayItem::KeyValue(_, v) => v.as_string(),
-                        PhpArrayItem::Value(v) => v.as_string(),
-                    }).collect();
+                    let strs: Vec<String> = items
+                        .iter()
+                        .map(|item| match item {
+                            PhpArrayItem::KeyValue(_, v) => v.as_string(),
+                            PhpArrayItem::Value(v) => v.as_string(),
+                        })
+                        .collect();
                     Ok(PhpValue::String(strs.join(&glue)))
                 } else {
                     Ok(PhpValue::String(String::new()))
@@ -2087,8 +2402,14 @@ impl AstPhpProcessor {
                         // Flags
                         while j < chars.len() {
                             match chars[j] {
-                                '0' if width == 0 && precision.is_none() => { pad_char = '0'; j += 1; }
-                                '-' => { left_align = true; j += 1; }
+                                '0' if width == 0 && precision.is_none() => {
+                                    pad_char = '0';
+                                    j += 1;
+                                }
+                                '-' => {
+                                    left_align = true;
+                                    j += 1;
+                                }
                                 _ => break,
                             }
                         }
@@ -2111,9 +2432,14 @@ impl AstPhpProcessor {
                         if j < chars.len() {
                             let formatted = match chars[j] {
                                 's' => {
-                                    let s = args.get(arg_idx).map_or(String::new(), |a| a.as_string());
+                                    let s =
+                                        args.get(arg_idx).map_or(String::new(), |a| a.as_string());
                                     arg_idx += 1;
-                                    if let Some(p) = precision { s[..s.len().min(p)].to_string() } else { s }
+                                    if let Some(p) = precision {
+                                        s[..s.len().min(p)].to_string()
+                                    } else {
+                                        s
+                                    }
                                 }
                                 'd' => {
                                     let n = args.get(arg_idx).map_or(0, |a| a.as_int());
@@ -2146,17 +2472,29 @@ impl AstPhpProcessor {
                                     arg_idx += 1;
                                     format!("{:b}", n)
                                 }
-                                '%' => { i = j + 1; out.push('%'); continue; }
-                                _ => { out.push('%'); i = i + 1; continue; }
+                                '%' => {
+                                    i = j + 1;
+                                    out.push('%');
+                                    continue;
+                                }
+                                _ => {
+                                    out.push('%');
+                                    i = i + 1;
+                                    continue;
+                                }
                             };
                             // Apply width padding
                             if width > formatted.len() {
                                 let padding = width - formatted.len();
                                 if left_align {
                                     out.push_str(&formatted);
-                                    for _ in 0..padding { out.push(' '); }
+                                    for _ in 0..padding {
+                                        out.push(' ');
+                                    }
                                 } else {
-                                    for _ in 0..padding { out.push(pad_char); }
+                                    for _ in 0..padding {
+                                        out.push(pad_char);
+                                    }
                                     out.push_str(&formatted);
                                 }
                             } else {
@@ -2180,12 +2518,13 @@ impl AstPhpProcessor {
             }
             "htmlspecialchars" | "htmlentities" => {
                 let s = args.first().map_or(String::new(), |a| a.as_string());
-                Ok(PhpValue::String(s
-                    .replace('&', "&amp;")
-                    .replace('<', "&lt;")
-                    .replace('>', "&gt;")
-                    .replace('"', "&quot;")
-                    .replace('\'', "&#039;")))
+                Ok(PhpValue::String(
+                    s.replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;")
+                        .replace('"', "&quot;")
+                        .replace('\'', "&#039;"),
+                ))
             }
             "htmlspecialchars_decode" | "html_entity_decode" => {
                 let s = args.first().map_or(String::new(), |a| a.as_string());
@@ -2197,7 +2536,9 @@ impl AstPhpProcessor {
             }
             "urldecode" => {
                 let s = args.first().map_or(String::new(), |a| a.as_string());
-                Ok(PhpValue::String(urlencoding::decode(&s).unwrap_or_default().to_string()))
+                Ok(PhpValue::String(
+                    urlencoding::decode(&s).unwrap_or_default().to_string(),
+                ))
             }
             "rawurlencode" => {
                 let s = args.first().map_or(String::new(), |a| a.as_string());
@@ -2205,7 +2546,9 @@ impl AstPhpProcessor {
             }
             "rawurldecode" => {
                 let s = args.first().map_or(String::new(), |a| a.as_string());
-                Ok(PhpValue::String(urlencoding::decode(&s).unwrap_or_default().to_string()))
+                Ok(PhpValue::String(
+                    urlencoding::decode(&s).unwrap_or_default().to_string(),
+                ))
             }
             "ucfirst" => {
                 let s = args.first().map_or(String::new(), |a| a.as_string());
@@ -2250,23 +2593,31 @@ impl AstPhpProcessor {
                 Ok(PhpValue::String(format!("{:.prec$}", num, prec = decimals)))
             }
             "intval" | "int" => Ok(PhpValue::Int(args.first().map_or(0, |a| a.as_int()))),
-            "floatval" | "doubleval" => Ok(PhpValue::Float(args.first().map_or(0.0, |a| a.as_float()))),
-            "strval" => Ok(PhpValue::String(args.first().map_or(String::new(), |a| a.as_string()))),
-            "boolval" => Ok(PhpValue::Bool(args.first().map_or(false, |a| a.is_truthy()))),
+            "floatval" | "doubleval" => {
+                Ok(PhpValue::Float(args.first().map_or(0.0, |a| a.as_float())))
+            }
+            "strval" => Ok(PhpValue::String(
+                args.first().map_or(String::new(), |a| a.as_string()),
+            )),
+            "boolval" => Ok(PhpValue::Bool(
+                args.first().map_or(false, |a| a.is_truthy()),
+            )),
 
             // ── Array functions ──────────────────────────────────────────
-            "count" | "sizeof" => {
-                Ok(PhpValue::Int(args.first().map_or(0, |a| a.count()) as i64))
-            }
+            "count" | "sizeof" => Ok(PhpValue::Int(args.first().map_or(0, |a| a.count()) as i64)),
             "array_keys" => {
                 if let Some(PhpValue::Array(items)) = args.first() {
-                    let keys: Vec<PhpArrayItem> = items.iter().enumerate().map(|(i, item)| {
-                        let key = match item {
-                            PhpArrayItem::KeyValue(k, _) => k.clone(),
-                            PhpArrayItem::Value(_) => i.to_string(),
-                        };
-                        PhpArrayItem::Value(PhpValue::String(key))
-                    }).collect();
+                    let keys: Vec<PhpArrayItem> = items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| {
+                            let key = match item {
+                                PhpArrayItem::KeyValue(k, _) => k.clone(),
+                                PhpArrayItem::Value(_) => i.to_string(),
+                            };
+                            PhpArrayItem::Value(PhpValue::String(key))
+                        })
+                        .collect();
                     Ok(PhpValue::Array(keys))
                 } else {
                     Ok(PhpValue::Array(vec![]))
@@ -2274,13 +2625,16 @@ impl AstPhpProcessor {
             }
             "array_values" => {
                 if let Some(PhpValue::Array(items)) = args.first() {
-                    let values: Vec<PhpArrayItem> = items.iter().map(|item| {
-                        let val = match item {
-                            PhpArrayItem::KeyValue(_, v) => v.clone(),
-                            PhpArrayItem::Value(v) => v.clone(),
-                        };
-                        PhpArrayItem::Value(val)
-                    }).collect();
+                    let values: Vec<PhpArrayItem> = items
+                        .iter()
+                        .map(|item| {
+                            let val = match item {
+                                PhpArrayItem::KeyValue(_, v) => v.clone(),
+                                PhpArrayItem::Value(v) => v.clone(),
+                            };
+                            PhpArrayItem::Value(val)
+                        })
+                        .collect();
                     Ok(PhpValue::Array(values))
                 } else {
                     Ok(PhpValue::Array(vec![]))
@@ -2304,9 +2658,9 @@ impl AstPhpProcessor {
             "array_key_exists" => {
                 let key = args.first().map_or(String::new(), |a| a.as_string());
                 if let Some(PhpValue::Array(items)) = args.get(1) {
-                    let found = items.iter().any(|item| {
-                        matches!(item, PhpArrayItem::KeyValue(k, _) if k == &key)
-                    });
+                    let found = items
+                        .iter()
+                        .any(|item| matches!(item, PhpArrayItem::KeyValue(k, _) if k == &key));
                     Ok(PhpValue::Bool(found))
                 } else {
                     Ok(PhpValue::Bool(false))
@@ -2452,9 +2806,7 @@ impl AstPhpProcessor {
             }
 
             // ── Date/time ───────────────────────────────────────────────
-            "time" => {
-                Ok(PhpValue::Int(chrono::Utc::now().timestamp()))
-            }
+            "time" => Ok(PhpValue::Int(chrono::Utc::now().timestamp())),
             "microtime" => {
                 let as_float = args.first().map_or(false, |a| a.is_truthy());
                 let now = std::time::SystemTime::now()
@@ -2478,7 +2830,9 @@ impl AstPhpProcessor {
                     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S") {
                         Ok(PhpValue::Int(dt.and_utc().timestamp()))
                     } else if let Ok(d) = chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
-                        Ok(PhpValue::Int(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp()))
+                        Ok(PhpValue::Int(
+                            d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(),
+                        ))
                     } else {
                         Ok(PhpValue::Bool(false))
                     }
@@ -2512,30 +2866,73 @@ impl AstPhpProcessor {
             }
             "dirname" => {
                 let path_str = args.first().map_or(String::new(), |a| a.as_string());
-                Ok(PhpValue::String(Path::new(&path_str).parent()
-                    .map_or(String::new(), |p| p.to_string_lossy().to_string())))
+                Ok(PhpValue::String(
+                    Path::new(&path_str)
+                        .parent()
+                        .map_or(String::new(), |p| p.to_string_lossy().to_string()),
+                ))
             }
             "basename" => {
                 let path_str = args.first().map_or(String::new(), |a| a.as_string());
-                Ok(PhpValue::String(Path::new(&path_str).file_name()
-                    .map_or(String::new(), |n| n.to_string_lossy().to_string())))
+                Ok(PhpValue::String(
+                    Path::new(&path_str)
+                        .file_name()
+                        .map_or(String::new(), |n| n.to_string_lossy().to_string()),
+                ))
             }
             "pathinfo" => {
                 let path_str = args.first().map_or(String::new(), |a| a.as_string());
                 let flag = args.get(1).map(|a| a.as_int());
                 let p = Path::new(&path_str);
                 match flag {
-                    Some(1) => Ok(PhpValue::String(p.parent().map_or(String::new(), |pp| pp.to_string_lossy().to_string()))),
-                    Some(2) => Ok(PhpValue::String(p.file_name().map_or(String::new(), |n| n.to_string_lossy().to_string()))),
-                    Some(4) => Ok(PhpValue::String(p.extension().map_or(String::new(), |e| e.to_string_lossy().to_string()))),
-                    Some(8) => Ok(PhpValue::String(p.file_stem().map_or(String::new(), |s| s.to_string_lossy().to_string()))),
+                    Some(1) => {
+                        Ok(PhpValue::String(p.parent().map_or(String::new(), |pp| {
+                            pp.to_string_lossy().to_string()
+                        })))
+                    }
+                    Some(2) => {
+                        Ok(PhpValue::String(p.file_name().map_or(String::new(), |n| {
+                            n.to_string_lossy().to_string()
+                        })))
+                    }
+                    Some(4) => {
+                        Ok(PhpValue::String(p.extension().map_or(String::new(), |e| {
+                            e.to_string_lossy().to_string()
+                        })))
+                    }
+                    Some(8) => {
+                        Ok(PhpValue::String(p.file_stem().map_or(String::new(), |s| {
+                            s.to_string_lossy().to_string()
+                        })))
+                    }
                     _ => {
-                        let items = vec![
-                            PhpArrayItem::KeyValue("dirname".to_string(), PhpValue::String(p.parent().map_or(String::new(), |pp| pp.to_string_lossy().to_string()))),
-                            PhpArrayItem::KeyValue("basename".to_string(), PhpValue::String(p.file_name().map_or(String::new(), |n| n.to_string_lossy().to_string()))),
-                            PhpArrayItem::KeyValue("extension".to_string(), PhpValue::String(p.extension().map_or(String::new(), |e| e.to_string_lossy().to_string()))),
-                            PhpArrayItem::KeyValue("filename".to_string(), PhpValue::String(p.file_stem().map_or(String::new(), |s| s.to_string_lossy().to_string()))),
-                        ];
+                        let items =
+                            vec![
+                                PhpArrayItem::KeyValue(
+                                    "dirname".to_string(),
+                                    PhpValue::String(p.parent().map_or(String::new(), |pp| {
+                                        pp.to_string_lossy().to_string()
+                                    })),
+                                ),
+                                PhpArrayItem::KeyValue(
+                                    "basename".to_string(),
+                                    PhpValue::String(p.file_name().map_or(String::new(), |n| {
+                                        n.to_string_lossy().to_string()
+                                    })),
+                                ),
+                                PhpArrayItem::KeyValue(
+                                    "extension".to_string(),
+                                    PhpValue::String(p.extension().map_or(String::new(), |e| {
+                                        e.to_string_lossy().to_string()
+                                    })),
+                                ),
+                                PhpArrayItem::KeyValue(
+                                    "filename".to_string(),
+                                    PhpValue::String(p.file_stem().map_or(String::new(), |s| {
+                                        s.to_string_lossy().to_string()
+                                    })),
+                                ),
+                            ];
                         Ok(PhpValue::Array(items))
                     }
                 }
@@ -2610,27 +3007,70 @@ impl AstPhpProcessor {
                 }
 
                 match component {
-                    Some(0) => Ok(PhpValue::String(scheme)),                // PHP_URL_SCHEME
-                    Some(1) => Ok(PhpValue::String(host)),                  // PHP_URL_HOST
-                    Some(2) => Ok(if port.is_empty() { PhpValue::Null } else { // PHP_URL_PORT
+                    Some(0) => Ok(PhpValue::String(scheme)), // PHP_URL_SCHEME
+                    Some(1) => Ok(PhpValue::String(host)),   // PHP_URL_HOST
+                    Some(2) => Ok(if port.is_empty() {
+                        PhpValue::Null
+                    } else {
+                        // PHP_URL_PORT
                         PhpValue::Int(port.parse::<i64>().unwrap_or(0))
                     }),
-                    Some(3) => Ok(PhpValue::String(user)),                  // PHP_URL_USER
-                    Some(4) => Ok(PhpValue::String(pass)),                  // PHP_URL_PASS
-                    Some(5) => Ok(PhpValue::String(path)),                  // PHP_URL_PATH
-                    Some(6) => Ok(PhpValue::String(query)),                 // PHP_URL_QUERY
-                    Some(7) => Ok(PhpValue::String(fragment)),              // PHP_URL_FRAGMENT
+                    Some(3) => Ok(PhpValue::String(user)), // PHP_URL_USER
+                    Some(4) => Ok(PhpValue::String(pass)), // PHP_URL_PASS
+                    Some(5) => Ok(PhpValue::String(path)), // PHP_URL_PATH
+                    Some(6) => Ok(PhpValue::String(query)), // PHP_URL_QUERY
+                    Some(7) => Ok(PhpValue::String(fragment)), // PHP_URL_FRAGMENT
                     _ => {
                         // Return full array
                         let mut items = Vec::new();
-                        if !scheme.is_empty() { items.push(PhpArrayItem::KeyValue("scheme".to_string(), PhpValue::String(scheme))); }
-                        if !host.is_empty() { items.push(PhpArrayItem::KeyValue("host".to_string(), PhpValue::String(host))); }
-                        if !port.is_empty() { items.push(PhpArrayItem::KeyValue("port".to_string(), PhpValue::Int(port.parse::<i64>().unwrap_or(0)))); }
-                        if !user.is_empty() { items.push(PhpArrayItem::KeyValue("user".to_string(), PhpValue::String(user))); }
-                        if !pass.is_empty() { items.push(PhpArrayItem::KeyValue("pass".to_string(), PhpValue::String(pass))); }
-                        if !path.is_empty() { items.push(PhpArrayItem::KeyValue("path".to_string(), PhpValue::String(path))); }
-                        if !query.is_empty() { items.push(PhpArrayItem::KeyValue("query".to_string(), PhpValue::String(query))); }
-                        if !fragment.is_empty() { items.push(PhpArrayItem::KeyValue("fragment".to_string(), PhpValue::String(fragment))); }
+                        if !scheme.is_empty() {
+                            items.push(PhpArrayItem::KeyValue(
+                                "scheme".to_string(),
+                                PhpValue::String(scheme),
+                            ));
+                        }
+                        if !host.is_empty() {
+                            items.push(PhpArrayItem::KeyValue(
+                                "host".to_string(),
+                                PhpValue::String(host),
+                            ));
+                        }
+                        if !port.is_empty() {
+                            items.push(PhpArrayItem::KeyValue(
+                                "port".to_string(),
+                                PhpValue::Int(port.parse::<i64>().unwrap_or(0)),
+                            ));
+                        }
+                        if !user.is_empty() {
+                            items.push(PhpArrayItem::KeyValue(
+                                "user".to_string(),
+                                PhpValue::String(user),
+                            ));
+                        }
+                        if !pass.is_empty() {
+                            items.push(PhpArrayItem::KeyValue(
+                                "pass".to_string(),
+                                PhpValue::String(pass),
+                            ));
+                        }
+                        if !path.is_empty() {
+                            items.push(PhpArrayItem::KeyValue(
+                                "path".to_string(),
+                                PhpValue::String(path),
+                            ));
+                        }
+                        if !query.is_empty() {
+                            items.push(PhpArrayItem::KeyValue(
+                                "query".to_string(),
+                                PhpValue::String(query),
+                            ));
+                        }
+                        if !fragment.is_empty() {
+                            items.push(PhpArrayItem::KeyValue(
+                                "fragment".to_string(),
+                                PhpValue::String(fragment),
+                            ));
+                        }
                         Ok(PhpValue::Array(items))
                     }
                 }
@@ -2659,7 +3099,8 @@ impl AstPhpProcessor {
                             .append(true)
                             .open(&p)?;
                         file.write_all(c.as_bytes())
-                    }).await;
+                    })
+                    .await;
                     match result {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
@@ -2682,12 +3123,10 @@ impl AstPhpProcessor {
             "filesize" => {
                 let path_str = args.first().map_or(String::new(), |a| a.as_string());
                 match self.resolve_local_path(&path_str) {
-                    Ok(path) => {
-                        match std::fs::metadata(&path) {
-                            Ok(meta) => Ok(PhpValue::Int(meta.len() as i64)),
-                            Err(_) => Ok(PhpValue::Bool(false)),
-                        }
-                    }
+                    Ok(path) => match std::fs::metadata(&path) {
+                        Ok(meta) => Ok(PhpValue::Int(meta.len() as i64)),
+                        Err(_) => Ok(PhpValue::Bool(false)),
+                    },
                     Err(_) => Ok(PhpValue::Bool(false)),
                 }
             }
@@ -2698,7 +3137,8 @@ impl AstPhpProcessor {
                 let full_pattern = if pattern.starts_with('/') {
                     root.join(pattern.trim_start_matches('/'))
                 } else {
-                    self.current_template_path.as_ref()
+                    self.current_template_path
+                        .as_ref()
                         .and_then(|p| p.parent())
                         .unwrap_or(&root)
                         .join(&pattern)
@@ -2707,7 +3147,7 @@ impl AstPhpProcessor {
                 if let Ok(entries) = ::std::fs::read_dir(full_pattern.parent().unwrap_or(&root)) {
                     for entry in entries.flatten() {
                         items.push(PhpArrayItem::Value(PhpValue::String(
-                            entry.path().to_string_lossy().to_string()
+                            entry.path().to_string_lossy().to_string(),
                         )));
                     }
                 }
@@ -2715,9 +3155,15 @@ impl AstPhpProcessor {
             }
 
             // ── Math ────────────────────────────────────────────────────
-            "abs" => Ok(PhpValue::Float(args.first().map_or(0.0, |a| a.as_float().abs()))),
-            "ceil" => Ok(PhpValue::Float(args.first().map_or(0.0, |a| a.as_float().ceil()))),
-            "floor" => Ok(PhpValue::Float(args.first().map_or(0.0, |a| a.as_float().floor()))),
+            "abs" => Ok(PhpValue::Float(
+                args.first().map_or(0.0, |a| a.as_float().abs()),
+            )),
+            "ceil" => Ok(PhpValue::Float(
+                args.first().map_or(0.0, |a| a.as_float().ceil()),
+            )),
+            "floor" => Ok(PhpValue::Float(
+                args.first().map_or(0.0, |a| a.as_float().floor()),
+            )),
             "round" => {
                 let val = args.first().map_or(0.0, |a| a.as_float());
                 let precision = args.get(1).map_or(0, |a| a.as_int()) as i32;
@@ -2727,27 +3173,39 @@ impl AstPhpProcessor {
             "max" => {
                 if args.len() == 1 {
                     if let Some(PhpValue::Array(items)) = args.first() {
-                        let max = items.iter().map(|i| match i {
-                            PhpArrayItem::KeyValue(_, v) => v.as_float(),
-                            PhpArrayItem::Value(v) => v.as_float(),
-                        }).fold(f64::NEG_INFINITY, f64::max);
+                        let max = items
+                            .iter()
+                            .map(|i| match i {
+                                PhpArrayItem::KeyValue(_, v) => v.as_float(),
+                                PhpArrayItem::Value(v) => v.as_float(),
+                            })
+                            .fold(f64::NEG_INFINITY, f64::max);
                         return Ok(PhpValue::Float(max));
                     }
                 }
-                let max = args.iter().map(|a| a.as_float()).fold(f64::NEG_INFINITY, f64::max);
+                let max = args
+                    .iter()
+                    .map(|a| a.as_float())
+                    .fold(f64::NEG_INFINITY, f64::max);
                 Ok(PhpValue::Float(max))
             }
             "min" => {
                 if args.len() == 1 {
                     if let Some(PhpValue::Array(items)) = args.first() {
-                        let min = items.iter().map(|i| match i {
-                            PhpArrayItem::KeyValue(_, v) => v.as_float(),
-                            PhpArrayItem::Value(v) => v.as_float(),
-                        }).fold(f64::INFINITY, f64::min);
+                        let min = items
+                            .iter()
+                            .map(|i| match i {
+                                PhpArrayItem::KeyValue(_, v) => v.as_float(),
+                                PhpArrayItem::Value(v) => v.as_float(),
+                            })
+                            .fold(f64::INFINITY, f64::min);
                         return Ok(PhpValue::Float(min));
                     }
                 }
-                let min = args.iter().map(|a| a.as_float()).fold(f64::INFINITY, f64::min);
+                let min = args
+                    .iter()
+                    .map(|a| a.as_float())
+                    .fold(f64::INFINITY, f64::min);
                 Ok(PhpValue::Float(min))
             }
             "rand" | "mt_rand" => {
@@ -2771,7 +3229,9 @@ impl AstPhpProcessor {
                 let subject = args.get(2).map_or(String::new(), |a| a.as_string());
                 let re_str = build_regex_with_flags(&pattern);
                 match Regex::new(&re_str) {
-                    Ok(re) => Ok(PhpValue::String(re.replace_all(&subject, replacement.as_str()).to_string())),
+                    Ok(re) => Ok(PhpValue::String(
+                        re.replace_all(&subject, replacement.as_str()).to_string(),
+                    )),
                     Err(_) => Ok(PhpValue::String(subject)),
                 }
             }
@@ -2781,18 +3241,23 @@ impl AstPhpProcessor {
                 let re_str = build_regex_with_flags(&pattern);
                 match Regex::new(&re_str) {
                     Ok(re) => {
-                        let parts: Vec<PhpArrayItem> = re.split(&subject)
+                        let parts: Vec<PhpArrayItem> = re
+                            .split(&subject)
                             .map(|s| PhpArrayItem::Value(PhpValue::String(s.to_string())))
                             .collect();
                         Ok(PhpValue::Array(parts))
                     }
-                    Err(_) => Ok(PhpValue::Array(vec![PhpArrayItem::Value(PhpValue::String(subject))]))
+                    Err(_) => Ok(PhpValue::Array(vec![PhpArrayItem::Value(
+                        PhpValue::String(subject),
+                    )])),
                 }
             }
             "strip_tags" => {
                 let s = args.first().map_or(String::new(), |a| a.as_string());
                 // Remove all HTML tags using a simple regex
-                let out = Regex::new(r"<[^>]+>").map(|re| re.replace_all(&s, "").to_string()).unwrap_or(s);
+                let out = Regex::new(r"<[^>]+>")
+                    .map(|re| re.replace_all(&s, "").to_string())
+                    .unwrap_or(s);
                 Ok(PhpValue::String(out))
             }
 
@@ -2813,21 +3278,72 @@ impl AstPhpProcessor {
             }
             "function_exists" => {
                 let name = args.first().map_or(String::new(), |a| a.as_string());
-                let is_builtin = matches!(name.as_str(),
-                    "echo" | "print" | "isset" | "empty" | "exit" | "die" |
-                    "strlen" | "strtolower" | "strtoupper" | "trim" | "substr" |
-                    "str_replace" | "str_contains" | "explode" | "implode" |
-                    "count" | "array_keys" | "array_values" | "in_array" |
-                    "json_encode" | "json_decode" | "date" | "time" |
-                    "file_exists" | "is_file" | "is_dir" | "is_readable" | "readfile" |
-                    "header" | "http_response_code" | "var_dump" | "print_r" |
-                    "parse_url" | "basename" | "dirname" | "pathinfo" | "realpath" |
-                    "rtrim" | "ltrim" | "file_get_contents" | "filesize" |
-                    "error_log" | "trigger_error" | "preg_match" | "strpos" | "stripos" |
-                    "is_array" | "is_string" | "is_numeric" | "is_int" | "is_bool" |
-                    "is_scalar" | "is_null" | "is_float" | "gettype" | "file_put_contents"
+                let is_builtin = matches!(
+                    name.as_str(),
+                    "echo"
+                        | "print"
+                        | "isset"
+                        | "empty"
+                        | "exit"
+                        | "die"
+                        | "strlen"
+                        | "strtolower"
+                        | "strtoupper"
+                        | "trim"
+                        | "substr"
+                        | "str_replace"
+                        | "str_contains"
+                        | "explode"
+                        | "implode"
+                        | "count"
+                        | "array_keys"
+                        | "array_values"
+                        | "in_array"
+                        | "json_encode"
+                        | "json_decode"
+                        | "date"
+                        | "time"
+                        | "file_exists"
+                        | "is_file"
+                        | "is_dir"
+                        | "is_readable"
+                        | "readfile"
+                        | "header"
+                        | "http_response_code"
+                        | "var_dump"
+                        | "print_r"
+                        | "parse_url"
+                        | "basename"
+                        | "dirname"
+                        | "pathinfo"
+                        | "realpath"
+                        | "rtrim"
+                        | "ltrim"
+                        | "file_get_contents"
+                        | "filesize"
+                        | "error_log"
+                        | "trigger_error"
+                        | "preg_match"
+                        | "strpos"
+                        | "stripos"
+                        | "is_array"
+                        | "is_string"
+                        | "is_numeric"
+                        | "is_int"
+                        | "is_bool"
+                        | "is_scalar"
+                        | "is_null"
+                        | "is_float"
+                        | "gettype"
+                        | "file_put_contents"
+                        | "http_request"
+                        | "ruph_session_start"
+                        | "ruph_session_destroy"
+                        | "ruph_session_id"
                 );
-                Ok(PhpValue::Bool(is_builtin || self.user_functions.contains_key(&name)))
+                Ok(PhpValue::Bool(
+                    is_builtin || self.user_functions.contains_key(&name),
+                ))
             }
             "print_r" => {
                 let val = args.first().unwrap_or(&PhpValue::Null);
@@ -2863,13 +3379,14 @@ impl AstPhpProcessor {
                 let name = args.first().map_or(String::new(), |a| a.as_string());
                 let value = args.get(1).map_or(String::new(), |a| a.as_string());
                 let cookie = format!("{}={}", name, value);
-                self.response_headers.insert("Set-Cookie".to_string(), cookie);
+                self.add_response_header("set-cookie", cookie);
                 Ok(PhpValue::Bool(true))
             }
-            "session_start" | "session_destroy" | "session_id" => {
-                // Stub — sessions not yet implemented
-                Ok(PhpValue::Bool(true))
-            }
+            "ruph_session_start" => self.ruph_session_start(&args).await,
+            "ruph_session_destroy" => self.ruph_session_destroy().await,
+            "ruph_session_id" => Ok(PhpValue::String(
+                self.session_id.clone().unwrap_or_default(),
+            )),
             // unset() is handled specially before arg evaluation (see above)
             // This fallback handles edge cases where it arrives as a regular call
             "unset" => Ok(PhpValue::Null),
@@ -2920,23 +3437,40 @@ impl AstPhpProcessor {
                     .trim_start_matches("ssl://")
                     .trim_start_matches("tcp://");
                 let (host, port_str) = if let Some(colon) = host_port.rfind(':') {
-                    (host_port[..colon].to_string(), host_port[colon+1..].to_string())
+                    (
+                        host_port[..colon].to_string(),
+                        host_port[colon + 1..].to_string(),
+                    )
                 } else {
-                    (host_port.to_string(), if is_ssl { "443".to_string() } else { "80".to_string() })
+                    (
+                        host_port.to_string(),
+                        if is_ssl {
+                            "443".to_string()
+                        } else {
+                            "80".to_string()
+                        },
+                    )
                 };
                 let port: u16 = port_str.parse().unwrap_or(if is_ssl { 443 } else { 80 });
                 let timeout_secs = args.get(3).map_or(30u64, |a| a.as_int().max(1) as u64);
 
                 let connect_result = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
-                    self.connect_tls(&host, port)
-                ).await;
+                    self.connect_tls(&host, port),
+                )
+                .await;
 
                 match connect_result {
                     Ok(Ok(tls_stream)) => {
                         let id = self.next_stream_id;
                         self.next_stream_id += 1;
-                        self.streams.insert(id, PhpTlsStream { stream: tls_stream, eof: false });
+                        self.streams.insert(
+                            id,
+                            PhpTlsStream {
+                                stream: tls_stream,
+                                eof: false,
+                            },
+                        );
                         Ok(PhpValue::Resource(id))
                     }
                     Ok(Err(e)) => {
@@ -2954,9 +3488,15 @@ impl AstPhpProcessor {
                 Ok(PhpValue::Bool(true))
             }
             "fwrite" => {
-                let handle = if let Some(PhpValue::Resource(id)) = args.first() { *id } else { 0 };
+                let handle = if let Some(PhpValue::Resource(id)) = args.first() {
+                    *id
+                } else {
+                    0
+                };
                 let data = args.get(1).map_or(String::new(), |a| a.as_string());
-                if handle == 0 { return Ok(PhpValue::Bool(false)); }
+                if handle == 0 {
+                    return Ok(PhpValue::Bool(false));
+                }
                 if let Some(mut php_stream) = self.streams.remove(&handle) {
                     let bytes = data.into_bytes();
                     let len = bytes.len() as i64;
@@ -2974,9 +3514,17 @@ impl AstPhpProcessor {
                 }
             }
             "fread" => {
-                let handle = if let Some(PhpValue::Resource(id)) = args.first() { *id } else { 0 };
-                let length = args.get(1).map_or(8192usize, |a| a.as_int().max(1) as usize);
-                if handle == 0 { return Ok(PhpValue::Bool(false)); }
+                let handle = if let Some(PhpValue::Resource(id)) = args.first() {
+                    *id
+                } else {
+                    0
+                };
+                let length = args
+                    .get(1)
+                    .map_or(8192usize, |a| a.as_int().max(1) as usize);
+                if handle == 0 {
+                    return Ok(PhpValue::Bool(false));
+                }
                 if let Some(mut php_stream) = self.streams.remove(&handle) {
                     let result = if php_stream.eof {
                         Ok(PhpValue::String(String::new()))
@@ -2985,15 +3533,17 @@ impl AstPhpProcessor {
                         // Short timeout simulates non-blocking read (PHP stream_set_blocking false)
                         match tokio::time::timeout(
                             std::time::Duration::from_millis(10),
-                            php_stream.stream.read(&mut buf)
-                        ).await {
+                            php_stream.stream.read(&mut buf),
+                        )
+                        .await
+                        {
                             Ok(Ok(0)) => {
                                 php_stream.eof = true;
                                 Ok(PhpValue::String(String::new()))
                             }
-                            Ok(Ok(n)) => {
-                                Ok(PhpValue::String(String::from_utf8_lossy(&buf[..n]).into_owned()))
-                            }
+                            Ok(Ok(n)) => Ok(PhpValue::String(
+                                String::from_utf8_lossy(&buf[..n]).into_owned(),
+                            )),
                             Ok(Err(e)) => {
                                 self.log_error(&format!("fread error: {}", e));
                                 php_stream.eof = true;
@@ -3012,24 +3562,41 @@ impl AstPhpProcessor {
                 }
             }
             "feof" => {
-                let handle = if let Some(PhpValue::Resource(id)) = args.first() { *id } else { 0 };
-                if handle == 0 { return Ok(PhpValue::Bool(true)); }
+                let handle = if let Some(PhpValue::Resource(id)) = args.first() {
+                    *id
+                } else {
+                    0
+                };
+                if handle == 0 {
+                    return Ok(PhpValue::Bool(true));
+                }
                 let eof = self.streams.get(&handle).map_or(true, |s| s.eof);
                 Ok(PhpValue::Bool(eof))
             }
             "fclose" => {
-                let handle = if let Some(PhpValue::Resource(id)) = args.first() { *id } else { 0 };
+                let handle = if let Some(PhpValue::Resource(id)) = args.first() {
+                    *id
+                } else {
+                    0
+                };
                 self.streams.remove(&handle);
                 Ok(PhpValue::Bool(true))
             }
             "php_uname" => Ok(PhpValue::String(std::env::consts::OS.to_string())),
             "php_sapi_name" => Ok(PhpValue::String("ruph-ast".to_string())),
             "ini_get" | "ini_set" => Ok(PhpValue::String(String::new())),
-            "__DIR__" | "__FILE__" => {
-                Ok(PhpValue::String(self.current_template_path.as_ref()
-                    .and_then(|p| if func_name == "__DIR__" { p.parent().map(|pp| pp.to_path_buf()) } else { Some(p.clone()) })
-                    .map_or(String::new(), |p| p.to_string_lossy().to_string())))
-            }
+            "__DIR__" | "__FILE__" => Ok(PhpValue::String(
+                self.current_template_path
+                    .as_ref()
+                    .and_then(|p| {
+                        if func_name == "__DIR__" {
+                            p.parent().map(|pp| pp.to_path_buf())
+                        } else {
+                            Some(p.clone())
+                        }
+                    })
+                    .map_or(String::new(), |p| p.to_string_lossy().to_string()),
+            )),
 
             // ── User-defined function call ──────────────────────────────
             _ => {
@@ -3039,7 +3606,9 @@ impl AstPhpProcessor {
                     let saved_script_returned = self.script_returned.take();
                     let saved_body_override = self.response_body_override.take();
                     for (i, (param_name, default)) in user_func.params.iter().enumerate() {
-                        let value = args.get(i).cloned()
+                        let value = args
+                            .get(i)
+                            .cloned()
                             .or_else(|| default.clone())
                             .unwrap_or(PhpValue::Null);
                         self.variables.insert(param_name.clone(), value);
@@ -3100,7 +3669,186 @@ impl AstPhpProcessor {
         self.included_files.clear();
         self.output_buffers.clear();
         self.side_effect_output = None;
+        self.session_id = None;
+        self.session_destroyed = false;
+        self.session_lock = None;
         // Preserve user_functions and constants across requests (like opcache)
+    }
+
+    fn parse_cookie_header(server_vars: &HashMap<String, String>) -> HashMap<String, String> {
+        let mut cookies = HashMap::new();
+        let Some(raw) = server_vars.get("HTTP_COOKIE") else {
+            return cookies;
+        };
+
+        for pair in raw.split(';') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let value = urlencoding::decode(value.trim())
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| value.trim().to_string());
+            cookies.insert(name.to_string(), value);
+        }
+
+        cookies
+    }
+
+    fn add_response_header(&mut self, name: &str, value: String) {
+        let name = name.trim().to_ascii_lowercase();
+        if name == "set-cookie" {
+            if !self.response_headers.contains_key("set-cookie") {
+                self.response_headers
+                    .insert("set-cookie".to_string(), value);
+                return;
+            }
+
+            let mut idx = 2;
+            loop {
+                let key = format!("set-cookie-{}", idx);
+                if !self.response_headers.contains_key(&key) {
+                    self.response_headers.insert(key, value);
+                    return;
+                }
+                idx += 1;
+            }
+        }
+
+        self.response_headers.insert(name, value);
+    }
+
+    fn is_valid_session_id(id: &str) -> bool {
+        !id.is_empty()
+            && id.len() <= 128
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    }
+
+    fn session_file_path(id: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join("ruph_sessions")
+            .join(format!("sess_{}", id))
+    }
+
+    async fn acquire_session_lock(id: &str) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = SESSION_LOCKS
+                .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap();
+            locks
+                .entry(id.to_string())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
+    async fn ruph_session_start(&mut self, args: &[PhpValue]) -> Result<PhpValue> {
+        let Some(PhpValue::String(id)) = args.first() else {
+            self.log_error("ruph_session_start() requires a string session id");
+            return Ok(PhpValue::Bool(false));
+        };
+        if !Self::is_valid_session_id(id) {
+            self.log_error("ruph_session_start() received an invalid session id");
+            return Ok(PhpValue::Bool(false));
+        }
+
+        if self.session_id.as_deref() == Some(id) && self.session_lock.is_some() {
+            self.add_response_header(
+                "set-cookie",
+                format!("RUPHSESSID={}; Path=/; HttpOnly; SameSite=Lax", id),
+            );
+            return Ok(PhpValue::Bool(true));
+        }
+
+        self.finalize_session().await;
+        self.session_lock = None;
+        self.session_lock = Some(Self::acquire_session_lock(id).await);
+
+        let path = Self::session_file_path(id);
+        let mut session = HashMap::new();
+        if let Ok(raw) = fs::read_to_string(&path).await {
+            match serde_json::from_str::<HashMap<String, String>>(&raw) {
+                Ok(values) => session = values,
+                Err(e) => self.log_error(&format!("Failed to parse ruph session {}: {}", id, e)),
+            }
+        }
+
+        self.session_id = Some(id.clone());
+        self.session_destroyed = false;
+        self.superglobals.insert("_SESSION".to_string(), session);
+        self.add_response_header(
+            "set-cookie",
+            format!("RUPHSESSID={}; Path=/; HttpOnly; SameSite=Lax", id),
+        );
+        Ok(PhpValue::Bool(true))
+    }
+
+    async fn ruph_session_destroy(&mut self) -> Result<PhpValue> {
+        if let Some(id) = self.session_id.clone() {
+            let path = Self::session_file_path(&id);
+            if let Err(e) = fs::remove_file(&path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    self.log_error(&format!("Failed to remove ruph session {}: {}", id, e));
+                    return Ok(PhpValue::Bool(false));
+                }
+            }
+        }
+
+        self.session_destroyed = true;
+        self.superglobals
+            .insert("_SESSION".to_string(), HashMap::new());
+        self.add_response_header(
+            "set-cookie",
+            "RUPHSESSID=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax".to_string(),
+        );
+        self.session_lock = None;
+        Ok(PhpValue::Bool(true))
+    }
+
+    async fn finalize_session(&mut self) {
+        let Some(id) = self.session_id.clone() else {
+            self.session_lock = None;
+            return;
+        };
+        if self.session_destroyed {
+            self.session_lock = None;
+            return;
+        }
+
+        let path = Self::session_file_path(&id);
+        if let Some(parent) = path.parent() {
+            if let Err(e) = fs::create_dir_all(parent).await {
+                self.log_error(&format!("Failed to create ruph session directory: {}", e));
+                self.session_lock = None;
+                return;
+            }
+        }
+
+        let session = self
+            .superglobals
+            .get("_SESSION")
+            .cloned()
+            .unwrap_or_default();
+        match serde_json::to_string(&session) {
+            Ok(raw) => {
+                if let Err(e) = fs::write(&path, raw).await {
+                    self.log_error(&format!("Failed to write ruph session {}: {}", id, e));
+                }
+            }
+            Err(e) => self.log_error(&format!("Failed to serialize ruph session {}: {}", id, e)),
+        }
+        self.session_lock = None;
     }
 
     /// Execute a chain of PHP scripts as a single request context.
@@ -3119,12 +3867,19 @@ impl AstPhpProcessor {
         root_dir: &Path,
         error_handler: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     ) -> Result<PhpExecution> {
-        let first = controllers.first()
+        let first = controllers
+            .first()
             .map(|(p, sv)| (p, sv))
             .or_else(|| leaf.map(|(p, sv)| (p, sv)));
 
         let Some((first_path, first_sv)) = first else {
-            return Ok(PhpExecution { body: String::new(), status: 200, headers: HashMap::new(), exited: false, returned: None });
+            return Ok(PhpExecution {
+                body: String::new(),
+                status: 200,
+                headers: HashMap::new(),
+                exited: false,
+                returned: None,
+            });
         };
 
         // Single reset for the entire request chain
@@ -3132,9 +3887,16 @@ impl AstPhpProcessor {
         self.error_log_handler = error_handler;
         self.accumulated_output.clear();
 
-        self.superglobals.insert("_GET".to_string(), get_params.clone());
-        self.superglobals.insert("_POST".to_string(), post_params.clone());
-        self.superglobals.insert("_SERVER".to_string(), first_sv.clone());
+        self.superglobals
+            .insert("_GET".to_string(), get_params.clone());
+        self.superglobals
+            .insert("_POST".to_string(), post_params.clone());
+        self.superglobals
+            .insert("_SERVER".to_string(), first_sv.clone());
+        self.superglobals
+            .insert("_COOKIE".to_string(), Self::parse_cookie_header(first_sv));
+        self.superglobals
+            .insert("_SESSION".to_string(), HashMap::new());
         let mut req_params = get_params.clone();
         req_params.extend(post_params.clone());
         self.superglobals.insert("_REQUEST".to_string(), req_params);
@@ -3147,13 +3909,15 @@ impl AstPhpProcessor {
         // ── Controllers ──────────────────────────────────────────────────────
         for (script_path, server_vars) in controllers {
             self.current_template_path = Some(script_path.clone());
-            self.superglobals.insert("_SERVER".to_string(), server_vars.clone());
+            self.superglobals
+                .insert("_SERVER".to_string(), server_vars.clone());
             // Clear per-script signals; preserve variables/constants/headers/status
             self.script_returned = None;
             self.script_return_value = None;
             self.response_body_override = None;
 
-            let content = fs::read_to_string(script_path).await
+            let content = fs::read_to_string(script_path)
+                .await
                 .map_err(|e| anyhow!("Cannot read {:?}: {}", script_path, e))?;
 
             let mut script_output = String::new();
@@ -3189,12 +3953,14 @@ impl AstPhpProcessor {
         if !chain_stopped {
             if let Some((leaf_path, leaf_sv)) = leaf {
                 self.current_template_path = Some(leaf_path.clone());
-                self.superglobals.insert("_SERVER".to_string(), leaf_sv.clone());
+                self.superglobals
+                    .insert("_SERVER".to_string(), leaf_sv.clone());
                 self.script_returned = None;
                 self.script_return_value = None;
                 self.response_body_override = None;
 
-                let content = fs::read_to_string(leaf_path).await
+                let content = fs::read_to_string(leaf_path)
+                    .await
                     .map_err(|e| anyhow!("Cannot read {:?}: {}", leaf_path, e))?;
 
                 let mut leaf_output = String::new();
@@ -3235,11 +4001,14 @@ impl AstPhpProcessor {
             self.response_body_override.clone().unwrap_or(total_output)
         };
 
-        let status = if self.response_status == 200 && self.response_headers.contains_key("location") {
-            302
-        } else {
-            self.response_status
-        };
+        let status =
+            if self.response_status == 200 && self.response_headers.contains_key("location") {
+                302
+            } else {
+                self.response_status
+            };
+
+        self.finalize_session().await;
 
         Ok(PhpExecution {
             body,
@@ -3278,7 +4047,8 @@ impl AstPhpProcessor {
         root_dir: &Path,
     ) -> Result<()> {
         self.reset_request_state(template_path, root_dir);
-        self.superglobals.insert("_SERVER".to_string(), server_vars.clone());
+        self.superglobals
+            .insert("_SERVER".to_string(), server_vars.clone());
 
         let mut output = String::new();
         self.process_php_code(php_code, &mut output).await?;
@@ -3292,7 +4062,8 @@ impl AstPhpProcessor {
         data: Option<&PhpValue>,
     ) -> Result<Option<String>> {
         let path = self.resolve_local_path(&template.as_string())?;
-        let content = fs::read_to_string(&path).await
+        let content = fs::read_to_string(&path)
+            .await
             .map_err(|_| anyhow!("Cannot read template"))?;
 
         let previous_source = self.source_code.clone();
@@ -3310,8 +4081,21 @@ impl AstPhpProcessor {
         Ok(Some(output))
     }
 
-    async fn fetch_content(&mut self, target: &PhpValue, headers: Option<&PhpValue>) -> Result<PhpValue> {
+    async fn fetch_content(
+        &mut self,
+        target: &PhpValue,
+        headers: Option<&PhpValue>,
+    ) -> Result<PhpValue> {
         let target = target.as_string();
+        if target == "php://input" {
+            let body = self
+                .superglobals
+                .get("_SERVER")
+                .and_then(|server| server.get("RUPH_RAW_BODY"))
+                .cloned()
+                .unwrap_or_default();
+            return Ok(PhpValue::String(body));
+        }
         if target.starts_with("http://") || target.starts_with("https://") {
             let mut request = self.http_client.get(&target);
             if let Some(headers) = headers {
@@ -3319,17 +4103,26 @@ impl AstPhpProcessor {
                     request = request.header(name, value);
                 }
             }
-            let response = request.send().await
+            let response = request
+                .send()
+                .await
                 .map_err(|e| anyhow!("HTTP request failed: {}", e))?;
-            let bytes = response.bytes().await
+            let bytes = response
+                .bytes()
+                .await
                 .map_err(|e| anyhow!("Failed to read response: {}", e))?;
-            return Ok(PhpValue::String(String::from_utf8_lossy(&bytes).to_string()));
+            return Ok(PhpValue::String(
+                String::from_utf8_lossy(&bytes).to_string(),
+            ));
         }
 
         let path = self.resolve_local_path(&target)?;
-        let bytes = fs::read(&path).await
+        let bytes = fs::read(&path)
+            .await
             .map_err(|_| anyhow!("Cannot read file"))?;
-        Ok(PhpValue::String(String::from_utf8_lossy(&bytes).to_string()))
+        Ok(PhpValue::String(
+            String::from_utf8_lossy(&bytes).to_string(),
+        ))
     }
 
     async fn http_request(
@@ -3339,8 +4132,7 @@ impl AstPhpProcessor {
         headers: Option<&PhpValue>,
         body: &str,
     ) -> Result<PhpValue> {
-        let method = reqwest::Method::from_bytes(method.as_bytes())
-            .unwrap_or(reqwest::Method::GET);
+        let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
         let mut request = self.http_client.request(method, url);
         if let Some(headers) = headers {
             for (name, value) in self.extract_headers(headers) {
@@ -3350,21 +4142,32 @@ impl AstPhpProcessor {
         if !body.is_empty() {
             request = request.body(body.to_string());
         }
-        let response = request.send().await
+        let response = request
+            .send()
+            .await
             .map_err(|e| anyhow!("HTTP request failed: {}", e))?;
-        let bytes = response.bytes().await
+        let bytes = response
+            .bytes()
+            .await
             .map_err(|e| anyhow!("Failed to read response: {}", e))?;
-        Ok(PhpValue::String(String::from_utf8_lossy(&bytes).to_string()))
+        Ok(PhpValue::String(
+            String::from_utf8_lossy(&bytes).to_string(),
+        ))
     }
 
     fn resolve_local_path(&self, target: &str) -> Result<PathBuf> {
-        let root_dir = self.root_dir.as_ref().ok_or_else(|| anyhow!("Root dir not set"))?;
-        let base_dir = self.current_template_path
+        let root_dir = self
+            .root_dir
+            .as_ref()
+            .ok_or_else(|| anyhow!("Root dir not set"))?;
+        let base_dir = self
+            .current_template_path
             .as_ref()
             .and_then(|p| p.parent())
             .unwrap_or(root_dir);
 
-        let canonical_root = root_dir.canonicalize()
+        let canonical_root = root_dir
+            .canonicalize()
             .map_err(|_| anyhow!("Cannot canonicalize root dir"))?;
 
         let raw_path = if target.starts_with('/') {
@@ -3388,7 +4191,8 @@ impl AstPhpProcessor {
             base_dir.join(target)
         };
 
-        let canonical_path = raw_path.canonicalize()
+        let canonical_path = raw_path
+            .canonicalize()
             .map_err(|_| anyhow!("Cannot resolve path: {}", raw_path.display()))?;
 
         if !canonical_path.starts_with(&canonical_root) {
@@ -3400,7 +4204,7 @@ impl AstPhpProcessor {
 
     fn apply_header_block(&mut self, headers: &PhpValue) {
         for (name, value) in self.extract_headers(headers) {
-            self.response_headers.insert(name, value);
+            self.add_response_header(&name, value);
         }
     }
 
@@ -3446,15 +4250,18 @@ impl AstPhpProcessor {
                     if let Some(obj) = json.as_object() {
                         for (key, value) in obj {
                             if let Some(value) = value.as_str() {
-                                self.variables.insert(key.clone(), PhpValue::String(value.to_string()));
+                                self.variables
+                                    .insert(key.clone(), PhpValue::String(value.to_string()));
                             } else {
-                                self.variables.insert(key.clone(), PhpValue::String(value.to_string()));
+                                self.variables
+                                    .insert(key.clone(), PhpValue::String(value.to_string()));
                             }
                         }
                         return;
                     }
                 }
-                self.variables.insert("data".to_string(), PhpValue::String(json.clone()));
+                self.variables
+                    .insert("data".to_string(), PhpValue::String(json.clone()));
             }
             _ => {
                 self.variables.insert("data".to_string(), data.clone());
@@ -3474,23 +4281,35 @@ impl AstPhpProcessor {
     }
 
     /// Handle preg_match() and preg_match_all() — writes captures into the 3rd argument variable.
-    async fn call_preg_match_family(&mut self, func_name: &str, args_node: Option<Node<'_>>) -> Result<PhpValue> {
+    async fn call_preg_match_family(
+        &mut self,
+        func_name: &str,
+        args_node: Option<Node<'_>>,
+    ) -> Result<PhpValue> {
         // Collect argument nodes
         let mut arg_nodes: Vec<Node> = Vec::new();
         if let Some(an) = args_node {
             for child in an.named_children(&mut an.walk()) {
-                let n = if child.kind() == "argument" { child.named_child(0).unwrap_or(child) } else { child };
+                let n = if child.kind() == "argument" {
+                    child.named_child(0).unwrap_or(child)
+                } else {
+                    child
+                };
                 arg_nodes.push(n);
             }
         }
 
         let pattern = if let Some(n) = arg_nodes.first() {
             self.evaluate_expression(*n).await?.as_string()
-        } else { return Ok(PhpValue::Int(0)); };
+        } else {
+            return Ok(PhpValue::Int(0));
+        };
 
         let subject = if let Some(n) = arg_nodes.get(1) {
             self.evaluate_expression(*n).await?.as_string()
-        } else { return Ok(PhpValue::Int(0)); };
+        } else {
+            return Ok(PhpValue::Int(0));
+        };
 
         let re_str = build_regex_with_flags(&pattern);
         let re = match Regex::new(&re_str) {
@@ -3510,15 +4329,24 @@ impl AstPhpProcessor {
             let mut groups: Vec<Vec<String>> = vec![Vec::new(); num_groups];
             for cap in re.captures_iter(&subject) {
                 for i in 0..num_groups {
-                    groups[i].push(cap.get(i).map(|m| m.as_str().to_string()).unwrap_or_default());
+                    groups[i].push(
+                        cap.get(i)
+                            .map(|m| m.as_str().to_string())
+                            .unwrap_or_default(),
+                    );
                 }
             }
             let count = groups.first().map(|g| g.len()).unwrap_or(0);
             if let Some(var) = captures_var {
-                let outer: Vec<PhpArrayItem> = groups.into_iter()
-                    .map(|g| PhpArrayItem::Value(PhpValue::Array(
-                        g.into_iter().map(|s| PhpArrayItem::Value(PhpValue::String(s))).collect()
-                    )))
+                let outer: Vec<PhpArrayItem> = groups
+                    .into_iter()
+                    .map(|g| {
+                        PhpArrayItem::Value(PhpValue::Array(
+                            g.into_iter()
+                                .map(|s| PhpArrayItem::Value(PhpValue::String(s)))
+                                .collect(),
+                        ))
+                    })
                     .collect();
                 self.variables.insert(var, PhpValue::Array(outer));
             }
@@ -3529,9 +4357,13 @@ impl AstPhpProcessor {
                 Some(caps) => {
                     if let Some(var) = captures_var {
                         let items: Vec<PhpArrayItem> = (0..caps.len())
-                            .map(|i| PhpArrayItem::Value(PhpValue::String(
-                                caps.get(i).map(|m| m.as_str().to_string()).unwrap_or_default()
-                            )))
+                            .map(|i| {
+                                PhpArrayItem::Value(PhpValue::String(
+                                    caps.get(i)
+                                        .map(|m| m.as_str().to_string())
+                                        .unwrap_or_default(),
+                                ))
+                            })
                             .collect();
                         self.variables.insert(var, PhpValue::Array(items));
                     }
@@ -3548,7 +4380,11 @@ impl AstPhpProcessor {
     }
 
     /// Open a TLS client connection to host:port
-    async fn connect_tls(&self, host: &str, port: u16) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    async fn connect_tls(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let config = rustls::ClientConfig::builder()
@@ -3557,9 +4393,12 @@ impl AstPhpProcessor {
         let connector = TlsConnector::from(Arc::new(config));
         let server_name = ServerName::try_from(host.to_string())
             .map_err(|e| anyhow!("Invalid TLS server name '{}': {}", host, e))?;
-        let tcp = TcpStream::connect((host, port)).await
+        let tcp = TcpStream::connect((host, port))
+            .await
             .map_err(|e| anyhow!("TCP connect to {}:{} failed: {}", host, port, e))?;
-        let tls = connector.connect(server_name, tcp).await
+        let tls = connector
+            .connect(server_name, tcp)
+            .await
             .map_err(|e| anyhow!("TLS handshake with {}:{} failed: {}", host, port, e))?;
         Ok(tls)
     }
@@ -3568,16 +4407,22 @@ impl AstPhpProcessor {
         self.side_effect_output.take()
     }
 
-    async fn include_file(&mut self, target: &str, once: bool) -> Result<(String, Option<PhpValue>)> {
+    async fn include_file(
+        &mut self,
+        target: &str,
+        once: bool,
+    ) -> Result<(String, Option<PhpValue>)> {
         let path = self.resolve_local_path(target)?;
-        let canonical = path.canonicalize()
+        let canonical = path
+            .canonicalize()
             .map_err(|_| anyhow!("Cannot resolve include path"))?;
 
         if once && self.included_files.contains(&canonical) {
             return Ok((String::new(), None));
         }
 
-        let content = fs::read_to_string(&canonical).await
+        let content = fs::read_to_string(&canonical)
+            .await
             .map_err(|_| anyhow!("Cannot read include file"))?;
 
         let previous_source = self.source_code.clone();
@@ -3614,14 +4459,17 @@ impl AstPhpProcessor {
 /// Converts PHP flags i/s/m/x to Rust inline group (?ism).
 fn build_regex_with_flags(input: &str) -> String {
     let s = input.trim();
-    if s.len() < 2 { return s.to_string(); }
+    if s.len() < 2 {
+        return s.to_string();
+    }
     let delim = s.as_bytes()[0];
     if !matches!(delim, b'/' | b'#' | b'~' | b'|' | b'@' | b'!') {
         return s.to_string();
     }
     if let Some(end_pos) = s[1..].rfind(delim as char) {
         let pattern = &s[1..end_pos + 1];
-        let flags: String = s[end_pos + 2..].chars()
+        let flags: String = s[end_pos + 2..]
+            .chars()
             .filter(|c| matches!(c, 'i' | 's' | 'm' | 'x'))
             .collect();
         if flags.is_empty() {
@@ -3638,47 +4486,56 @@ fn build_regex_with_flags(input: &str) -> String {
 fn html_entity_decode_basic(s: &str) -> String {
     let mut out = s.to_string();
     // Named entities
-    out = out.replace("&amp;", "&")
-             .replace("&lt;", "<")
-             .replace("&gt;", ">")
-             .replace("&quot;", "\"")
-             .replace("&apos;", "'")
-             .replace("&nbsp;", "\u{00A0}")
-             .replace("&mdash;", "—")
-             .replace("&ndash;", "–")
-             .replace("&laquo;", "«")
-             .replace("&raquo;", "»")
-             .replace("&hellip;", "…")
-             .replace("&copy;", "©")
-             .replace("&reg;", "®")
-             .replace("&trade;", "™");
+    out = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", "\u{00A0}")
+        .replace("&mdash;", "—")
+        .replace("&ndash;", "–")
+        .replace("&laquo;", "«")
+        .replace("&raquo;", "»")
+        .replace("&hellip;", "…")
+        .replace("&copy;", "©")
+        .replace("&reg;", "®")
+        .replace("&trade;", "™");
     // Numeric decimal: &#123;
     if let Ok(re) = Regex::new(r"&#(\d+);") {
-        out = re.replace_all(&out, |caps: &regex::Captures| {
-            caps[1].parse::<u32>()
-                .ok()
-                .and_then(char::from_u32)
-                .map(|c| c.to_string())
-                .unwrap_or_default()
-        }).to_string();
+        out = re
+            .replace_all(&out, |caps: &regex::Captures| {
+                caps[1]
+                    .parse::<u32>()
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map(|c| c.to_string())
+                    .unwrap_or_default()
+            })
+            .to_string();
     }
     // Numeric hex: &#x1F;
     if let Ok(re) = Regex::new(r"(?i)&#x([0-9a-f]+);") {
-        out = re.replace_all(&out, |caps: &regex::Captures| {
-            u32::from_str_radix(&caps[1], 16)
-                .ok()
-                .and_then(char::from_u32)
-                .map(|c| c.to_string())
-                .unwrap_or_default()
-        }).to_string();
+        out = re
+            .replace_all(&out, |caps: &regex::Captures| {
+                u32::from_str_radix(&caps[1], 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map(|c| c.to_string())
+                    .unwrap_or_default()
+            })
+            .to_string();
     }
     out
 }
 
 // Strip PHP regex delimiters: /pattern/flags -> (pattern, flags)
+#[allow(dead_code)]
 fn strip_php_regex_delimiters(input: &str) -> (String, String) {
     let s = input.trim();
-    if s.len() < 2 { return (s.to_string(), String::new()); }
+    if s.len() < 2 {
+        return (s.to_string(), String::new());
+    }
     let delim = s.as_bytes()[0];
     // Common PHP delimiters: / # ~ |
     if !matches!(delim, b'/' | b'#' | b'~' | b'|' | b'@' | b'!') {
@@ -3697,28 +4554,43 @@ fn strip_php_regex_delimiters(input: &str) -> (String, String) {
 fn php_value_to_json(val: &PhpValue) -> String {
     match val {
         PhpValue::Null => "null".to_string(),
-        PhpValue::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
+        PhpValue::Bool(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
         PhpValue::Int(n) => n.to_string(),
         PhpValue::Float(f) => f.to_string(),
         PhpValue::String(s) => serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s)),
         PhpValue::Array(items) => {
             // Determine if this is an associative array or a list
-            let is_assoc = items.iter().any(|i| matches!(i, PhpArrayItem::KeyValue(_, _)));
+            let is_assoc = items
+                .iter()
+                .any(|i| matches!(i, PhpArrayItem::KeyValue(_, _)));
             if is_assoc {
-                let pairs: Vec<String> = items.iter().enumerate().map(|(i, item)| {
-                    match item {
-                        PhpArrayItem::KeyValue(k, v) => format!("{}:{}", serde_json::to_string(k).unwrap_or_default(), php_value_to_json(v)),
+                let pairs: Vec<String> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, item)| match item {
+                        PhpArrayItem::KeyValue(k, v) => format!(
+                            "{}:{}",
+                            serde_json::to_string(k).unwrap_or_default(),
+                            php_value_to_json(v)
+                        ),
                         PhpArrayItem::Value(v) => format!("\"{}\":{}", i, php_value_to_json(v)),
-                    }
-                }).collect();
+                    })
+                    .collect();
                 format!("{{{}}}", pairs.join(","))
             } else {
-                let values: Vec<String> = items.iter().map(|item| {
-                    match item {
+                let values: Vec<String> = items
+                    .iter()
+                    .map(|item| match item {
                         PhpArrayItem::KeyValue(_, v) => php_value_to_json(v),
                         PhpArrayItem::Value(v) => php_value_to_json(v),
-                    }
-                }).collect();
+                    })
+                    .collect();
                 format!("[{}]", values.join(","))
             }
         }
@@ -3732,19 +4604,25 @@ fn json_to_php_value(json: &serde_json::Value, assoc: bool) -> PhpValue {
         serde_json::Value::Null => PhpValue::Null,
         serde_json::Value::Bool(b) => PhpValue::Bool(*b),
         serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() { PhpValue::Int(i) }
-            else if let Some(f) = n.as_f64() { PhpValue::Float(f) }
-            else { PhpValue::String(n.to_string()) }
+            if let Some(i) = n.as_i64() {
+                PhpValue::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                PhpValue::Float(f)
+            } else {
+                PhpValue::String(n.to_string())
+            }
         }
         serde_json::Value::String(s) => PhpValue::String(s.clone()),
         serde_json::Value::Array(arr) => {
-            let items: Vec<PhpArrayItem> = arr.iter()
+            let items: Vec<PhpArrayItem> = arr
+                .iter()
                 .map(|v| PhpArrayItem::Value(json_to_php_value(v, assoc)))
                 .collect();
             PhpValue::Array(items)
         }
         serde_json::Value::Object(obj) => {
-            let items: Vec<PhpArrayItem> = obj.iter()
+            let items: Vec<PhpArrayItem> = obj
+                .iter()
                 .map(|(k, v)| PhpArrayItem::KeyValue(k.clone(), json_to_php_value(v, assoc)))
                 .collect();
             PhpValue::Array(items)
@@ -3758,7 +4636,10 @@ fn md5_hash(data: &[u8]) -> u128 {
     // For now return a hash derived from the data
     let mut hash: u128 = 0;
     for (i, &byte) in data.iter().enumerate() {
-        hash = hash.wrapping_mul(31).wrapping_add(byte as u128).wrapping_add(i as u128);
+        hash = hash
+            .wrapping_mul(31)
+            .wrapping_add(byte as u128)
+            .wrapping_add(i as u128);
     }
     hash
 }
@@ -3771,7 +4652,8 @@ fn parse_header_block(headers: &str) -> Vec<(String, String)> {
             if line.is_empty() {
                 return None;
             }
-            line.split_once(':').map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+            line.split_once(':')
+                .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
         })
         .collect()
 }
@@ -3822,9 +4704,19 @@ impl PhpValue {
             PhpValue::String(value) => value.clone(),
             PhpValue::Int(n) => n.to_string(),
             PhpValue::Float(f) => {
-                if f.fract() == 0.0 { format!("{:.0}", f) } else { f.to_string() }
+                if f.fract() == 0.0 {
+                    format!("{:.0}", f)
+                } else {
+                    f.to_string()
+                }
             }
-            PhpValue::Bool(b) => if *b { "1".to_string() } else { String::new() },
+            PhpValue::Bool(b) => {
+                if *b {
+                    "1".to_string()
+                } else {
+                    String::new()
+                }
+            }
             PhpValue::Array(_) => "Array".to_string(),
             PhpValue::Null => String::new(),
             PhpValue::Resource(id) => format!("Resource id #{}", id),
@@ -3840,10 +4732,22 @@ impl PhpValue {
         match self {
             PhpValue::Int(n) => *n,
             PhpValue::Float(f) => *f as i64,
-            PhpValue::Bool(b) => if *b { 1 } else { 0 },
+            PhpValue::Bool(b) => {
+                if *b {
+                    1
+                } else {
+                    0
+                }
+            }
             PhpValue::String(s) => s.parse::<i64>().unwrap_or(0),
             PhpValue::Null => 0,
-            PhpValue::Array(items) => if items.is_empty() { 0 } else { 1 },
+            PhpValue::Array(items) => {
+                if items.is_empty() {
+                    0
+                } else {
+                    1
+                }
+            }
             PhpValue::Resource(id) => *id as i64,
         }
     }
@@ -3852,10 +4756,22 @@ impl PhpValue {
         match self {
             PhpValue::Float(f) => *f,
             PhpValue::Int(n) => *n as f64,
-            PhpValue::Bool(b) => if *b { 1.0 } else { 0.0 },
+            PhpValue::Bool(b) => {
+                if *b {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
             PhpValue::String(s) => s.parse::<f64>().unwrap_or(0.0),
             PhpValue::Null => 0.0,
-            PhpValue::Array(items) => if items.is_empty() { 0.0 } else { 1.0 },
+            PhpValue::Array(items) => {
+                if items.is_empty() {
+                    0.0
+                } else {
+                    1.0
+                }
+            }
             PhpValue::Resource(id) => *id as f64,
         }
     }
@@ -3892,15 +4808,21 @@ impl PhpValue {
     pub fn loose_eq(&self, other: &PhpValue) -> bool {
         match (self, other) {
             (PhpValue::Null, PhpValue::Null) => true,
-            (PhpValue::Null, PhpValue::Bool(false)) | (PhpValue::Bool(false), PhpValue::Null) => true,
-            (PhpValue::Null, PhpValue::String(s)) | (PhpValue::String(s), PhpValue::Null) => s.is_empty(),
+            (PhpValue::Null, PhpValue::Bool(false)) | (PhpValue::Bool(false), PhpValue::Null) => {
+                true
+            }
+            (PhpValue::Null, PhpValue::String(s)) | (PhpValue::String(s), PhpValue::Null) => {
+                s.is_empty()
+            }
             (PhpValue::Null, PhpValue::Int(0)) | (PhpValue::Int(0), PhpValue::Null) => true,
             (PhpValue::Null, _) | (_, PhpValue::Null) => false,
             (PhpValue::Bool(a), _) => *a == other.is_truthy(),
             (_, PhpValue::Bool(b)) => self.is_truthy() == *b,
             (PhpValue::Int(a), PhpValue::Int(b)) => a == b,
             (PhpValue::Float(a), PhpValue::Float(b)) => a == b,
-            (PhpValue::Int(a), PhpValue::Float(b)) | (PhpValue::Float(b), PhpValue::Int(a)) => (*a as f64) == *b,
+            (PhpValue::Int(a), PhpValue::Float(b)) | (PhpValue::Float(b), PhpValue::Int(a)) => {
+                (*a as f64) == *b
+            }
             (PhpValue::String(a), PhpValue::String(b)) => {
                 // If both parse as numbers, compare numerically
                 if let (Ok(an), Ok(bn)) = (a.parse::<f64>(), b.parse::<f64>()) {
@@ -3952,7 +4874,9 @@ impl PhpValue {
             }
             for item in items {
                 if let PhpArrayItem::KeyValue(k, v) = item {
-                    if k == key { return v.clone(); }
+                    if k == key {
+                        return v.clone();
+                    }
                 }
             }
         }
@@ -4032,14 +4956,17 @@ mod tests {
         let template_path = temp_dir.path().join("_index.php");
         write(&template_path, php_code).await.unwrap();
 
-        let result = processor.execute_php(
-            php_code,
-            &get_params,
-            &post_params,
-            &server_vars,
-            &template_path,
-            temp_dir.path(),
-        ).await.unwrap();
+        let result = processor
+            .execute_php(
+                php_code,
+                &get_params,
+                &post_params,
+                &server_vars,
+                &template_path,
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
         assert!(result.body.contains("Hello from AST PHP!"));
     }
 
@@ -4056,14 +4983,17 @@ mod tests {
         let template_path = temp_dir.path().join("_index.php");
         write(&template_path, php_code).await.unwrap();
 
-        let result = processor.execute_php(
-            php_code,
-            &get_params,
-            &post_params,
-            &server_vars,
-            &template_path,
-            temp_dir.path(),
-        ).await.unwrap();
+        let result = processor
+            .execute_php(
+                php_code,
+                &get_params,
+                &post_params,
+                &server_vars,
+                &template_path,
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
         assert!(result.body.contains("Welcome to My Site"));
     }
 
@@ -4082,14 +5012,17 @@ mod tests {
         let template_path = temp_dir.path().join("_index.php");
         write(&template_path, php_code).await.unwrap();
 
-        let result = processor.execute_php(
-            php_code,
-            &get_params,
-            &post_params,
-            &server_vars,
-            &template_path,
-            temp_dir.path(),
-        ).await.unwrap();
+        let result = processor
+            .execute_php(
+                php_code,
+                &get_params,
+                &post_params,
+                &server_vars,
+                &template_path,
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
         assert!(result.body.contains("Hello, Alice"));
     }
 
@@ -4101,7 +5034,10 @@ mod tests {
         let get_params = HashMap::new();
         let post_params = HashMap::new();
         let mut server_vars = HashMap::new();
-        server_vars.insert("HTTP_REFERER".to_string(), "https://example.com".to_string());
+        server_vars.insert(
+            "HTTP_REFERER".to_string(),
+            "https://example.com".to_string(),
+        );
 
         let php_code = r#"<?php
 error_log("referer: {$_SERVER['HTTP_REFERER']}");
@@ -4120,25 +5056,151 @@ echo 'hi';
             logged_clone.lock().unwrap().push(msg.to_string());
         });
 
-        let result = processor.execute_php_with_handler(
-            php_code,
-            &get_params,
-            &post_params,
-            &server_vars,
-            &template_path,
-            temp_dir.path(),
-            Some(handler),
-        ).await.unwrap();
+        let result = processor
+            .execute_php_with_handler(
+                php_code,
+                &get_params,
+                &post_params,
+                &server_vars,
+                &template_path,
+                temp_dir.path(),
+                Some(handler),
+            )
+            .await
+            .unwrap();
 
         let messages = logged.lock().unwrap();
         eprintln!("Logged messages: {:?}", messages);
         eprintln!("Output body: {:?}", result.body);
         eprintln!("Returned: {:?}", result.returned);
         eprintln!("Exited: {:?}", result.exited);
-        assert_eq!(messages.len(), 3, "Expected 3 log messages, got {}: {:?}", messages.len(), *messages);
+        assert_eq!(
+            messages.len(),
+            3,
+            "Expected 3 log messages, got {}: {:?}",
+            messages.len(),
+            *messages
+        );
         assert!(messages[0].contains("referer"));
         assert!(messages[1].contains("asdfds"));
         assert!(messages[2].contains("fsdfsd"));
         assert!(result.body.contains("hi"), "Body was: {:?}", result.body);
+    }
+
+    #[tokio::test]
+    async fn test_ast_cookie_superglobal() {
+        let mut processor = AstPhpProcessor::new().unwrap();
+        let get_params = HashMap::new();
+        let post_params = HashMap::new();
+        let mut server_vars = HashMap::new();
+        server_vars.insert(
+            "HTTP_COOKIE".to_string(),
+            "foo=bar%20baz; theme=dark".to_string(),
+        );
+
+        let php_code = r#"<?php echo $_COOKIE['foo'] . ':' . $_COOKIE['theme']; ?>"#;
+        let temp_dir = TempDir::new().unwrap();
+        let template_path = temp_dir.path().join("_index.php");
+        write(&template_path, php_code).await.unwrap();
+
+        let result = processor
+            .execute_php(
+                php_code,
+                &get_params,
+                &post_params,
+                &server_vars,
+                &template_path,
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.body, "bar baz:dark");
+    }
+
+    #[tokio::test]
+    async fn test_ruph_session_persists_session_superglobal() {
+        let session_id = format!("test_{}_ast_session", std::process::id());
+        let session_path = AstPhpProcessor::session_file_path(&session_id);
+        let _ = std::fs::remove_file(&session_path);
+
+        let get_params = HashMap::new();
+        let post_params = HashMap::new();
+        let server_vars = HashMap::new();
+        let temp_dir = TempDir::new().unwrap();
+        let template_path = temp_dir.path().join("_index.php");
+
+        let php_code = format!(
+            r#"<?php ruph_session_start("{}"); $_SESSION['name'] = 'Alice'; echo ruph_session_id(); ?>"#,
+            session_id
+        );
+        write(&template_path, &php_code).await.unwrap();
+
+        let mut writer = AstPhpProcessor::new().unwrap();
+        let result = writer
+            .execute_php(
+                &php_code,
+                &get_params,
+                &post_params,
+                &server_vars,
+                &template_path,
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.body, session_id);
+        assert!(result
+            .headers
+            .get("set-cookie")
+            .unwrap()
+            .contains("RUPHSESSID="));
+
+        let php_code = format!(
+            r#"<?php ruph_session_start("{}"); echo $_SESSION['name']; ?>"#,
+            session_id
+        );
+        write(&template_path, &php_code).await.unwrap();
+
+        let mut reader = AstPhpProcessor::new().unwrap();
+        let result = reader
+            .execute_php(
+                &php_code,
+                &get_params,
+                &post_params,
+                &server_vars,
+                &template_path,
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.body, "Alice");
+
+        let _ = std::fs::remove_file(&session_path);
+    }
+
+    #[tokio::test]
+    async fn test_ast_multiple_set_cookie_headers_are_preserved() {
+        let mut processor = AstPhpProcessor::new().unwrap();
+        let get_params = HashMap::new();
+        let post_params = HashMap::new();
+        let server_vars = HashMap::new();
+
+        let php_code = r#"<?php setcookie('a', '1'); setcookie('b', '2'); ?>"#;
+        let temp_dir = TempDir::new().unwrap();
+        let template_path = temp_dir.path().join("_index.php");
+        write(&template_path, php_code).await.unwrap();
+
+        let result = processor
+            .execute_php(
+                php_code,
+                &get_params,
+                &post_params,
+                &server_vars,
+                &template_path,
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.headers.get("set-cookie"), Some(&"a=1".to_string()));
+        assert_eq!(result.headers.get("set-cookie-2"), Some(&"b=2".to_string()));
     }
 }

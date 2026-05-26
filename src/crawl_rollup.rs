@@ -64,40 +64,108 @@ pub struct IpInfo {
 // ── Crawler identification (mirrors PHP identify_crawler) ──────────────────
 
 fn identify_crawler(ua_lower: &str) -> &'static str {
-    if ua_lower.contains("googlebot") { return "Googlebot"; }
-    if ua_lower.contains("bingbot") { return "Bingbot"; }
-    if ua_lower.contains("gptbot") { return "GPTBot"; }
-    if ua_lower.contains("claudebot") { return "ClaudeBot"; }
-    if ua_lower.contains("chatgpt") { return "ChatGPT"; }
-    if ua_lower.contains("bytespider") { return "ByteSpider"; }
-    if ua_lower.contains("ahref") { return "AhrefsBot"; }
-    if ua_lower.contains("semrush") { return "SemrushBot"; }
-    if ua_lower.contains("yandex") { return "YandexBot"; }
-    if ua_lower.contains("baidu") { return "Baiduspider"; }
-    if ua_lower.contains("petalbot") { return "PetalBot"; }
-    if ua_lower.contains("applebot") { return "Applebot"; }
-    if ua_lower.contains("facebookexternalhit") { return "Facebook"; }
-    if ua_lower.contains("duckduckbot") { return "DuckDuckBot"; }
-    if ua_lower.contains("ccbot") { return "CCBot"; }
-    if ua_lower.contains("linkedinbot") { return "LinkedIn"; }
-    if ua_lower.contains("twitterbot") { return "Twitter"; }
-    if ua_lower.contains("python") { return "Python"; }
-    if ua_lower.contains("curl") { return "curl"; }
-    if ua_lower.contains("wget") { return "wget"; }
-    if ua_lower.contains("go-http") { return "Go-HTTP"; }
-    if ua_lower.contains("scrapy") { return "Scrapy"; }
-    if ua_lower.contains("zgrab") { return "ZGrab"; }
-    if ua_lower.contains("masscan") { return "Masscan"; }
-    if ua_lower.contains("censys") { return "Censys"; }
-    if ua_lower.contains("shodan") { return "Shodan"; }
-    if ua_lower.contains("nuclei") { return "Nuclei"; }
-    if ua_lower.contains("nikto") { return "Nikto"; }
-    if ua_lower.contains("java/") { return "Java Client"; }
-    if ua_lower.contains("okhttp") { return "OkHttp"; }
-    if ua_lower.contains("httpclient") { return "HTTPClient"; }
-    if ua_lower.contains("bot") { return "Other Bot"; }
-    if ua_lower.contains("crawl") { return "Other Crawler"; }
-    if ua_lower.contains("spider") { return "Other Spider"; }
+    if ua_lower.contains("googlebot") {
+        return "Googlebot";
+    }
+    if ua_lower.contains("bingbot") {
+        return "Bingbot";
+    }
+    if ua_lower.contains("gptbot") {
+        return "GPTBot";
+    }
+    if ua_lower.contains("claudebot") {
+        return "ClaudeBot";
+    }
+    if ua_lower.contains("chatgpt") {
+        return "ChatGPT";
+    }
+    if ua_lower.contains("bytespider") {
+        return "ByteSpider";
+    }
+    if ua_lower.contains("ahref") {
+        return "AhrefsBot";
+    }
+    if ua_lower.contains("semrush") {
+        return "SemrushBot";
+    }
+    if ua_lower.contains("yandex") {
+        return "YandexBot";
+    }
+    if ua_lower.contains("baidu") {
+        return "Baiduspider";
+    }
+    if ua_lower.contains("petalbot") {
+        return "PetalBot";
+    }
+    if ua_lower.contains("applebot") {
+        return "Applebot";
+    }
+    if ua_lower.contains("facebookexternalhit") {
+        return "Facebook";
+    }
+    if ua_lower.contains("duckduckbot") {
+        return "DuckDuckBot";
+    }
+    if ua_lower.contains("ccbot") {
+        return "CCBot";
+    }
+    if ua_lower.contains("linkedinbot") {
+        return "LinkedIn";
+    }
+    if ua_lower.contains("twitterbot") {
+        return "Twitter";
+    }
+    if ua_lower.contains("python") {
+        return "Python";
+    }
+    if ua_lower.contains("curl") {
+        return "curl";
+    }
+    if ua_lower.contains("wget") {
+        return "wget";
+    }
+    if ua_lower.contains("go-http") {
+        return "Go-HTTP";
+    }
+    if ua_lower.contains("scrapy") {
+        return "Scrapy";
+    }
+    if ua_lower.contains("zgrab") {
+        return "ZGrab";
+    }
+    if ua_lower.contains("masscan") {
+        return "Masscan";
+    }
+    if ua_lower.contains("censys") {
+        return "Censys";
+    }
+    if ua_lower.contains("shodan") {
+        return "Shodan";
+    }
+    if ua_lower.contains("nuclei") {
+        return "Nuclei";
+    }
+    if ua_lower.contains("nikto") {
+        return "Nikto";
+    }
+    if ua_lower.contains("java/") {
+        return "Java Client";
+    }
+    if ua_lower.contains("okhttp") {
+        return "OkHttp";
+    }
+    if ua_lower.contains("httpclient") {
+        return "HTTPClient";
+    }
+    if ua_lower.contains("bot") {
+        return "Other Bot";
+    }
+    if ua_lower.contains("crawl") {
+        return "Other Crawler";
+    }
+    if ua_lower.contains("spider") {
+        return "Other Spider";
+    }
     "Human"
 }
 
@@ -190,7 +258,10 @@ fn rollup_hour(crawl_dir: &str, agg_dir: &str, date: &str, hour: &str) -> Result
     std::fs::write(&tmp_path, &json)?;
     std::fs::rename(&tmp_path, &agg_path)?;
 
-    debug!("Rolled up {}/{}: {} requests, {} IPs", date, hour, agg.total, agg.unique_ips);
+    debug!(
+        "Rolled up {}/{}: {} requests, {} IPs",
+        date, hour, agg.total, agg.unique_ips
+    );
     Ok(true)
 }
 
@@ -258,7 +329,10 @@ fn rollup_daily(agg_dir: &str, date: &str) -> Result<bool> {
     std::fs::write(&tmp_path, &json)?;
     std::fs::rename(&tmp_path, &daily_path)?;
 
-    info!("Daily rollup {}: {} requests, {} IPs", date, daily.total, daily.unique_ips);
+    info!(
+        "Daily rollup {}: {} requests, {} IPs",
+        date, daily.total, daily.unique_ips
+    );
     Ok(true)
 }
 
@@ -283,10 +357,16 @@ fn save_ip_cache(path: &str, cache: &HashMap<String, IpInfo>) -> Result<()> {
 
 /// Look up an IP via ip-api.com (free, no key, 45 req/min).
 async fn lookup_ip(client: &reqwest::Client, ip: &str) -> Option<IpInfo> {
-    let url = format!("http://ip-api.com/json/{}?fields=status,country,city,isp,org,as,query", ip);
-    let resp = client.get(&url)
+    let url = format!(
+        "http://ip-api.com/json/{}?fields=status,country,city,isp,org,as,query",
+        ip
+    );
+    let resp = client
+        .get(&url)
         .timeout(Duration::from_secs(10))
-        .send().await.ok()?;
+        .send()
+        .await
+        .ok()?;
     let json: serde_json::Value = resp.json().await.ok()?;
 
     if json.get("status")?.as_str()? != "success" {
@@ -294,18 +374,33 @@ async fn lookup_ip(client: &reqwest::Client, ip: &str) -> Option<IpInfo> {
     }
 
     Some(IpInfo {
-        asn: json.get("as").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        org: json.get("org").and_then(|v| v.as_str())
+        asn: json
+            .get("as")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        org: json
+            .get("org")
+            .and_then(|v| v.as_str())
             .or_else(|| json.get("isp").and_then(|v| v.as_str()))
             .map(|s| s.to_string()),
-        country: json.get("country").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        city: json.get("city").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        country: json
+            .get("country")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        city: json
+            .get("city")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         network: None,
     })
 }
 
 /// Batch-enrich IPs: look up top IPs by request count that aren't in cache.
-async fn enrich_ips(agg_dir: &str, date: &str, cache: &mut HashMap<String, IpInfo>) -> Result<usize> {
+async fn enrich_ips(
+    agg_dir: &str,
+    date: &str,
+    cache: &mut HashMap<String, IpInfo>,
+) -> Result<usize> {
     // Collect all IPs from today's hourly files
     let mut all_ips: HashMap<String, u64> = HashMap::new();
     for h in 0..24 {
@@ -327,7 +422,8 @@ async fn enrich_ips(agg_dir: &str, date: &str, cache: &mut HashMap<String, IpInf
     let mut ip_list: Vec<(String, u64)> = all_ips.into_iter().collect();
     ip_list.sort_by(|a, b| b.1.cmp(&a.1));
 
-    let unknown: Vec<String> = ip_list.iter()
+    let unknown: Vec<String> = ip_list
+        .iter()
         .filter(|(ip, _)| !cache.contains_key(ip) && !ip.is_empty())
         .take(100)
         .map(|(ip, _)| ip.clone())
@@ -430,7 +526,9 @@ pub async fn crawl_rollup_task(log_dir: String) {
                 let agg_dir = agg_dir.clone();
                 let today = today.clone();
                 move || rollup_hour(&crawl_dir, &agg_dir, &today, &hh)
-            }).await {
+            })
+            .await
+            {
                 Ok(Ok(true)) => {}
                 Ok(Ok(false)) => {} // already done or no data
                 Ok(Err(e)) => warn!("Rollup {}/{:02}: {}", today, h, e),
@@ -439,7 +537,9 @@ pub async fn crawl_rollup_task(log_dir: String) {
         }
 
         // Yesterday: all hours + daily
-        let yesterday = (now - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+        let yesterday = (now - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
         for h in 0..24u32 {
             let hh = format!("{:02}", h);
             let cd = crawl_dir.clone();
@@ -477,8 +577,12 @@ pub async fn ip_enrichment_task(log_dir: String) {
 
         match enrich_ips(&agg_dir, &today, &mut cache).await {
             Ok(n) if n > 0 => {
-                info!("IP enrichment: looked up {} new IPs (cache: {} -> {})",
-                    n, cache_size_before, cache.len());
+                info!(
+                    "IP enrichment: looked up {} new IPs (cache: {} -> {})",
+                    n,
+                    cache_size_before,
+                    cache.len()
+                );
                 if let Err(e) = save_ip_cache(&cache_path, &cache) {
                     warn!("Failed to save IP cache: {}", e);
                 }

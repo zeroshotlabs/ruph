@@ -31,6 +31,9 @@ configparser = "3.0"
 tempfile = "3.0"
 rusqlite = { version = "0.31", features = ["bundled"] }
 webpki-roots = "0.26"
+simple-dns = "0.9"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
 
 # PHP parsing
 tree-sitter = "0.25"

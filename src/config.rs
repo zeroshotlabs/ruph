@@ -4,10 +4,10 @@
 //! [php.*], [http.*], [https.<domain>], [ssl]
 //! CLI arguments override config file values.
 
+use anyhow::{anyhow, Result};
+use configparser::ini::Ini;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use anyhow::{Result, anyhow};
-use configparser::ini::Ini;
 
 /// PHP processor selection mode
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +93,14 @@ pub struct Config {
     pub trailhead_domain_owners: HashMap<String, String>,
     /// Prefix -> trailhead owner
     pub trailhead_prefix_owners: Vec<(String, String)>,
+
+    // [acme] — embedded DNS-01 ACME challenge
+    /// Zone the embedded DNS server is authoritative for (e.g., "auth.example.com")
+    pub acme_zone: Option<String>,
+    /// Default ACME account email
+    pub acme_email: Option<String>,
+    /// UDP bind address for the embedded DNS server (default "0.0.0.0:53")
+    pub acme_dns_bind: Option<String>,
 }
 
 impl Default for Config {
@@ -107,7 +115,11 @@ impl Default for Config {
             http_docroot: None,
             domain_roots: HashMap::new(),
             prefix_roots: Vec::new(),
-            index_files: vec!["_index.php".to_string(), "index.html".to_string(), "index.htm".to_string()],
+            index_files: vec![
+                "_index.php".to_string(),
+                "index.html".to_string(),
+                "index.htm".to_string(),
+            ],
             default_access_log: None,
             domain_access_logs: HashMap::new(),
             prefix_access_logs: Vec::new(),
@@ -125,6 +137,9 @@ impl Default for Config {
             trailhead_default_owner: None,
             trailhead_domain_owners: HashMap::new(),
             trailhead_prefix_owners: Vec::new(),
+            acme_zone: None,
+            acme_email: None,
+            acme_dns_bind: None,
         }
     }
 }
@@ -134,8 +149,11 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let mut ini = Ini::new();
         ini.set_comment_symbols(&[';', '#']);
-        ini.load(path.to_str().ok_or_else(|| anyhow!("Invalid config path"))?)
-            .map_err(|e| anyhow!("Failed to read config {}: {}", path.display(), e))?;
+        ini.load(
+            path.to_str()
+                .ok_or_else(|| anyhow!("Invalid config path"))?,
+        )
+        .map_err(|e| anyhow!("Failed to read config {}: {}", path.display(), e))?;
 
         eprintln!("  config: {}", path.display());
 
@@ -149,7 +167,10 @@ impl Config {
             config.log_console = parse_bool(&v);
         }
         // access_log (preferred) or logs (legacy alias)
-        if let Some(v) = ini.get("server", "access_log").or_else(|| ini.get("server", "logs")) {
+        if let Some(v) = ini
+            .get("server", "access_log")
+            .or_else(|| ini.get("server", "logs"))
+        {
             let v = v.trim().to_string();
             if !v.is_empty() {
                 config.default_access_log = Some(v);
@@ -162,7 +183,11 @@ impl Config {
             }
         }
         if let Some(v) = ini.get("server", "index_files") {
-            config.index_files = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            config.index_files = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
         if let Some(v) = ini.get("server", "docroot") {
             if !v.is_empty() {
@@ -172,7 +197,11 @@ impl Config {
         if let Some(v) = ini.get("server", "status_page") {
             let v = v.trim().to_string();
             if !v.is_empty() {
-                config.status_page = Some(if v.starts_with('/') { v } else { format!("/{}", v) });
+                config.status_page = Some(if v.starts_with('/') {
+                    v
+                } else {
+                    format!("/{}", v)
+                });
             }
         }
         if let Some(v) = ini.get("server", "rate_window") {
@@ -230,7 +259,9 @@ impl Config {
                 config.bind = v;
             }
             // support "listen" + "port" aliases (proxee INI style)
-            if let (Some(listen), Some(port)) = (ini.get("server", "listen"), ini.get("server", "port")) {
+            if let (Some(listen), Some(port)) =
+                (ini.get("server", "listen"), ini.get("server", "port"))
+            {
                 if !listen.is_empty() {
                     config.bind = format!("{}:{}", listen, port);
                 }
@@ -250,7 +281,11 @@ impl Config {
         }
 
         // ── [php.*] or [php] ──
-        let php_section = if ini.get("php.*", "processor").is_some() { "php.*" } else { "php" };
+        let php_section = if ini.get("php.*", "processor").is_some() {
+            "php.*"
+        } else {
+            "php"
+        };
         if let Some(v) = ini.get(php_section, "processor") {
             if v.trim().eq_ignore_ascii_case("libphp") {
                 return Err(anyhow!(
@@ -269,6 +304,26 @@ impl Config {
         if let Some(v) = ini.get("ssl", "dir") {
             if !v.is_empty() {
                 config.ssl_dir = Some(v);
+            }
+        }
+
+        // ── [acme] — embedded DNS-01 ACME challenge ──
+        if let Some(v) = ini.get("acme", "zone") {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                config.acme_zone = Some(v);
+            }
+        }
+        if let Some(v) = ini.get("acme", "email") {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                config.acme_email = Some(v);
+            }
+        }
+        if let Some(v) = ini.get("acme", "dns_bind") {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                config.acme_dns_bind = Some(v);
             }
         }
 
@@ -301,7 +356,8 @@ impl Config {
                 // Supports comma-separated: [https.a.com,https.b.com]
                 if section_name.starts_with("https.") || section_name.contains(",https.") {
                     let docroot = ini.get(section_name, "docroot");
-                    let access_log = ini.get(section_name, "access_log")
+                    let access_log = ini
+                        .get(section_name, "access_log")
                         .or_else(|| ini.get(section_name, "logs"));
                     let error_log = ini.get(section_name, "error_log");
                     let th_owner = ini.get(section_name, "trailhead_owner");
@@ -317,9 +373,13 @@ impl Config {
                                 let v = v.trim();
                                 if !v.is_empty() {
                                     if has_dot {
-                                        config.domain_roots.insert(pattern.to_string(), v.to_string());
+                                        config
+                                            .domain_roots
+                                            .insert(pattern.to_string(), v.to_string());
                                     } else {
-                                        config.prefix_roots.push((pattern.to_string(), v.to_string()));
+                                        config
+                                            .prefix_roots
+                                            .push((pattern.to_string(), v.to_string()));
                                     }
                                 }
                             }
@@ -327,9 +387,13 @@ impl Config {
                                 let v = v.trim();
                                 if !v.is_empty() {
                                     if has_dot {
-                                        config.domain_access_logs.insert(pattern.to_string(), v.to_string());
+                                        config
+                                            .domain_access_logs
+                                            .insert(pattern.to_string(), v.to_string());
                                     } else {
-                                        config.prefix_access_logs.push((pattern.to_string(), v.to_string()));
+                                        config
+                                            .prefix_access_logs
+                                            .push((pattern.to_string(), v.to_string()));
                                     }
                                 }
                             }
@@ -337,9 +401,13 @@ impl Config {
                                 let v = v.trim();
                                 if !v.is_empty() {
                                     if has_dot {
-                                        config.domain_error_logs.insert(pattern.to_string(), v.to_string());
+                                        config
+                                            .domain_error_logs
+                                            .insert(pattern.to_string(), v.to_string());
                                     } else {
-                                        config.prefix_error_logs.push((pattern.to_string(), v.to_string()));
+                                        config
+                                            .prefix_error_logs
+                                            .push((pattern.to_string(), v.to_string()));
                                     }
                                 }
                             }
@@ -347,9 +415,13 @@ impl Config {
                                 let v = v.trim();
                                 if !v.is_empty() {
                                     if has_dot {
-                                        config.trailhead_domain_owners.insert(pattern.to_string(), v.to_string());
+                                        config
+                                            .trailhead_domain_owners
+                                            .insert(pattern.to_string(), v.to_string());
                                     } else {
-                                        config.trailhead_prefix_owners.push((pattern.to_string(), v.to_string()));
+                                        config
+                                            .trailhead_prefix_owners
+                                            .push((pattern.to_string(), v.to_string()));
                                     }
                                 }
                             }
@@ -374,21 +446,30 @@ impl Config {
                         if let Some(path) = value {
                             let path = path.trim();
                             if !path.is_empty() && !domain.is_empty() {
-                                config.domain_roots.insert(domain.to_string(), path.to_string());
+                                config
+                                    .domain_roots
+                                    .insert(domain.to_string(), path.to_string());
                             }
                         }
-                    } else if let Some(domain) = key.strip_prefix("access_log.").or_else(|| key.strip_prefix("logs.")) {
+                    } else if let Some(domain) = key
+                        .strip_prefix("access_log.")
+                        .or_else(|| key.strip_prefix("logs."))
+                    {
                         if let Some(path) = value {
                             let path = path.trim();
                             if !path.is_empty() && !domain.is_empty() {
-                                config.domain_access_logs.insert(domain.to_string(), path.to_string());
+                                config
+                                    .domain_access_logs
+                                    .insert(domain.to_string(), path.to_string());
                             }
                         }
                     } else if let Some(domain) = key.strip_prefix("error_log.") {
                         if let Some(path) = value {
                             let path = path.trim();
                             if !path.is_empty() && !domain.is_empty() {
-                                config.domain_error_logs.insert(domain.to_string(), path.to_string());
+                                config
+                                    .domain_error_logs
+                                    .insert(domain.to_string(), path.to_string());
                             }
                         }
                     }
@@ -397,30 +478,45 @@ impl Config {
             // Old-style [http] docroot / http_docroot / index_files / logs / error_log
             if config.docroot.is_none() {
                 if let Some(v) = ini.get("http", "docroot") {
-                    if !v.is_empty() { config.docroot = Some(v); }
+                    if !v.is_empty() {
+                        config.docroot = Some(v);
+                    }
                 }
             }
             if config.http_docroot.is_none() {
                 if let Some(v) = ini.get("http", "http_docroot") {
                     let v = v.trim().to_string();
-                    if !v.is_empty() { config.http_docroot = Some(v); }
+                    if !v.is_empty() {
+                        config.http_docroot = Some(v);
+                    }
                 }
             }
             if ini.get("server", "index_files").is_none() {
                 if let Some(v) = ini.get("http", "index_files") {
-                    config.index_files = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                    config.index_files = v
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
                 }
             }
             if config.default_access_log.is_none() {
-                if let Some(v) = ini.get("http", "access_log").or_else(|| ini.get("http", "logs")) {
+                if let Some(v) = ini
+                    .get("http", "access_log")
+                    .or_else(|| ini.get("http", "logs"))
+                {
                     let v = v.trim().to_string();
-                    if !v.is_empty() { config.default_access_log = Some(v); }
+                    if !v.is_empty() {
+                        config.default_access_log = Some(v);
+                    }
                 }
             }
             if config.default_error_log.is_none() {
                 if let Some(v) = ini.get("http", "error_log") {
                     let v = v.trim().to_string();
-                    if !v.is_empty() { config.default_error_log = Some(v); }
+                    if !v.is_empty() {
+                        config.default_error_log = Some(v);
+                    }
                 }
             }
         }
@@ -436,10 +532,15 @@ impl Config {
             // Current directory
             Some(PathBuf::from("ruph.ini")),
             // Home directory
-            std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".ruph").join("ruph.ini")),
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".ruph").join("ruph.ini")),
             // /etc
             Some(PathBuf::from("/etc/ruph/ruph.ini")),
-        ].into_iter().flatten().collect();
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
 
         for path in candidates {
             if path.exists() {
@@ -451,5 +552,8 @@ impl Config {
 }
 
 fn parse_bool(s: &str) -> bool {
-    matches!(s.trim().to_lowercase().as_str(), "true" | "yes" | "on" | "1")
+    matches!(
+        s.trim().to_lowercase().as_str(),
+        "true" | "yes" | "on" | "1"
+    )
 }

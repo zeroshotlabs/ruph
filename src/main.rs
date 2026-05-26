@@ -1,29 +1,31 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use hyper::header::{HeaderValue, HOST};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tracing::{error, info, warn};
 use hyper::service::service_fn;
 use hyper::{body::Incoming as IncomingBody, Request, Response, StatusCode};
-use std::convert::Infallible;
-use tokio::net::TcpListener;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::TcpListener;
+use tracing::{error, info, warn};
 
+mod acme;
+mod acme_state;
 mod ast_php_processor;
+mod config;
+mod crawl_rollup;
+mod dns_server;
 mod embedded_php_processor;
 mod php_processor;
-mod web_server;
-mod config;
-mod ssl;
-mod acme;
-mod status;
-mod crawl_rollup;
 mod request_log;
+mod ssl;
+mod status;
 mod trailhead_client;
+mod web_server;
 
-use crate::web_server::{WebServer, RuphBody};
+use crate::web_server::{RuphBody, WebServer};
 
 type ResponseBody = RuphBody;
 
@@ -94,8 +96,12 @@ impl DomainLogger {
         }
 
         Ok(DomainLogger {
-            default, files, prefix_files: prefix_files_vec,
-            err_default, err_files, err_prefix_files: err_prefix_files_vec,
+            default,
+            files,
+            prefix_files: prefix_files_vec,
+            err_default,
+            err_files,
+            err_prefix_files: err_prefix_files_vec,
         })
     }
 
@@ -123,8 +129,7 @@ impl DomainLogger {
         for (prefix, mutex) in prefix_files {
             if prefix.len() > best_len
                 && bare.starts_with(prefix.as_str())
-                && (bare.len() == prefix.len()
-                    || bare.as_bytes().get(prefix.len()) == Some(&b'.'))
+                && (bare.len() == prefix.len() || bare.as_bytes().get(prefix.len()) == Some(&b'.'))
             {
                 best = Some(mutex);
                 best_len = prefix.len();
@@ -158,27 +163,91 @@ impl DomainLogger {
         let formatted = format!("{} PHP: {}", now.format("%H:%M:%S"), line);
 
         // If any error log is configured, use the error log chain
-        if self.err_default.is_some() || !self.err_files.is_empty() || !self.err_prefix_files.is_empty() {
-            Self::write_to(domain, &formatted, &self.err_files, &self.err_prefix_files, &self.err_default);
+        if self.err_default.is_some()
+            || !self.err_files.is_empty()
+            || !self.err_prefix_files.is_empty()
+        {
+            Self::write_to(
+                domain,
+                &formatted,
+                &self.err_files,
+                &self.err_prefix_files,
+                &self.err_default,
+            );
         } else {
             // Fallback: write to request log (previous behavior)
             self.log(domain, &formatted);
         }
     }
 
-    fn log_request(&self, domain: &str, remote_addr: &SocketAddr, method: &hyper::Method, uri: &hyper::Uri, status: u16, is_tls: bool, redirect_to: Option<&str>) {
+    fn log_request(
+        &self,
+        domain: &str,
+        remote_addr: &SocketAddr,
+        method: &hyper::Method,
+        uri: &hyper::Uri,
+        status: u16,
+        is_tls: bool,
+        redirect_to: Option<&str>,
+    ) {
         let now = chrono::Local::now();
-        let level = if status >= 500 { "ERROR" } else if status >= 400 { " WARN" } else { " INFO" };
-        let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
+        let level = if status >= 500 {
+            "ERROR"
+        } else if status >= 400 {
+            " WARN"
+        } else {
+            " INFO"
+        };
+        let path = uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or(uri.path());
         let proto = if is_tls { "S" } else { "-" };
-        let redir = redirect_to.map(|r| format!(" -> {}", r)).unwrap_or_default();
-        self.log(domain, &format!("{} {} [{}] {} [{}] {} {} {}{}", now.format("%H:%M:%S"), level, status, proto, domain, remote_addr, method, path, redir));
+        let redir = redirect_to
+            .map(|r| format!(" -> {}", r))
+            .unwrap_or_default();
+        self.log(
+            domain,
+            &format!(
+                "{} {} [{}] {} [{}] {} {} {}{}",
+                now.format("%H:%M:%S"),
+                level,
+                status,
+                proto,
+                domain,
+                remote_addr,
+                method,
+                path,
+                redir
+            ),
+        );
     }
 
-    fn log_error(&self, domain: &str, remote_addr: &SocketAddr, method: &hyper::Method, uri: &hyper::Uri, err: &str) {
+    fn log_error(
+        &self,
+        domain: &str,
+        remote_addr: &SocketAddr,
+        method: &hyper::Method,
+        uri: &hyper::Uri,
+        err: &str,
+    ) {
         let now = chrono::Local::now();
-        let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
-        self.log(domain, &format!("{} ERROR [{}] {} {} {} - {}", now.format("%H:%M:%S"), domain, remote_addr, method, path, err));
+        let path = uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or(uri.path());
+        self.log(
+            domain,
+            &format!(
+                "{} ERROR [{}] {} {} {} - {}",
+                now.format("%H:%M:%S"),
+                domain,
+                remote_addr,
+                method,
+                path,
+                err
+            ),
+        );
     }
 }
 
@@ -258,21 +327,23 @@ async fn main() -> Result<()> {
     }
 
     let domain_logger = Arc::new(DomainLogger::new(
-        &cfg.default_access_log, &cfg.domain_access_logs, &cfg.prefix_access_logs,
-        &cfg.default_error_log, &cfg.domain_error_logs, &cfg.prefix_error_logs,
+        &cfg.default_access_log,
+        &cfg.domain_access_logs,
+        &cfg.prefix_access_logs,
+        &cfg.default_error_log,
+        &cfg.domain_error_logs,
+        &cfg.prefix_error_logs,
     )?);
 
     // Full request logging to SQLite
     let request_logger: Option<Arc<request_log::RequestLogger>> = match &cfg.log_full {
-        Some(path) => {
-            match request_log::RequestLogger::open(std::path::Path::new(path)) {
-                Ok(rl) => Some(Arc::new(rl)),
-                Err(e) => {
-                    eprintln!("  log_full: FAILED to open {}: {}", path, e);
-                    None
-                }
+        Some(path) => match request_log::RequestLogger::open(std::path::Path::new(path)) {
+            Ok(rl) => Some(Arc::new(rl)),
+            Err(e) => {
+                eprintln!("  log_full: FAILED to open {}: {}", path, e);
+                None
             }
-        }
+        },
         None => None,
     };
 
@@ -315,13 +386,46 @@ async fn main() -> Result<()> {
     }
 
     if let Some(spec) = &cli.new_cert {
-        let parts: Vec<&str> = spec.split(",").collect();
-        if parts.len() != 2 {
-            return Err(anyhow!("--new-cert must be email@domain,example.com"));
-        }
-        let email = parts[0].trim();
-        let domain = parts[1].trim();
-        acme::issue_cert(email, domain, &ssl_dir).await?;
+        let (email, domain) = parse_new_cert_spec(spec, &cfg)?;
+
+        // Start temporary DNS server for one-shot cert issuance if zone is configured
+        let txt_records = if cfg.acme_zone.is_some() {
+            let records = dns_server::new_txt_store();
+            let zone = cfg.acme_zone.as_ref().unwrap().clone();
+            let dns_bind = cfg
+                .acme_dns_bind
+                .as_deref()
+                .unwrap_or("0.0.0.0:53")
+                .to_string();
+            let records_clone = records.clone();
+            tokio::spawn(async move {
+                if let Err(e) = dns_server::run_dns_server(
+                    dns_server::DnsServerConfig {
+                        zone,
+                        bind: dns_bind,
+                    },
+                    records_clone,
+                )
+                .await
+                {
+                    eprintln!("DNS server error: {}", e);
+                }
+            });
+            // Give DNS server time to bind
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            Some(records)
+        } else {
+            None
+        };
+
+        acme::issue_cert(
+            &email,
+            &domain,
+            &ssl_dir,
+            cfg.acme_zone.as_deref(),
+            txt_records,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -340,11 +444,13 @@ async fn main() -> Result<()> {
     let bind_str = cli.bind_https.as_deref().unwrap_or(&cfg.bind);
     let addr: SocketAddr = bind_str.parse()?;
 
-    let domain_roots: std::collections::HashMap<String, std::path::PathBuf> = cfg.domain_roots
+    let domain_roots: std::collections::HashMap<String, std::path::PathBuf> = cfg
+        .domain_roots
         .iter()
         .map(|(k, v)| (k.clone(), std::path::PathBuf::from(v)))
         .collect();
-    let prefix_roots: Vec<(String, std::path::PathBuf)> = cfg.prefix_roots
+    let prefix_roots: Vec<(String, std::path::PathBuf)> = cfg
+        .prefix_roots
         .iter()
         .map(|(k, v)| (k.clone(), std::path::PathBuf::from(v)))
         .collect();
@@ -378,6 +484,7 @@ async fn main() -> Result<()> {
 
     let listener = TcpListener::bind(addr).await?;
     eprintln!("ruph listening on {}", addr);
+    let connection_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
     let tls_config = if cli.tls || cfg.tls {
         Some(Arc::new(ssl::build_tls_config(&ssl_dir)?))
@@ -411,7 +518,7 @@ async fn main() -> Result<()> {
         Some(Arc::new(WebServer::new(
             http_root,
             std::collections::HashMap::new(), // No per-domain roots for HTTP
-            Vec::new(),                        // No prefix roots for HTTP
+            Vec::new(),                       // No prefix roots for HTTP
             cfg.index_files.clone(),
             cfg.php_mode.clone(),
             php_binary,
@@ -436,9 +543,44 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Start embedded DNS server for ACME DNS-01 (background, for future auto-renewal)
+    if let Some(ref zone) = cfg.acme_zone {
+        let records = dns_server::new_txt_store();
+        let dns_bind = cfg
+            .acme_dns_bind
+            .as_deref()
+            .unwrap_or("0.0.0.0:53")
+            .to_string();
+        let zone_clone = zone.clone();
+        tokio::spawn(async move {
+            if let Err(e) = dns_server::run_dns_server(
+                dns_server::DnsServerConfig {
+                    zone: zone_clone,
+                    bind: dns_bind,
+                },
+                records,
+            )
+            .await
+            {
+                eprintln!("DNS server error: {}", e);
+            }
+        });
+        eprintln!(
+            "  acme dns: {} (zone: {})",
+            cfg.acme_dns_bind.as_deref().unwrap_or("0.0.0.0:53"),
+            zone
+        );
+    }
+
     // Crawl log rollup + IP enrichment background tasks
-    let log_dir = format!("{}/ruph_logs",
-        web_server.root_dir.parent().unwrap_or(&web_server.root_dir).to_string_lossy());
+    let log_dir = format!(
+        "{}/ruph_logs",
+        web_server
+            .root_dir
+            .parent()
+            .unwrap_or(&web_server.root_dir)
+            .to_string_lossy()
+    );
     // Only start if the crawl log directory exists
     if std::path::Path::new(&format!("{}/crawl", log_dir)).exists() {
         info!("Starting crawl rollup task (log_dir: {})", log_dir);
@@ -458,6 +600,13 @@ async fn main() -> Result<()> {
                             continue;
                         }
                     };
+                    let permit = match connection_slots.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            warn!("connection limit reached ({}); dropping HTTPS connection from {}", MAX_CONNECTIONS, remote_addr);
+                            continue;
+                        }
+                    };
                     let web_server = web_server.clone();
                     let tls_config = tls_config.clone();
                     let dl = domain_logger.clone();
@@ -466,6 +615,7 @@ async fn main() -> Result<()> {
                     let rl = request_logger.clone();
                     let th = trailhead.clone();
                     tokio::task::spawn(async move {
+                        let _permit = permit;
                         serve_connection(stream, remote_addr, web_server, tls_config, dl, stats, sp, rl, th).await;
                     });
                 }
@@ -477,6 +627,13 @@ async fn main() -> Result<()> {
                             continue;
                         }
                     };
+                    let permit = match connection_slots.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            warn!("connection limit reached ({}); dropping HTTP connection from {}", MAX_CONNECTIONS, remote_addr);
+                            continue;
+                        }
+                    };
                     let ws = http_web_server.as_ref().unwrap().clone();
                     let dl = domain_logger.clone();
                     let stats = server_stats.clone();
@@ -484,6 +641,7 @@ async fn main() -> Result<()> {
                     let rl = request_logger.clone();
                     let th = trailhead.clone();
                     tokio::task::spawn(async move {
+                        let _permit = permit;
                         serve_connection(stream, remote_addr, ws, None, dl, stats, sp, rl, th).await;
                     });
                 }
@@ -496,6 +654,16 @@ async fn main() -> Result<()> {
                     continue;
                 }
             };
+            let permit = match connection_slots.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    warn!(
+                        "connection limit reached ({}); dropping connection from {}",
+                        MAX_CONNECTIONS, remote_addr
+                    );
+                    continue;
+                }
+            };
             let web_server = web_server.clone();
             let tls_config = tls_config.clone();
             let dl = domain_logger.clone();
@@ -504,11 +672,29 @@ async fn main() -> Result<()> {
             let rl = request_logger.clone();
             let th = trailhead.clone();
             tokio::task::spawn(async move {
-                serve_connection(stream, remote_addr, web_server, tls_config, dl, stats, sp, rl, th).await;
+                let _permit = permit;
+                serve_connection(
+                    stream,
+                    remote_addr,
+                    web_server,
+                    tls_config,
+                    dl,
+                    stats,
+                    sp,
+                    rl,
+                    th,
+                )
+                .await;
             });
         }
     }
 }
+
+/// Hard cap on concurrently served TCP connections. Without an admission limit,
+/// a scanner can keep enough idle keep-alive sockets open to exhaust memory or
+/// task resources before the per-connection lifetime timeout gets a chance to
+/// reap them.
+const MAX_CONNECTIONS: usize = 2048;
 
 /// Max time a connection may stay open (idle or active).  After this
 /// deadline the connection is dropped regardless of keep-alive state.
@@ -516,13 +702,29 @@ async fn main() -> Result<()> {
 /// reaping abandoned or slow-loris connections before FDs pile up.
 const CONNECTION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(300);
 
+struct ConnectionGuard {
+    stats: Arc<status::ServerStats>,
+}
+
+impl ConnectionGuard {
+    fn new(stats: Arc<status::ServerStats>) -> Self {
+        stats.connection_opened();
+        Self { stats }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.stats.connection_closed();
+    }
+}
+
 /// Shared hyper connection builder with tuned H2 window sizes.
 /// 1 MiB initial windows mean the first response fits in one window
 /// without waiting for flow-control ACKs, reducing TTFB on larger pages.
 fn http_builder() -> AutoBuilder<TokioExecutor> {
     let mut b = AutoBuilder::new(TokioExecutor::new());
-    b.http1()
-        .keep_alive(true);
+    b.http1().keep_alive(true);
     b.http2()
         .initial_stream_window_size(1024 * 1024)
         .initial_connection_window_size(2 * 1024 * 1024);
@@ -541,8 +743,7 @@ async fn serve_connection(
     request_logger: Option<Arc<request_log::RequestLogger>>,
     trailhead: Option<Arc<trailhead_client::TrailheadClient>>,
 ) {
-    stats.connection_opened();
-    let conn_stats = stats.clone();
+    let _connection_guard = ConnectionGuard::new(stats.clone());
 
     // Disable Nagle's algorithm so TLS handshake packets are sent immediately
     // rather than being buffered waiting for more data. Material impact on
@@ -554,10 +755,8 @@ async fn serve_connection(
     if let Some(config) = tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(config);
         // TLS handshake timeout — prevent slow/stalled handshakes from holding FDs
-        let tls_result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            acceptor.accept(stream),
-        ).await;
+        let tls_result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), acceptor.accept(stream)).await;
         match tls_result {
             Ok(Ok(tls_stream)) => {
                 let sni = tls_stream
@@ -577,16 +776,23 @@ async fn serve_connection(
                     let sp = status_page_path.clone();
                     let rl = request_logger.clone();
                     let th = trailhead.clone();
-                    async move { handle_request(req, ws, remote_addr, Some(sni), dl, st, sp, rl, th).await }
+                    async move {
+                        handle_request(req, ws, remote_addr, Some(sni), dl, st, sp, rl, th).await
+                    }
                 });
                 let builder = http_builder();
                 // Connection lifetime cap — prevents infinite keep-alive from leaking FDs
                 match tokio::time::timeout(
                     CONNECTION_LIFETIME,
                     builder.serve_connection(io, service),
-                ).await {
+                )
+                .await
+                {
                     Ok(Err(err)) => error!("[{}] TLS error from {}: {}", sni, remote_addr, err),
-                    Err(_) => info!("[{}] connection lifetime exceeded from {}", sni, remote_addr),
+                    Err(_) => info!(
+                        "[{}] connection lifetime exceeded from {}",
+                        sni, remote_addr
+                    ),
                     _ => {}
                 }
             }
@@ -609,17 +815,13 @@ async fn serve_connection(
             async move { handle_request(req, ws, remote_addr, None, dl, st, sp, rl, th).await }
         });
         let builder = http_builder();
-        match tokio::time::timeout(
-            CONNECTION_LIFETIME,
-            builder.serve_connection(io, service),
-        ).await {
+        match tokio::time::timeout(CONNECTION_LIFETIME, builder.serve_connection(io, service)).await
+        {
             Ok(Err(err)) => error!("Error serving connection from {}: {}", remote_addr, err),
             Err(_) => info!("Connection lifetime exceeded from {}", remote_addr),
             _ => {}
         }
     }
-
-    conn_stats.connection_closed();
 }
 
 async fn handle_request(
@@ -643,7 +845,9 @@ async fn handle_request(
         }
     }
 
-    let host = req.headers().get("host")
+    let host = req
+        .headers()
+        .get("host")
         .and_then(|v| v.to_str().ok())
         .or_else(|| req.uri().authority().map(|a| a.as_str()))
         .unwrap_or("-")
@@ -657,9 +861,16 @@ async fn handle_request(
 
     // Snapshot request headers for full logging (before req is consumed)
     let needs_snapshot = request_logger.is_some()
-        || trailhead.as_ref().map_or(false, |th| th.resolve_owner(&domain).is_some());
+        || trailhead
+            .as_ref()
+            .map_or(false, |th| th.resolve_owner(&domain).is_some());
     let req_snapshot = if needs_snapshot {
-        Some(request_log::RequestSnapshot::capture(&req, remote_addr, is_tls, domain.as_str()))
+        Some(request_log::RequestSnapshot::capture(
+            &req,
+            remote_addr,
+            is_tls,
+            domain.as_str(),
+        ))
     } else {
         None
     };
@@ -675,12 +886,28 @@ async fn handle_request(
                 .body(RuphBody::full(html))
                 .unwrap();
             let status_code = response.status().as_u16();
-            let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
+            let path = uri
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or(uri.path());
             let proto = if is_tls { "S" } else { "-" };
-            info!(http = status_code, "{} [{}] {} {} {}", proto, domain, remote_addr, method, path);
-            let th_owner = trailhead.as_ref().and_then(|th| th.resolve_owner(&domain).map(|o| o.to_string()));
+            info!(
+                http = status_code,
+                "{} [{}] {} {} {}", proto, domain, remote_addr, method, path
+            );
+            let th_owner = trailhead
+                .as_ref()
+                .and_then(|th| th.resolve_owner(&domain).map(|o| o.to_string()));
             if th_owner.is_none() {
-                domain_logger.log_request(&domain, &remote_addr, &method, &uri, status_code, is_tls, None);
+                domain_logger.log_request(
+                    &domain,
+                    &remote_addr,
+                    &method,
+                    &uri,
+                    status_code,
+                    is_tls,
+                    None,
+                );
             }
             if let Some(snap) = req_snapshot {
                 let rec = snap.into_record(status_code, &response.headers(), None, t0.elapsed());
@@ -696,7 +923,10 @@ async fn handle_request(
         }
     }
 
-    let response = match web_server.handle_request(req, Some(remote_addr), is_tls).await {
+    let response = match web_server
+        .handle_request(req, Some(remote_addr), is_tls)
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             error!("[{}] {} {} {} - {}", domain, remote_addr, method, uri, e);
@@ -710,26 +940,49 @@ async fn handle_request(
     };
 
     let status = response.status().as_u16();
-    let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
+    let path = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(uri.path());
     let proto = if is_tls { "S" } else { "-" };
     let location = if (300..400).contains(&status) {
-        response.headers().get("location")
+        response
+            .headers()
+            .get("location")
             .and_then(|v| v.to_str().ok())
             .map(|v| format!(" -> {}", v))
             .unwrap_or_default()
     } else {
         String::new()
     };
-    info!(http = status, "{} [{}] {} {} {}{}", proto, domain, remote_addr, method, path, location);
-    let th_owner = trailhead.as_ref().and_then(|th| th.resolve_owner(&domain).map(|o| o.to_string()));
+    info!(
+        http = status,
+        "{} [{}] {} {} {}{}", proto, domain, remote_addr, method, path, location
+    );
+    let th_owner = trailhead
+        .as_ref()
+        .and_then(|th| th.resolve_owner(&domain).map(|o| o.to_string()));
     if th_owner.is_none() {
-        domain_logger.log_request(&domain, &remote_addr, &method, &uri, status, is_tls,
-            if location.is_empty() { None } else { Some(&location[4..]) });
+        domain_logger.log_request(
+            &domain,
+            &remote_addr,
+            &method,
+            &uri,
+            status,
+            is_tls,
+            if location.is_empty() {
+                None
+            } else {
+                Some(&location[4..])
+            },
+        );
     }
 
     // Full request log (non-blocking)
     if let Some(snap) = req_snapshot {
-        let resp_size = response.headers().get("content-length")
+        let resp_size = response
+            .headers()
+            .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<i64>().ok());
         let rec = snap.into_record(status, response.headers(), resp_size, t0.elapsed());
@@ -745,11 +998,33 @@ async fn handle_request(
     Ok(response)
 }
 
-fn init_logging(level: &str) -> Result<()> {
-    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+/// Parse --new-cert spec: "email,domain" (legacy) or "domain" (email from config).
+fn parse_new_cert_spec(spec: &str, cfg: &config::Config) -> Result<(String, String)> {
+    if spec.contains(',') {
+        let parts: Vec<&str> = spec.split(',').collect();
+        if parts.len() != 2 {
+            return Err(anyhow!(
+                "--new-cert must be email@domain,example.com or just example.com \
+                 (with [acme] email in config)"
+            ));
+        }
+        Ok((parts[0].trim().to_string(), parts[1].trim().to_string()))
+    } else {
+        let email = cfg.acme_email.as_ref().ok_or_else(|| {
+            anyhow!(
+                "--new-cert {} requires [acme] email in config, \
+                 or use --new-cert email,domain format",
+                spec
+            )
+        })?;
+        Ok((email.clone(), spec.trim().to_string()))
+    }
+}
 
-    let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(level))?;
+fn init_logging(level: &str) -> Result<()> {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+    let filter = EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new(level))?;
 
     tracing_subscriber::registry()
         .with(fmt::layer().event_format(RuphFormatter))
@@ -781,8 +1056,8 @@ where
         let level = *event.metadata().level();
         let (lc, label) = match level {
             Level::ERROR => ("\x1b[31m", "ERROR"),
-            Level::WARN  => ("\x1b[33m", " WARN"),
-            Level::INFO  => ("\x1b[32m", " INFO"),
+            Level::WARN => ("\x1b[33m", " WARN"),
+            Level::INFO => ("\x1b[32m", " INFO"),
             Level::DEBUG => ("\x1b[36m", "DEBUG"),
             Level::TRACE => ("\x1b[35m", "TRACE"),
         };

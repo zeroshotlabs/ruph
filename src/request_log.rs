@@ -4,7 +4,7 @@
 //! All inserts are done via `spawn_blocking` so the async runtime is never stalled.
 
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::warn;
@@ -82,7 +82,7 @@ impl RequestLogger {
             CREATE INDEX IF NOT EXISTS idx_req_path     ON requests(path);
             CREATE INDEX IF NOT EXISTS idx_req_ua       ON requests(user_agent);
             CREATE INDEX IF NOT EXISTS idx_req_tls      ON requests(tls);
-            "
+            ",
         )?;
 
         eprintln!("  log_full: {}", path.display());
@@ -246,7 +246,11 @@ fn headers_to_json(headers: &hyper::HeaderMap) -> Option<String> {
             }
         }
     }
-    if map.is_empty() { None } else { serde_json::to_string(&map).ok() }
+    if map.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&map).ok()
+    }
 }
 
 impl RequestSnapshot {
@@ -258,10 +262,14 @@ impl RequestSnapshot {
         domain: &str,
     ) -> Self {
         let hdr = |name: &str| -> Option<String> {
-            req.headers().get(name).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+            req.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
         };
 
-        let content_length: Option<i64> = req.headers()
+        let content_length: Option<i64> = req
+            .headers()
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse().ok());
@@ -269,7 +277,9 @@ impl RequestSnapshot {
         let request_headers_json = headers_to_json(req.headers());
 
         let uri = req.uri();
-        let host = req.headers().get("host")
+        let host = req
+            .headers()
+            .get("host")
             .and_then(|v| v.to_str().ok())
             .or_else(|| uri.authority().map(|a| a.as_str()))
             .unwrap_or("-")
@@ -283,9 +293,17 @@ impl RequestSnapshot {
             host: host.clone(),
             path: uri.path().to_string(),
             query: uri.query().map(|s| s.to_string()),
-            protocol: if is_tls { "https".into() } else { "http".into() },
+            protocol: if is_tls {
+                "https".into()
+            } else {
+                "http".into()
+            },
             tls: is_tls,
-            sni: if is_tls { Some(domain.to_string()) } else { None },
+            sni: if is_tls {
+                Some(domain.to_string())
+            } else {
+                None
+            },
             http_version: format!("{:?}", req.version()),
             request_headers_json,
             user_agent: hdr("user-agent"),

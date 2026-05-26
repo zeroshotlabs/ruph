@@ -69,7 +69,12 @@ impl TrailheadClient {
             eprintln!("  trailhead: * -> {}", d);
         }
 
-        TrailheadClient { inner, domain_owners, prefix_owners, default_owner }
+        TrailheadClient {
+            inner,
+            domain_owners,
+            prefix_owners,
+            default_owner,
+        }
     }
 
     /// Resolve which owner a domain maps to.  Returns None if no match.
@@ -87,8 +92,7 @@ impl TrailheadClient {
         for (prefix, owner) in &self.prefix_owners {
             if prefix.len() > best_len
                 && bare.starts_with(prefix.as_str())
-                && (bare.len() == prefix.len()
-                    || bare.as_bytes().get(prefix.len()) == Some(&b'.'))
+                && (bare.len() == prefix.len() || bare.as_bytes().get(prefix.len()) == Some(&b'.'))
             {
                 best = Some(owner.as_str());
                 best_len = prefix.len();
@@ -109,9 +113,12 @@ impl TrailheadClient {
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let mut guard = inner.lock().await;
-            let buf = guard.buffers.entry(owner.clone()).or_insert_with(|| OwnerBuf {
-                lines: Vec::with_capacity(MAX_BATCH_LINES),
-            });
+            let buf = guard
+                .buffers
+                .entry(owner.clone())
+                .or_insert_with(|| OwnerBuf {
+                    lines: Vec::with_capacity(MAX_BATCH_LINES),
+                });
             buf.lines.push(line);
             if buf.lines.len() >= MAX_BATCH_LINES {
                 let lines = std::mem::take(&mut buf.lines);
@@ -130,9 +137,8 @@ impl TrailheadClient {
     pub fn start_flush_task(&self) {
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(
-                std::time::Duration::from_secs(FLUSH_INTERVAL_SECS),
-            );
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(FLUSH_INTERVAL_SECS));
             loop {
                 interval.tick().await;
                 let mut guard = inner.lock().await;
@@ -161,7 +167,10 @@ impl TrailheadClient {
 
 fn record_to_ndjson(rec: &RequestRecord) -> String {
     let mut obj = serde_json::Map::new();
-    obj.insert("timestamp".into(), serde_json::Value::Number(rec.ts_epoch_ms.into()));
+    obj.insert(
+        "timestamp".into(),
+        serde_json::Value::Number(rec.ts_epoch_ms.into()),
+    );
     obj.insert("ip".into(), rec.ip.clone().into());
     obj.insert("port".into(), serde_json::Value::Number(rec.port.into()));
     obj.insert("method".into(), rec.method.clone().into());
@@ -170,12 +179,19 @@ fn record_to_ndjson(rec: &RequestRecord) -> String {
 
     macro_rules! opt_str {
         ($field:ident) => {
-            if let Some(ref v) = rec.$field { obj.insert(stringify!($field).into(), v.clone().into()); }
+            if let Some(ref v) = rec.$field {
+                obj.insert(stringify!($field).into(), v.clone().into());
+            }
         };
     }
     macro_rules! opt_num {
         ($field:ident) => {
-            if let Some(v) = rec.$field { obj.insert(stringify!($field).into(), serde_json::Value::Number(v.into())); }
+            if let Some(v) = rec.$field {
+                obj.insert(
+                    stringify!($field).into(),
+                    serde_json::Value::Number(v.into()),
+                );
+            }
         };
     }
 

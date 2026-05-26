@@ -365,7 +365,7 @@ Constants: `PHP_URL_SCHEME` (0), `PHP_URL_HOST` (1), `PHP_URL_PORT` (2), `PHP_UR
 | `ob_start` | `ob_start()` | null — starts capturing output |
 | `ob_get_clean` | `ob_get_clean()` | string — returns and clears buffer |
 
-### Ruph Extensions (4)
+### Ruph Extensions (7)
 
 | Function | Signature | Returns |
 |----------|-----------|---------|
@@ -373,8 +373,11 @@ Constants: `PHP_URL_SCHEME` (0), `PHP_URL_HOST` (1), `PHP_URL_PORT` (2), `PHP_UR
 | `render` | `render($template [, $data])` | string — render template with data |
 | `response` | `response($status [, $headers [, $body]])` | null — set full response |
 | `http_request` | `http_request($method, $url [, $headers [, $body]])` | string — HTTP client |
+| `ruph_session_start` | `ruph_session_start($id)` | bool — start a basic file-backed session with a required string ID |
+| `ruph_session_id` | `ruph_session_id()` | string — current ruph session ID |
+| `ruph_session_destroy` | `ruph_session_destroy()` | bool — delete the current ruph session and clear `$_SESSION` |
 
-### Introspection / Misc (10)
+### Introspection / Misc (8)
 
 | Function | Signature | Returns |
 |----------|-----------|---------|
@@ -385,8 +388,6 @@ Constants: `PHP_URL_SCHEME` (0), `PHP_URL_HOST` (1), `PHP_URL_PORT` (2), `PHP_UR
 | `define` | `define($name, $value)` | true |
 | `defined` | `defined($name)` | bool |
 | `constant` | `constant($name)` | mixed |
-| `session_start` | `session_start()` | true — stub |
-| `session_destroy` | `session_destroy()` | true — stub |
 | `sleep` / `usleep` | `sleep($s)` | 0 — no-op |
 
 ---
@@ -409,7 +410,7 @@ These PHP features are **not** available in ruph's built-in interpreter:
 - Fibers
 - Attributes (`#[...]`)
 - PHP extensions (PDO, curl, mbstring, GD, etc.)
-- `$_SESSION` persistence (stubs only)
-- `$_COOKIE`, `$_FILES`, `$_ENV` superglobals
+- Full PHP session compatibility; AST mode supports only basic `ruph_session_*` sessions
+- `$_FILES`, `$_ENV` superglobals
 
 For these features, use `processor = cgi` in `ruph.ini` to route through an external PHP binary.

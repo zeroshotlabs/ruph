@@ -127,7 +127,11 @@ impl ServerStats {
                 total += self.qps_slots[idx].load(Ordering::Relaxed);
             }
         }
-        if window == 0 { 0.0 } else { total as f64 / window as f64 }
+        if window == 0 {
+            0.0
+        } else {
+            total as f64 / window as f64
+        }
     }
 
     pub fn active_connections(&self) -> usize {
@@ -156,7 +160,9 @@ impl ServerStats {
     pub fn unique_ips_in_window(&self, window: u64) -> usize {
         let now_secs = self.start_time.elapsed().as_secs();
         let map = self.ip_windows.lock().unwrap_or_else(|e| e.into_inner());
-        map.values().filter(|w| w.hits_in_window(now_secs, window) > 0).count()
+        map.values()
+            .filter(|w| w.hits_in_window(now_secs, window) > 0)
+            .count()
     }
 
     /// Returns all IPs sorted by total hits descending.
@@ -173,9 +179,18 @@ impl ServerStats {
         let mut vars = HashMap::new();
         vars.insert("RUPH_QPS_10".to_string(), format!("{:.1}", self.qps(10)));
         vars.insert("RUPH_QPS_60".to_string(), format!("{:.1}", self.qps(60)));
-        vars.insert("RUPH_TOTAL_REQUESTS".to_string(), self.total_requests().to_string());
-        vars.insert("RUPH_ACTIVE_CONNECTIONS".to_string(), self.active_connections().to_string());
-        vars.insert("RUPH_UPTIME".to_string(), self.uptime().as_secs().to_string());
+        vars.insert(
+            "RUPH_TOTAL_REQUESTS".to_string(),
+            self.total_requests().to_string(),
+        );
+        vars.insert(
+            "RUPH_ACTIVE_CONNECTIONS".to_string(),
+            self.active_connections().to_string(),
+        );
+        vars.insert(
+            "RUPH_UPTIME".to_string(),
+            self.uptime().as_secs().to_string(),
+        );
         vars.insert("RUPH_IP_HITS".to_string(), ip_total.to_string());
         vars.insert("RUPH_IP_HITS_WINDOW".to_string(), ip_window.to_string());
         vars.insert("RUPH_RATE_WINDOW".to_string(), self.rate_window.to_string());
@@ -192,7 +207,11 @@ pub fn format_stats_line(stats: &ServerStats) -> String {
     let h = (uptime % 86400) / 3600;
     let m = (uptime % 3600) / 60;
     let s = uptime % 60;
-    let up = if d > 0 { format!("{}d{:02}h{:02}m", d, h, m) } else { format!("{}h{:02}m{:02}s", h, m, s) };
+    let up = if d > 0 {
+        format!("{}d{:02}h{:02}m", d, h, m)
+    } else {
+        format!("{}h{:02}m{:02}s", h, m, s)
+    };
     let ips = stats.ip_hits().len();
     let ips_2s = stats.unique_ips_in_window(2) as f64 / 2.0;
     format!(
@@ -221,17 +240,22 @@ pub fn render_status_page(stats: &ServerStats, viewer_ip: IpAddr, vhost: &str) -
     };
 
     let ip_hits = stats.ip_hits();
-    let ip_rows: String = ip_hits.iter()
+    let ip_rows: String = ip_hits
+        .iter()
         .take(50)
-        .map(|(ip, count)| format!(
-            "            <tr><td>{}</td><td class=\"num\">{}</td></tr>", ip, count
-        ))
+        .map(|(ip, count)| {
+            format!(
+                "            <tr><td>{}</td><td class=\"num\">{}</td></tr>",
+                ip, count
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
 
-    format!(r#"<!DOCTYPE html>
+    format!(
+        r#"<!DOCTYPE html>
 <html>
 <head>
 <title>ruph server status</title>
@@ -343,8 +367,12 @@ mod tests {
         let stats = ServerStats::new(2);
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
         let ip2: IpAddr = "10.0.0.2".parse().unwrap();
-        for _ in 0..5 { stats.record_request(ip1); }
-        for _ in 0..3 { stats.record_request(ip2); }
+        for _ in 0..5 {
+            stats.record_request(ip1);
+        }
+        for _ in 0..3 {
+            stats.record_request(ip2);
+        }
         let hits = stats.ip_hits();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0], (ip1, 5)); // sorted desc

@@ -4,19 +4,19 @@
 //! Used as a fallback when AST and embedded processors cannot handle a script,
 //! or as the primary processor when configured.
 
-use std::collections::HashMap;
-use std::path::Path;
-use std::io;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use hyper::header::HeaderName;
-use tokio::process::Command;
+use std::collections::HashMap;
+use std::io;
+use std::io::Write as StdWrite;
+use std::path::Path;
+use std::sync::Arc;
+use tempfile::NamedTempFile;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
-use tempfile::NamedTempFile;
-use std::io::Write as StdWrite;
-use std::sync::Arc;
 
 /// Callback for routing PHP stderr lines (e.g. error_log()) to domain-specific logs.
 pub type PhpStderrHandler = Arc<dyn Fn(&str) + Send + Sync>;
@@ -93,7 +93,11 @@ impl PhpProcessor {
         let php_binary = Self::find_php_binary()?;
         info!("External PHP processor using: {}", php_binary);
         let (prepend_file, prepend_path) = Self::create_prepend_file()?;
-        Ok(PhpProcessor { php_binary, _prepend_file: prepend_file, prepend_path })
+        Ok(PhpProcessor {
+            php_binary,
+            _prepend_file: prepend_file,
+            prepend_path,
+        })
     }
 
     pub fn with_binary(binary: String) -> Result<Self> {
@@ -106,7 +110,11 @@ impl PhpProcessor {
                 let first_line = version.lines().next().unwrap_or("unknown");
                 info!("External PHP processor using: {} ({})", binary, first_line);
                 let (prepend_file, prepend_path) = Self::create_prepend_file()?;
-                Ok(PhpProcessor { php_binary: binary, _prepend_file: prepend_file, prepend_path })
+                Ok(PhpProcessor {
+                    php_binary: binary,
+                    _prepend_file: prepend_file,
+                    prepend_path,
+                })
             }
             _ => Err(anyhow!("PHP binary not usable: {}", binary)),
         }
@@ -157,7 +165,9 @@ impl PhpProcessor {
             }
         }
 
-        Err(anyhow!("PHP binary not found. Install PHP or set php.binary in config."))
+        Err(anyhow!(
+            "PHP binary not found. Install PHP or set php.binary in config."
+        ))
     }
 
     /// Build a configured Command for a PHP script, applying CGI environment vars.
@@ -169,22 +179,39 @@ impl PhpProcessor {
         server_vars: &HashMap<String, String>,
     ) -> Command {
         let mut command = Command::new(&self.php_binary);
-        command.arg("-d").arg(format!("auto_prepend_file={}", self.prepend_path));
+        command
+            .arg("-d")
+            .arg(format!("auto_prepend_file={}", self.prepend_path));
         command.arg("-d").arg("variables_order=EGPCS");
         command.arg("-f").arg(file_path);
 
-        let docroot = server_vars.get("DOCUMENT_ROOT")
+        let docroot = server_vars
+            .get("DOCUMENT_ROOT")
             .cloned()
             .unwrap_or_else(|| {
-                file_path.parent().unwrap_or(Path::new(".")).to_string_lossy().to_string()
+                file_path
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .to_string_lossy()
+                    .to_string()
             });
         command.current_dir(&docroot);
 
         // CGI environment — GATEWAY_INTERFACE enables header() output in PHP stdout
         command.env("GATEWAY_INTERFACE", "CGI/1.1");
-        command.env("REQUEST_METHOD",
-            server_vars.get("REQUEST_METHOD").cloned()
-                .unwrap_or_else(|| if post_data.is_empty() { "GET".to_string() } else { "POST".to_string() }));
+        command.env(
+            "REQUEST_METHOD",
+            server_vars
+                .get("REQUEST_METHOD")
+                .cloned()
+                .unwrap_or_else(|| {
+                    if post_data.is_empty() {
+                        "GET".to_string()
+                    } else {
+                        "POST".to_string()
+                    }
+                }),
+        );
         command.env("SCRIPT_FILENAME", file_path.to_string_lossy().to_string());
         command.env("DOCUMENT_ROOT", &docroot);
 
@@ -195,7 +222,8 @@ impl PhpProcessor {
 
         // Build query string
         if !query_params.is_empty() {
-            let qs = query_params.iter()
+            let qs = query_params
+                .iter()
                 .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
                 .collect::<Vec<_>>()
                 .join("&");
@@ -204,7 +232,8 @@ impl PhpProcessor {
 
         // POST data
         if !post_data.is_empty() {
-            let post_string = post_data.iter()
+            let post_string = post_data
+                .iter()
                 .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
                 .collect::<Vec<_>>()
                 .join("&");
@@ -223,7 +252,9 @@ impl PhpProcessor {
         let mut status = 200u16;
 
         // Find blank line separating headers from body
-        let sep = raw.find("\r\n\r\n").map(|p| (p, p + 4))
+        let sep = raw
+            .find("\r\n\r\n")
+            .map(|p| (p, p + 4))
             .or_else(|| raw.find("\n\n").map(|p| (p, p + 2)));
 
         let (header_str, body) = match sep {
@@ -233,13 +264,19 @@ impl PhpProcessor {
 
         for line in header_str.lines() {
             let line = line.trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             if let Some(colon) = line.find(':') {
                 let name = line[..colon].trim().to_lowercase();
                 let value = line[colon + 1..].trim().to_string();
                 if name == "status" {
-                    if let Ok(s) = value.split_whitespace()
-                        .next().unwrap_or("200").parse::<u16>() {
+                    if let Ok(s) = value
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("200")
+                        .parse::<u16>()
+                    {
                         status = s;
                     }
                 } else if name != "x-powered-by" {
@@ -263,8 +300,10 @@ impl PhpProcessor {
     ) -> Result<String> {
         debug!("Executing PHP via external binary: {:?}", file_path);
 
-        let output = self.build_command(file_path, query_params, post_data, server_vars)
-            .output().await
+        let output = self
+            .build_command(file_path, query_params, post_data, server_vars)
+            .output()
+            .await
             .map_err(|e| anyhow!("Failed to execute PHP: {}", e))?;
 
         let stdout = String::from_utf8(output.stdout)
@@ -300,8 +339,10 @@ impl PhpProcessor {
     ) -> Result<crate::ast_php_processor::PhpExecution> {
         debug!("Executing PHP with header parsing: {:?}", file_path);
 
-        let output = self.build_command(file_path, query_params, post_data, server_vars)
-            .output().await
+        let output = self
+            .build_command(file_path, query_params, post_data, server_vars)
+            .output()
+            .await
             .map_err(|e| anyhow!("Failed to execute PHP: {}", e))?;
 
         let stdout = String::from_utf8(output.stdout)
@@ -312,7 +353,10 @@ impl PhpProcessor {
             if stdout.is_empty() {
                 return Err(anyhow!("PHP execution failed: {}", stderr));
             }
-            let msg = format!("PHP exited with error but produced output: {}", stderr.trim());
+            let msg = format!(
+                "PHP exited with error but produced output: {}",
+                stderr.trim()
+            );
             warn!("{}", msg);
             if let Some(handler) = stderr_handler {
                 handler(&msg);
@@ -320,7 +364,13 @@ impl PhpProcessor {
         }
 
         let (headers, body, status) = Self::parse_cgi_output(&stdout);
-        Ok(crate::ast_php_processor::PhpExecution { body, status, headers, exited: false, returned: None })
+        Ok(crate::ast_php_processor::PhpExecution {
+            body,
+            status,
+            headers,
+            exited: false,
+            returned: None,
+        })
     }
 
     /// Spawn PHP and stream its output, parsing CGI headers from the start of stdout.
@@ -339,10 +389,13 @@ impl PhpProcessor {
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
 
-        let mut child = command.spawn()
+        let mut child = command
+            .spawn()
             .map_err(|e| anyhow!("Failed to spawn PHP: {}", e))?;
 
-        let stdout = child.stdout.take()
+        let stdout = child
+            .stdout
+            .take()
             .ok_or_else(|| anyhow!("Failed to acquire PHP stdout"))?;
         let mut reader = BufReader::new(stdout);
 
@@ -377,7 +430,7 @@ impl PhpProcessor {
         loop {
             let mut line = String::new();
             match reader.read_line(&mut line).await {
-                Ok(0) => break,  // EOF before blank line
+                Ok(0) => break, // EOF before blank line
                 Ok(_) => {}
                 Err(e) => return Err(anyhow!("Error reading PHP headers: {}", e)),
             }
@@ -391,8 +444,12 @@ impl PhpProcessor {
                 let name = trimmed[..colon].trim().to_lowercase();
                 let value = trimmed[colon + 1..].trim().to_string();
                 if name == "status" {
-                    if let Ok(s) = value.split_whitespace()
-                        .next().unwrap_or("200").parse::<u16>() {
+                    if let Ok(s) = value
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("200")
+                        .parse::<u16>()
+                    {
                         status = s;
                     }
                     continue;
@@ -443,7 +500,11 @@ impl PhpProcessor {
             let _ = child.wait().await;
         });
 
-        Ok(PhpStream { headers, status, rx })
+        Ok(PhpStream {
+            headers,
+            status,
+            rx,
+        })
     }
 
     #[allow(dead_code)]
@@ -473,16 +534,14 @@ mod tests {
             std::fs::write(&php_file, "<?php echo 'Hello from PHP'; ?>").unwrap();
 
             let mut sv = HashMap::new();
-            sv.insert("DOCUMENT_ROOT".to_string(), dir.path().to_string_lossy().to_string());
+            sv.insert(
+                "DOCUMENT_ROOT".to_string(),
+                dir.path().to_string_lossy().to_string(),
+            );
 
-            let result = proc.process_file(
-                &php_file,
-                "",
-                &HashMap::new(),
-                &HashMap::new(),
-                &sv,
-                None,
-            ).await;
+            let result = proc
+                .process_file(&php_file, "", &HashMap::new(), &HashMap::new(), &sv, None)
+                .await;
 
             if let Ok(output) = result {
                 assert!(output.contains("Hello from PHP"));

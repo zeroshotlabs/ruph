@@ -78,7 +78,7 @@ See [REQUESTS.md](REQUESTS.md) for the exact request flow and controller semanti
 ```php
 <?php
 // Master _index.php — global auth, then delegate
-session_start();
+ruph_session_start($_COOKIE['RUPHSESSID'] ?? 'guest');
 if (!authenticated()) { http_response_code(401); exit; }
 
 // Let the leaf _index.php handle it, or ruph serves static
@@ -172,7 +172,7 @@ ruph's built-in interpreter runs PHP natively in Rust — no external PHP binary
 
 #### Misc
 
-`phpversion`, `php_uname`, `php_sapi_name`, `function_exists`, `define`, `defined`, `constant`, `sleep`, `usleep`, `session_start`, `session_destroy`
+`phpversion`, `php_uname`, `php_sapi_name`, `function_exists`, `define`, `defined`, `constant`, `sleep`, `usleep`, `ruph_session_start`, `ruph_session_id`, `ruph_session_destroy`
 
 #### Ruph Extensions
 
@@ -183,6 +183,9 @@ ruph's built-in interpreter runs PHP natively in Rust — no external PHP binary
 | `response($status, $headers, $body)` | Set response status, headers, and body in one call |
 | `http_request($method, $url, $headers, $body)` | Make an HTTP request from PHP |
 | `file_get_contents($url)` | Works with both local files and HTTP URLs |
+| `ruph_session_start($id)` | Start a basic file-backed session using a required string session ID |
+| `ruph_session_id()` | Return the current ruph session ID |
+| `ruph_session_destroy()` | Delete the current ruph session and clear `$_SESSION` |
 
 ### Pre-defined Constants
 
@@ -198,7 +201,7 @@ ruph PHP is designed for web scripting, not running legacy PHP applications. The
 - Generators and `yield`
 - Try/catch exceptions
 - PHP extensions (PDO, curl, mbstring, etc.)
-- `$_SESSION` persistence (session functions exist as stubs)
+- Full PHP session compatibility; AST mode supports only basic `ruph_session_*` sessions
 
 For sites that need full PHP, set `processor = cgi` in your config and ruph will use an external PHP binary as a subprocess.
 

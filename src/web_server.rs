@@ -3,28 +3,28 @@
 //! This module provides HTTP web server capabilities alongside the MCP protocol,
 //! allowing the server to serve static files and process embedded PHP-like templates.
 
-use std::path::{Path, PathBuf};
+use crate::ast_php_processor::{AstPhpProcessor, PhpExecution};
+use crate::config::PhpMode;
+use crate::embedded_php_processor::EmbeddedPhpProcessor;
+use crate::php_processor::{PhpProcessor, PhpStderrHandler, PhpStream};
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
+use http_body_util::BodyExt;
+use hyper::body::{Body, Frame, Incoming as IncomingBody, SizeHint};
+use hyper::header::{HeaderName, HeaderValue};
+use hyper::http::request::Parts;
+use hyper::{Method, Request, Response, StatusCode};
+use mime_guess::from_path;
 use std::collections::HashMap;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::task::{Context, Poll};
-use hyper::http::request::Parts;
-use hyper::{Request, Response, StatusCode, Method};
-use hyper::header::{HeaderName, HeaderValue};
-use hyper::body::{Body, Frame, Incoming as IncomingBody, SizeHint};
-use http_body_util::BodyExt;
-use bytes::Bytes;
-use mime_guess::from_path;
-use urlencoding::decode;
-use tokio::fs;
-use tokio::sync::{Mutex, mpsc, oneshot};
-use anyhow::{Result, anyhow};
-use tracing::{debug, info, warn, error};
-use crate::embedded_php_processor::EmbeddedPhpProcessor;
-use crate::ast_php_processor::{AstPhpProcessor, PhpExecution};
-use crate::php_processor::{PhpProcessor, PhpStream, PhpStderrHandler};
-use crate::config::PhpMode;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use tokio::fs;
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tracing::{debug, error, info, warn};
+use urlencoding::decode;
 
 // ---------------------------------------------------------------------------
 // Streaming-capable response body
@@ -70,12 +70,12 @@ impl Body for RuphBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
         match &mut *self {
-            RuphBody::Full(opt) => {
-                Poll::Ready(opt.take().filter(|b| !b.is_empty()).map(|b| Ok(Frame::data(b))))
-            }
-            RuphBody::Streaming(rx) => {
-                rx.poll_recv(cx).map(|opt| opt.map(|r| r.map(Frame::data)))
-            }
+            RuphBody::Full(opt) => Poll::Ready(
+                opt.take()
+                    .filter(|b| !b.is_empty())
+                    .map(|b| Ok(Frame::data(b))),
+            ),
+            RuphBody::Streaming(rx) => rx.poll_recv(cx).map(|opt| opt.map(|r| r.map(Frame::data))),
         }
     }
 
@@ -122,9 +122,7 @@ pub struct WebServer {
 
 impl WebServer {
     fn php_auto_handled(exec: &PhpExecution) -> bool {
-        !exec.body.trim().is_empty()
-            || exec.headers.contains_key("location")
-            || exec.status != 200
+        !exec.body.trim().is_empty() || exec.headers.contains_key("location") || exec.status != 200
     }
 
     fn php_stops_controller(exec: &PhpExecution) -> bool {
@@ -147,7 +145,8 @@ impl WebServer {
         headers: &HashMap<String, String>,
     ) -> hyper::http::response::Builder {
         for (name, value) in headers {
-            let header_name = match HeaderName::from_bytes(name.trim().as_bytes()) {
+            let normalized_name = Self::normalize_response_header_name(name);
+            let header_name = match HeaderName::from_bytes(normalized_name.as_bytes()) {
                 Ok(n) => n,
                 Err(_) => {
                     warn!("Skipping invalid response header name: {:?}", name);
@@ -157,7 +156,10 @@ impl WebServer {
             let header_value = match HeaderValue::from_str(value.trim()) {
                 Ok(v) => v,
                 Err(_) => {
-                    warn!("Skipping invalid response header value for {}: {:?}", header_name, value);
+                    warn!(
+                        "Skipping invalid response header value for {}: {:?}",
+                        header_name, value
+                    );
                     continue;
                 }
             };
@@ -166,11 +168,22 @@ impl WebServer {
         builder
     }
 
+    fn normalize_response_header_name(name: &str) -> String {
+        let name = name.trim().to_ascii_lowercase();
+        if name == "set-cookie" || name.starts_with("set-cookie-") {
+            "set-cookie".to_string()
+        } else {
+            name
+        }
+    }
+
     /// Build an HTTP response from a PhpExecution result.
     /// Uses PHP's Content-Type if set, otherwise defaults to text/html.
     fn build_php_response(exec: &PhpExecution) -> Result<Response<RuphBody>> {
         let status = StatusCode::from_u16(exec.status).unwrap_or(StatusCode::OK);
-        let content_type = exec.headers.get("content-type")
+        let content_type = exec
+            .headers
+            .get("content-type")
             .cloned()
             .unwrap_or_else(|| "text/html; charset=utf-8".to_string());
         let mut builder = Response::builder()
@@ -178,8 +191,11 @@ impl WebServer {
             .header("Content-Type", &content_type);
         // Apply remaining headers, skipping content-type (already set above)
         for (name, value) in &exec.headers {
-            if name == "content-type" { continue; }
-            let header_name = match HeaderName::from_bytes(name.trim().as_bytes()) {
+            if name == "content-type" {
+                continue;
+            }
+            let normalized_name = Self::normalize_response_header_name(name);
+            let header_name = match HeaderName::from_bytes(normalized_name.as_bytes()) {
                 Ok(n) => n,
                 Err(_) => continue,
             };
@@ -234,7 +250,10 @@ impl WebServer {
             Some(bin) => match PhpProcessor::with_binary(bin) {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    warn!("Failed to initialize external PHP with specified binary: {}", e);
+                    warn!(
+                        "Failed to initialize external PHP with specified binary: {}",
+                        e
+                    );
                     PhpProcessor::new().ok()
                 }
             },
@@ -264,14 +283,23 @@ impl WebServer {
             .cloned()
             .unwrap_or_else(|| "_index.php".to_string());
 
-        if ast_php_processor.is_none() && embedded_php_processor.is_none() && php_processor.is_none() {
+        if ast_php_processor.is_none()
+            && embedded_php_processor.is_none()
+            && php_processor.is_none()
+        {
             warn!("No PHP processors available. PHP files will be served as static content.");
         } else {
             let available: Vec<&str> = [
                 ast_php_processor.as_ref().map(|_| "ast"),
                 embedded_php_processor.as_ref().map(|_| "embedded"),
-                php_processor.as_ref().map(|p| { let _ = p; "cgi" }),
-            ].into_iter().flatten().collect();
+                php_processor.as_ref().map(|p| {
+                    let _ = p;
+                    "cgi"
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
             eprintln!("  php: [{}], mode: {:?}", available.join(", "), php_mode);
         }
 
@@ -314,7 +342,8 @@ impl WebServer {
     /// Find the first PHP file from `index_files` that exists in `root`.
     #[allow(dead_code)]
     fn find_root_init_script(root: &Path, index_files: &[String]) -> Option<PathBuf> {
-        index_files.iter()
+        index_files
+            .iter()
             .filter(|name| name.ends_with(".php"))
             .map(|name| root.join(name))
             .find(|p| p.is_file())
@@ -483,7 +512,11 @@ impl WebServer {
         let target = self.resolve_file_path(url_path, root)?;
         let is_dir_target = target.is_dir() || url_path.ends_with('/');
         let parts: Vec<&str> = clean.split('/').filter(|p| !p.is_empty()).collect();
-        let dir_count = if is_dir_target { parts.len() } else { parts.len().saturating_sub(1) };
+        let dir_count = if is_dir_target {
+            parts.len()
+        } else {
+            parts.len().saturating_sub(1)
+        };
 
         let mut current = root.to_path_buf();
         for part in parts.iter().take(dir_count) {
@@ -565,7 +598,10 @@ impl WebServer {
 
         if let Some(target) = target_dir {
             if let Some(deepest) = self.deepest_leaf_for_dir(root, &target) {
-                rr.insert("rr_leaf_idx".to_string(), deepest.to_string_lossy().to_string());
+                rr.insert(
+                    "rr_leaf_idx".to_string(),
+                    deepest.to_string_lossy().to_string(),
+                );
             }
         }
 
@@ -580,9 +616,16 @@ impl WebServer {
     /// 3. Resolve the target.
     /// 4. For non-PHP targets, optionally run the deepest local leaf `_index.php`.
     /// 5. Deliver the resolved target directly, or 404.
-    pub async fn handle_request(&self, req: Request<IncomingBody>, remote_addr: Option<std::net::SocketAddr>, is_tls: bool) -> Result<Response<RuphBody>> {
+    pub async fn handle_request(
+        &self,
+        req: Request<IncomingBody>,
+        remote_addr: Option<std::net::SocketAddr>,
+        is_tls: bool,
+    ) -> Result<Response<RuphBody>> {
         let (parts, body) = req.into_parts();
-        let host = parts.headers.get("host")
+        let host = parts
+            .headers
+            .get("host")
             .and_then(|v| v.to_str().ok())
             .or_else(|| parts.uri.authority().map(|a| a.as_str()))
             .unwrap_or("")
@@ -601,26 +644,39 @@ impl WebServer {
             return Ok(self.error_response(StatusCode::FORBIDDEN, "Access denied"));
         }
 
-        // Only GET, POST, HEAD allowed
-        if !matches!(method, Method::GET | Method::POST | Method::HEAD) {
+        // Only GET, POST, HEAD, OPTIONS allowed
+        if !matches!(
+            method,
+            Method::GET | Method::POST | Method::HEAD | Method::OPTIONS
+        ) {
             return Ok(self.error_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed"));
         }
 
         // ── Step 1: Pre-resolve filesystem → rr_* variables ──
         let rr_vars = self.resolve_rr_vars(&path, &root);
-        debug!("rr_vars: file={} dir={} index={} leaf={}",
+        debug!(
+            "rr_vars: file={} dir={} index={} leaf={}",
             rr_vars.get("rr_file").unwrap_or(&String::new()),
             rr_vars.get("rr_dir").unwrap_or(&String::new()),
             rr_vars.get("rr_index").unwrap_or(&String::new()),
-            rr_vars.get("rr_leaf_idx").unwrap_or(&String::new()));
+            rr_vars.get("rr_leaf_idx").unwrap_or(&String::new())
+        );
 
         let query_string = parts.uri.query().unwrap_or("").to_string();
         let query_params = self.parse_query_string(&query_string);
-        let post_params = if method == Method::POST {
+        let body_bytes = if method == Method::POST {
             let body_bytes = match body.collect().await {
                 Ok(collected) => collected.to_bytes(),
-                Err(_) => return Ok(self.error_response(StatusCode::BAD_REQUEST, "Invalid request body")),
+                Err(_) => {
+                    return Ok(self.error_response(StatusCode::BAD_REQUEST, "Invalid request body"))
+                }
             };
+            body_bytes
+        } else {
+            Bytes::new()
+        };
+        let raw_body = String::from_utf8_lossy(&body_bytes).to_string();
+        let post_params = if method == Method::POST {
             self.parse_post_data(&body_bytes)
         } else {
             HashMap::new()
@@ -643,9 +699,23 @@ impl WebServer {
         let mut controllers: Vec<(PathBuf, HashMap<String, String>)> = Vec::new();
 
         let build_sv = |script: &Path| -> Result<HashMap<String, String>> {
-            let mut sv = self.build_server_vars_from_parts_with_addr(&parts, script, &root, remote_addr)?;
-            if is_tls { sv.insert("HTTPS".to_string(), "on".to_string()); }
-            for (k, v) in &rr_vars { sv.insert(k.clone(), v.clone()); }
+            let mut sv =
+                self.build_server_vars_from_parts_with_addr(&parts, script, &root, remote_addr)?;
+            if is_tls {
+                sv.insert("HTTPS".to_string(), "on".to_string());
+            }
+            for (k, v) in &rr_vars {
+                sv.insert(k.clone(), v.clone());
+            }
+            sv.insert("RUPH_RAW_BODY".to_string(), raw_body.clone());
+            sv.insert("CONTENT_LENGTH".to_string(), body_bytes.len().to_string());
+            if let Some(content_type) = parts
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+            {
+                sv.insert("CONTENT_TYPE".to_string(), content_type.to_string());
+            }
             Ok(sv)
         };
 
@@ -653,7 +723,8 @@ impl WebServer {
             controllers.push((master_path.clone(), build_sv(&master_path)?));
         }
         if let Some(vhost_path) = self.vhost_root_script(&root) {
-            let is_dup = self.global_master_script()
+            let is_dup = self
+                .global_master_script()
                 .as_ref()
                 .map(|m| Self::is_same_canonical_file(m, &vhost_path))
                 .unwrap_or(false);
@@ -688,13 +759,34 @@ impl WebServer {
         if has_php {
             // For SSE requests use streaming mode: PHP output flows to client as flush() is called
             if prefer_sse {
-                match self.run_php_chain_streaming(&controllers, leaf.as_ref(), &query_params, &post_params, stderr_handler.as_ref()).await {
+                match self
+                    .run_php_chain_streaming(
+                        &controllers,
+                        leaf.as_ref(),
+                        &query_params,
+                        &post_params,
+                        stderr_handler.as_ref(),
+                    )
+                    .await
+                {
                     Ok(Some(response)) => return Ok(response),
                     Ok(None) => {} // fall through to buffered execution
-                    Err(e) => warn!("SSE streaming chain failed: {} — falling back to buffered", e),
+                    Err(e) => warn!(
+                        "SSE streaming chain failed: {} — falling back to buffered",
+                        e
+                    ),
                 }
             }
-            match self.run_php_chain(&controllers, leaf.as_ref(), &query_params, &post_params, stderr_handler.as_ref()).await {
+            match self
+                .run_php_chain(
+                    &controllers,
+                    leaf.as_ref(),
+                    &query_params,
+                    &post_params,
+                    stderr_handler.as_ref(),
+                )
+                .await
+            {
                 Ok(exec) => {
                     let chain_handled = if leaf.is_some() {
                         Self::php_leaf_handled(&exec)
@@ -719,16 +811,30 @@ impl WebServer {
 
         // ── Direct .php file execution (after controllers passed through) ──
         if is_direct_php {
-            let php_path = match &target { RequestTarget::Script(p) => p, _ => unreachable!() };
+            let php_path = match &target {
+                RequestTarget::Script(p) => p,
+                _ => unreachable!(),
+            };
             let sv = build_sv(php_path)?;
-            return self.deliver_target(&target, &query_params, &post_params, &sv, prefer_sse, stderr_handler.as_ref(), &method).await;
+            return self
+                .deliver_target(
+                    &target,
+                    &query_params,
+                    &post_params,
+                    &sv,
+                    prefer_sse,
+                    stderr_handler.as_ref(),
+                    &method,
+                )
+                .await;
         }
 
         let deliver_path = match &target {
             RequestTarget::Static(path) | RequestTarget::Script(path) => path,
             RequestTarget::NotFound => &root,
         };
-        let mut sv = self.build_server_vars_from_parts_with_addr(&parts, deliver_path, &root, remote_addr)?;
+        let mut sv =
+            self.build_server_vars_from_parts_with_addr(&parts, deliver_path, &root, remote_addr)?;
         if is_tls {
             sv.insert("HTTPS".to_string(), "on".to_string());
         }
@@ -736,20 +842,22 @@ impl WebServer {
             sv.insert(k.clone(), v.clone());
         }
 
-        let mut response = self.deliver_target(
-            &target,
-            &query_params,
-            &post_params,
-            &sv,
-            prefer_sse,
-            stderr_handler.as_ref(),
-            &method,
-        )
-        .await?;
+        let mut response = self
+            .deliver_target(
+                &target,
+                &query_params,
+                &post_params,
+                &sv,
+                prefer_sse,
+                stderr_handler.as_ref(),
+                &method,
+            )
+            .await?;
 
         // Merge PHP headers set by the leaf before it fell through to static delivery
         for (name, value) in &php_passthrough_headers {
-            let header_name = match HeaderName::from_bytes(name.trim().as_bytes()) {
+            let normalized_name = Self::normalize_response_header_name(name);
+            let header_name = match HeaderName::from_bytes(normalized_name.as_bytes()) {
                 Ok(n) => n,
                 Err(_) => continue,
             };
@@ -757,7 +865,7 @@ impl WebServer {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            response.headers_mut().insert(header_name, header_value);
+            response.headers_mut().append(header_name, header_value);
         }
 
         Ok(response)
@@ -765,7 +873,13 @@ impl WebServer {
 
     /// Handle GET requests
     #[allow(dead_code)]
-    async fn handle_get_request(&self, req: Request<IncomingBody>, root: &Path, init_script: Option<&Path>, stderr_handler: Option<&PhpStderrHandler>) -> Result<Response<RuphBody>> {
+    async fn handle_get_request(
+        &self,
+        req: Request<IncomingBody>,
+        root: &Path,
+        init_script: Option<&Path>,
+        stderr_handler: Option<&PhpStderrHandler>,
+    ) -> Result<Response<RuphBody>> {
         let uri = req.uri();
         let path = uri.path();
         let query = uri.query();
@@ -775,20 +889,37 @@ impl WebServer {
             RequestTarget::Script(script_path) => {
                 let query_params = self.parse_query_string(query.unwrap_or(""));
                 let server_vars = self.build_server_vars(&req, &script_path, root)?;
-                let prefer_sse = req.headers()
+                let prefer_sse = req
+                    .headers()
                     .get("accept")
                     .and_then(|v| v.to_str().ok())
                     .map(|v| v.contains("text/event-stream"))
                     .unwrap_or(false);
-                self.process_php_template(&script_path, &query_params, &HashMap::new(), &server_vars, prefer_sse, stderr_handler).await
+                self.process_php_template(
+                    &script_path,
+                    &query_params,
+                    &HashMap::new(),
+                    &server_vars,
+                    prefer_sse,
+                    stderr_handler,
+                )
+                .await
             }
-            RequestTarget::NotFound => Ok(self.error_response(StatusCode::NOT_FOUND, "File not found")),
+            RequestTarget::NotFound => {
+                Ok(self.error_response(StatusCode::NOT_FOUND, "File not found"))
+            }
         }
     }
 
     /// Handle POST requests
     #[allow(dead_code)]
-    async fn handle_post_request(&self, req: Request<IncomingBody>, root: &Path, init_script: Option<&Path>, stderr_handler: Option<&PhpStderrHandler>) -> Result<Response<RuphBody>> {
+    async fn handle_post_request(
+        &self,
+        req: Request<IncomingBody>,
+        root: &Path,
+        init_script: Option<&Path>,
+        stderr_handler: Option<&PhpStderrHandler>,
+    ) -> Result<Response<RuphBody>> {
         let uri = req.uri().clone();
         let path = uri.path();
         let target = self.resolve_request_target(path, root, init_script)?;
@@ -806,7 +937,8 @@ impl WebServer {
 
         let server_vars = self.build_server_vars(&req, &script_path, root)?;
 
-        let prefer_sse = req.headers()
+        let prefer_sse = req
+            .headers()
             .get("accept")
             .and_then(|v| v.to_str().ok())
             .map(|v| v.contains("text/event-stream"))
@@ -815,17 +947,33 @@ impl WebServer {
         // Parse POST data
         let body_bytes = match req.collect().await {
             Ok(collected) => collected.to_bytes(),
-            Err(_) => return Ok(self.error_response(StatusCode::BAD_REQUEST, "Invalid request body")),
+            Err(_) => {
+                return Ok(self.error_response(StatusCode::BAD_REQUEST, "Invalid request body"))
+            }
         };
 
         let post_data = self.parse_post_data(&body_bytes);
         let query_params = self.parse_query_string(uri.query().unwrap_or(""));
-        self.process_php_template(&script_path, &query_params, &post_data, &server_vars, prefer_sse, stderr_handler).await
+        self.process_php_template(
+            &script_path,
+            &query_params,
+            &post_data,
+            &server_vars,
+            prefer_sse,
+            stderr_handler,
+        )
+        .await
     }
 
     /// Handle HEAD requests
     #[allow(dead_code)]
-    async fn handle_head_request(&self, req: Request<IncomingBody>, root: &Path, init_script: Option<&Path>, _stderr_handler: Option<&PhpStderrHandler>) -> Result<Response<RuphBody>> {
+    async fn handle_head_request(
+        &self,
+        req: Request<IncomingBody>,
+        root: &Path,
+        init_script: Option<&Path>,
+        _stderr_handler: Option<&PhpStderrHandler>,
+    ) -> Result<Response<RuphBody>> {
         let uri = req.uri();
         let path = uri.path();
 
@@ -834,7 +982,12 @@ impl WebServer {
                 let content_type = self.get_content_type(&file_path);
                 let metadata = match fs::metadata(&file_path).await {
                     Ok(meta) => meta,
-                    Err(_) => return Ok(self.error_response(StatusCode::INTERNAL_SERVER_ERROR, "Cannot read file metadata")),
+                    Err(_) => {
+                        return Ok(self.error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Cannot read file metadata",
+                        ))
+                    }
                 };
 
                 Response::builder()
@@ -844,8 +997,13 @@ impl WebServer {
                     .body(RuphBody::empty())
                     .map_err(|e| anyhow!("Failed to build response: {}", e))
             }
-            RequestTarget::Script(_) => Ok(self.error_response(StatusCode::METHOD_NOT_ALLOWED, "HEAD not supported for scripts")),
-            RequestTarget::NotFound => Ok(self.error_response(StatusCode::NOT_FOUND, "File not found")),
+            RequestTarget::Script(_) => Ok(self.error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "HEAD not supported for scripts",
+            )),
+            RequestTarget::NotFound => {
+                Ok(self.error_response(StatusCode::NOT_FOUND, "File not found"))
+            }
         }
     }
 
@@ -862,7 +1020,9 @@ impl WebServer {
 
         // Ensure the resolved path is within the root directory.
         // Use the pre-canonicalized root if available (common case); fall back to computing it.
-        let canonical_root = self.canonical_roots.get(root)
+        let canonical_root = self
+            .canonical_roots
+            .get(root)
             .cloned()
             .or_else(|| root.canonicalize().ok())
             .ok_or_else(|| anyhow!("Cannot canonicalize root directory"))?;
@@ -883,7 +1043,9 @@ impl WebServer {
             Ok(content) => content,
             Err(e) => {
                 error!("Failed to read file {:?}: {}", file_path, e);
-                return Ok(self.error_response(StatusCode::INTERNAL_SERVER_ERROR, "Cannot read file"));
+                return Ok(
+                    self.error_response(StatusCode::INTERNAL_SERVER_ERROR, "Cannot read file")
+                );
             }
         };
 
@@ -910,11 +1072,17 @@ impl WebServer {
         debug!("Processing PHP template: {:?}", template_path);
 
         if !template_path.is_file() {
-            warn!("Refusing to execute non-file PHP target: {:?}", template_path);
+            warn!(
+                "Refusing to execute non-file PHP target: {:?}",
+                template_path
+            );
             return Ok(self.error_response(StatusCode::NOT_FOUND, "Script not found"));
         }
 
-        if self.ast_php_processor.is_none() && self.embedded_php_processor.is_none() && self.php_processor.is_none() {
+        if self.ast_php_processor.is_none()
+            && self.embedded_php_processor.is_none()
+            && self.php_processor.is_none()
+        {
             warn!("No PHP processors available, serving PHP file as static content");
             return self.serve_static_file(template_path).await;
         }
@@ -922,9 +1090,21 @@ impl WebServer {
         // cgi mode: use streaming PHP execution so SSE and header() work correctly
         if matches!(self.php_mode, PhpMode::Cgi | PhpMode::Auto) {
             if let Some(php) = &self.php_processor {
-                match php.stream_file(template_path, query_params, post_params, server_vars, stderr_handler.cloned()).await {
+                match php
+                    .stream_file(
+                        template_path,
+                        query_params,
+                        post_params,
+                        server_vars,
+                        stderr_handler.cloned(),
+                    )
+                    .await
+                {
                     Ok(stream) => return self.build_response_from_stream(stream, prefer_sse).await,
-                    Err(e) => warn!("PHP streaming failed for {:?}: {}, trying fallback", template_path, e),
+                    Err(e) => warn!(
+                        "PHP streaming failed for {:?}: {}, trying fallback",
+                        template_path, e
+                    ),
                 }
             }
         }
@@ -932,15 +1112,38 @@ impl WebServer {
         // Fallback: AST or embedded processor (buffered, no CGI header support)
         let content = match fs::read_to_string(template_path).await {
             Ok(content) => content,
-            Err(_) => return Ok(self.error_response(StatusCode::INTERNAL_SERVER_ERROR, "Cannot read PHP file")),
+            Err(_) => {
+                return Ok(
+                    self.error_response(StatusCode::INTERNAL_SERVER_ERROR, "Cannot read PHP file")
+                )
+            }
         };
 
         let output = match self.php_mode {
-            PhpMode::Ast => self.run_ast_only(&content, template_path, query_params, post_params, server_vars).await,
-            PhpMode::Embedded => self.run_embedded_only(&content, query_params, post_params, server_vars),
+            PhpMode::Ast => {
+                self.run_ast_only(
+                    &content,
+                    template_path,
+                    query_params,
+                    post_params,
+                    server_vars,
+                )
+                .await
+            }
+            PhpMode::Embedded => {
+                self.run_embedded_only(&content, query_params, post_params, server_vars)
+            }
             PhpMode::Cgi | PhpMode::Auto => {
                 // External PHP already failed; fall back through AST then embedded
-                self.run_auto_chain_with_handler(&content, template_path, query_params, post_params, server_vars, stderr_handler).await
+                self.run_auto_chain_with_handler(
+                    &content,
+                    template_path,
+                    query_params,
+                    post_params,
+                    server_vars,
+                    stderr_handler,
+                )
+                .await
             }
         };
 
@@ -948,8 +1151,10 @@ impl WebServer {
             Ok(o) => o,
             Err(e) => {
                 error!("All PHP processors failed for {:?}: {}", template_path, e);
-                return Ok(self.error_response(StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("Template processing error: {}", e)));
+                return Ok(self.error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Template processing error: {}", e),
+                ));
             }
         };
 
@@ -973,13 +1178,21 @@ impl WebServer {
     /// Build an HTTP response from a `PhpStream`.
     /// If the response is SSE (`Content-Type: text/event-stream`), the body is streamed
     /// incrementally; otherwise all chunks are collected into a buffered body.
-    async fn build_response_from_stream(&self, stream: PhpStream, prefer_sse: bool) -> Result<Response<RuphBody>> {
-        let is_sse = stream.headers.get("content-type")
+    async fn build_response_from_stream(
+        &self,
+        stream: PhpStream,
+        prefer_sse: bool,
+    ) -> Result<Response<RuphBody>> {
+        let is_sse = stream
+            .headers
+            .get("content-type")
             .map(|ct| ct.contains("text/event-stream"))
-            .unwrap_or(false) || prefer_sse;
+            .unwrap_or(false)
+            || prefer_sse;
 
         let status = StatusCode::from_u16(stream.status).unwrap_or(StatusCode::OK);
-        let mut builder = Self::apply_safe_headers(Response::builder().status(status), &stream.headers);
+        let mut builder =
+            Self::apply_safe_headers(Response::builder().status(status), &stream.headers);
 
         if is_sse {
             if !stream.headers.contains_key("content-type") {
@@ -1015,22 +1228,42 @@ impl WebServer {
     /// Auto mode: AST -> embedded -> cgi
     #[allow(dead_code)]
     async fn run_auto_chain(
-        &self, content: &str, template_path: &Path,
-        qp: &HashMap<String, String>, pp: &HashMap<String, String>, sv: &HashMap<String, String>,
+        &self,
+        content: &str,
+        template_path: &Path,
+        qp: &HashMap<String, String>,
+        pp: &HashMap<String, String>,
+        sv: &HashMap<String, String>,
     ) -> Result<PhpExecution> {
-        self.run_auto_chain_with_handler(content, template_path, qp, pp, sv, None).await
+        self.run_auto_chain_with_handler(content, template_path, qp, pp, sv, None)
+            .await
     }
 
     /// Auto mode with stderr handler: AST -> embedded -> cgi
     async fn run_auto_chain_with_handler(
-        &self, content: &str, template_path: &Path,
-        qp: &HashMap<String, String>, pp: &HashMap<String, String>, sv: &HashMap<String, String>,
+        &self,
+        content: &str,
+        template_path: &Path,
+        qp: &HashMap<String, String>,
+        pp: &HashMap<String, String>,
+        sv: &HashMap<String, String>,
         stderr_handler: Option<&PhpStderrHandler>,
     ) -> Result<PhpExecution> {
         // Try AST first
         if let Some(ast) = &self.ast_php_processor {
             let mut ast = ast.lock().await;
-            match ast.execute_php_with_handler(content, qp, pp, sv, template_path, &self.root_dir, stderr_handler.cloned()).await {
+            match ast
+                .execute_php_with_handler(
+                    content,
+                    qp,
+                    pp,
+                    sv,
+                    template_path,
+                    &self.root_dir,
+                    stderr_handler.cloned(),
+                )
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(e) => warn!("AST failed for {:?}: {}, trying next", template_path, e),
             }
@@ -1039,20 +1272,41 @@ impl WebServer {
         // Try embedded
         if let Some(emb) = &self.embedded_php_processor {
             match emb.execute_php(content, qp, pp, sv) {
-                Ok(body) if !body.trim().is_empty() => return Ok(PhpExecution {
-                    body, status: 200, headers: HashMap::new(), exited: false, returned: None,
-                }),
-                Ok(_) => warn!("Embedded returned empty for {:?}, trying next", template_path),
-                Err(e) => warn!("Embedded failed for {:?}: {}, trying next", template_path, e),
+                Ok(body) if !body.trim().is_empty() => {
+                    return Ok(PhpExecution {
+                        body,
+                        status: 200,
+                        headers: HashMap::new(),
+                        exited: false,
+                        returned: None,
+                    })
+                }
+                Ok(_) => warn!(
+                    "Embedded returned empty for {:?}, trying next",
+                    template_path
+                ),
+                Err(e) => warn!(
+                    "Embedded failed for {:?}: {}, trying next",
+                    template_path, e
+                ),
             }
         }
 
         // Try external PHP (buffered, CGI headers stripped)
         if let Some(php) = &self.php_processor {
-            match php.process_file(template_path, content, qp, pp, sv, stderr_handler).await {
-                Ok(body) => return Ok(PhpExecution {
-                    body, status: 200, headers: HashMap::new(), exited: false, returned: None,
-                }),
+            match php
+                .process_file(template_path, content, qp, pp, sv, stderr_handler)
+                .await
+            {
+                Ok(body) => {
+                    return Ok(PhpExecution {
+                        body,
+                        status: 200,
+                        headers: HashMap::new(),
+                        exited: false,
+                        returned: None,
+                    })
+                }
                 Err(e) => warn!("External PHP failed for {:?}: {}", template_path, e),
             }
         }
@@ -1063,24 +1317,46 @@ impl WebServer {
     /// CGI mode: external PHP first, then AST -> embedded (kept for potential future use)
     #[allow(dead_code)]
     async fn run_cgi_first(
-        &self, content: &str, template_path: &Path,
-        qp: &HashMap<String, String>, pp: &HashMap<String, String>, sv: &HashMap<String, String>,
+        &self,
+        content: &str,
+        template_path: &Path,
+        qp: &HashMap<String, String>,
+        pp: &HashMap<String, String>,
+        sv: &HashMap<String, String>,
     ) -> Result<PhpExecution> {
         // Try external PHP first
         if let Some(php) = &self.php_processor {
-            match php.process_file(template_path, content, qp, pp, sv, None).await {
-                Ok(body) if !body.trim().is_empty() => return Ok(PhpExecution {
-                    body, status: 200, headers: HashMap::new(), exited: false, returned: None,
-                }),
-                Ok(_) => warn!("External PHP returned empty for {:?}, trying AST", template_path),
-                Err(e) => warn!("External PHP failed for {:?}: {}, trying AST", template_path, e),
+            match php
+                .process_file(template_path, content, qp, pp, sv, None)
+                .await
+            {
+                Ok(body) if !body.trim().is_empty() => {
+                    return Ok(PhpExecution {
+                        body,
+                        status: 200,
+                        headers: HashMap::new(),
+                        exited: false,
+                        returned: None,
+                    })
+                }
+                Ok(_) => warn!(
+                    "External PHP returned empty for {:?}, trying AST",
+                    template_path
+                ),
+                Err(e) => warn!(
+                    "External PHP failed for {:?}: {}, trying AST",
+                    template_path, e
+                ),
             }
         }
 
         // Fallback to AST
         if let Some(ast) = &self.ast_php_processor {
             let mut ast = ast.lock().await;
-            match ast.execute_php(content, qp, pp, sv, template_path, &self.root_dir).await {
+            match ast
+                .execute_php(content, qp, pp, sv, template_path, &self.root_dir)
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(e) => warn!("AST failed for {:?}: {}, trying embedded", template_path, e),
             }
@@ -1089,9 +1365,15 @@ impl WebServer {
         // Fallback to embedded
         if let Some(emb) = &self.embedded_php_processor {
             match emb.execute_php(content, qp, pp, sv) {
-                Ok(body) => return Ok(PhpExecution {
-                    body, status: 200, headers: HashMap::new(), exited: false, returned: None,
-                }),
+                Ok(body) => {
+                    return Ok(PhpExecution {
+                        body,
+                        status: 200,
+                        headers: HashMap::new(),
+                        exited: false,
+                        returned: None,
+                    })
+                }
                 Err(e) => warn!("Embedded failed for {:?}: {}", template_path, e),
             }
         }
@@ -1101,24 +1383,39 @@ impl WebServer {
 
     /// AST-only mode
     async fn run_ast_only(
-        &self, content: &str, template_path: &Path,
-        qp: &HashMap<String, String>, pp: &HashMap<String, String>, sv: &HashMap<String, String>,
+        &self,
+        content: &str,
+        template_path: &Path,
+        qp: &HashMap<String, String>,
+        pp: &HashMap<String, String>,
+        sv: &HashMap<String, String>,
     ) -> Result<PhpExecution> {
         if let Some(ast) = &self.ast_php_processor {
             let mut ast = ast.lock().await;
-            return ast.execute_php(content, qp, pp, sv, template_path, &self.root_dir).await;
+            return ast
+                .execute_php(content, qp, pp, sv, template_path, &self.root_dir)
+                .await;
         }
         Err(anyhow!("AST processor not available"))
     }
 
     /// Embedded-only mode
     fn run_embedded_only(
-        &self, content: &str,
-        qp: &HashMap<String, String>, pp: &HashMap<String, String>, sv: &HashMap<String, String>,
+        &self,
+        content: &str,
+        qp: &HashMap<String, String>,
+        pp: &HashMap<String, String>,
+        sv: &HashMap<String, String>,
     ) -> Result<PhpExecution> {
         if let Some(emb) = &self.embedded_php_processor {
             let body = emb.execute_php(content, qp, pp, sv)?;
-            return Ok(PhpExecution { body, status: 200, headers: HashMap::new(), exited: false, returned: None });
+            return Ok(PhpExecution {
+                body,
+                status: 200,
+                headers: HashMap::new(),
+                exited: false,
+                returned: None,
+            });
         }
         Err(anyhow!("Embedded processor not available"))
     }
@@ -1162,7 +1459,12 @@ impl WebServer {
         data
     }
 
-    fn resolve_request_target(&self, url_path: &str, root: &Path, init_script: Option<&Path>) -> Result<RequestTarget> {
+    fn resolve_request_target(
+        &self,
+        url_path: &str,
+        root: &Path,
+        init_script: Option<&Path>,
+    ) -> Result<RequestTarget> {
         debug!("Resolving path: {}", url_path);
         let file_path = self.resolve_file_path(url_path, root)?;
 
@@ -1182,7 +1484,10 @@ impl WebServer {
         // Front controller: fall back to _index.php for unmatched routes
         if let Some(init) = init_script {
             if init.is_file() {
-                debug!("No match for {}, routing to front controller {:?}", url_path, init);
+                debug!(
+                    "No match for {}, routing to front controller {:?}",
+                    url_path, init
+                );
                 return Ok(RequestTarget::Script(init.to_path_buf()));
             }
             warn!("Front controller candidate is not a file: {:?}", init);
@@ -1257,8 +1562,14 @@ impl WebServer {
         };
 
         server_vars.insert("SCRIPT_NAME".to_string(), script_name.clone());
-        server_vars.insert("SCRIPT_FILENAME".to_string(), script_path.to_string_lossy().to_string());
-        server_vars.insert("DOCUMENT_ROOT".to_string(), root.to_string_lossy().to_string());
+        server_vars.insert(
+            "SCRIPT_FILENAME".to_string(),
+            script_path.to_string_lossy().to_string(),
+        );
+        server_vars.insert(
+            "DOCUMENT_ROOT".to_string(),
+            root.to_string_lossy().to_string(),
+        );
         let request_uri = uri
             .path_and_query()
             .map(|pq| pq.as_str())
@@ -1274,7 +1585,11 @@ impl WebServer {
                 request_path.to_string()
             } else if request_path.starts_with(dir) {
                 let remainder = &request_path[dir.len()..];
-                if remainder.is_empty() { "".to_string() } else { remainder.to_string() }
+                if remainder.is_empty() {
+                    "".to_string()
+                } else {
+                    remainder.to_string()
+                }
             } else {
                 "".to_string()
             }
@@ -1288,7 +1603,6 @@ impl WebServer {
             let header_value = value.to_str().unwrap_or("").to_string();
             server_vars.insert(header_name, header_value);
         }
-
 
         // Inject RUPH_* stats vars if stats + remote_addr available
         if let (Some(stats), Some(addr)) = (&self.stats, remote_addr) {
@@ -1317,7 +1631,12 @@ impl WebServer {
         server_vars.insert("REQUEST_METHOD".to_string(), parts.method.to_string());
         let script_name = script_path
             .strip_prefix(root)
-            .unwrap_or(script_path.file_name().map(Path::new).unwrap_or(script_path))
+            .unwrap_or(
+                script_path
+                    .file_name()
+                    .map(Path::new)
+                    .unwrap_or(script_path),
+            )
             .to_string_lossy()
             .replace('\\', "/");
         let script_name = if script_name.starts_with('/') {
@@ -1327,8 +1646,14 @@ impl WebServer {
         };
 
         server_vars.insert("SCRIPT_NAME".to_string(), script_name.clone());
-        server_vars.insert("SCRIPT_FILENAME".to_string(), script_path.to_string_lossy().to_string());
-        server_vars.insert("DOCUMENT_ROOT".to_string(), root.to_string_lossy().to_string());
+        server_vars.insert(
+            "SCRIPT_FILENAME".to_string(),
+            script_path.to_string_lossy().to_string(),
+        );
+        server_vars.insert(
+            "DOCUMENT_ROOT".to_string(),
+            root.to_string_lossy().to_string(),
+        );
         let request_uri = uri
             .path_and_query()
             .map(|pq| pq.as_str())
@@ -1344,7 +1669,11 @@ impl WebServer {
                 request_path.to_string()
             } else if request_path.starts_with(dir) {
                 let remainder = &request_path[dir.len()..];
-                if remainder.is_empty() { "".to_string() } else { remainder.to_string() }
+                if remainder.is_empty() {
+                    "".to_string()
+                } else {
+                    remainder.to_string()
+                }
             } else {
                 "".to_string()
             }
@@ -1388,7 +1717,10 @@ impl WebServer {
             format!("/{}", script_name)
         };
         sv.insert("SCRIPT_NAME".to_string(), script_name.clone());
-        sv.insert("SCRIPT_FILENAME".to_string(), script_path.to_string_lossy().to_string());
+        sv.insert(
+            "SCRIPT_FILENAME".to_string(),
+            script_path.to_string_lossy().to_string(),
+        );
         sv.insert("PHP_SELF".to_string(), script_name);
         sv
     }
@@ -1412,7 +1744,10 @@ impl WebServer {
         // Create a fresh processor for this request (avoids blocking the shared mutex)
         let mut ast = match AstPhpProcessor::new() {
             Ok(a) => a,
-            Err(e) => { warn!("Failed to create streaming processor: {}", e); return Ok(None); }
+            Err(e) => {
+                warn!("Failed to create streaming processor: {}", e);
+                return Ok(None);
+            }
         };
 
         // Seed with compiled functions/constants from the shared processor
@@ -1428,29 +1763,29 @@ impl WebServer {
 
         // Clone data for the background task
         let controllers = controllers.to_vec();
-        let leaf_owned: Option<(PathBuf, HashMap<String, String>)> = leaf.map(|(p, sv)| (p.clone(), sv.clone()));
+        let leaf_owned: Option<(PathBuf, HashMap<String, String>)> =
+            leaf.map(|(p, sv)| (p.clone(), sv.clone()));
         let get_params = query_params.clone();
         let post_params = post_params.clone();
         let root_dir = self.root_dir.clone();
         let error_handler = stderr_handler.cloned();
 
         tokio::spawn(async move {
-            let _ = ast.execute_chain(
-                &controllers,
-                leaf_owned.as_ref(),
-                &get_params,
-                &post_params,
-                &root_dir,
-                error_handler,
-            ).await;
+            let _ = ast
+                .execute_chain(
+                    &controllers,
+                    leaf_owned.as_ref(),
+                    &get_params,
+                    &post_params,
+                    &root_dir,
+                    error_handler,
+                )
+                .await;
             // ast drop closes flush_tx, signalling end of stream to the channel receiver
         });
 
         // Wait for PHP to call flush() and commit its headers (with timeout)
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            headers_rx,
-        ).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), headers_rx).await {
             Ok(Ok((headers, status))) => {
                 let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
                 let mut builder = Response::builder().status(status_code);
@@ -1482,20 +1817,52 @@ impl WebServer {
     ) -> Result<PhpExecution> {
         if let Some(ast) = &self.ast_php_processor {
             let mut ast = ast.lock().await;
-            return ast.execute_chain(controllers, leaf, query_params, post_params, &self.root_dir, stderr_handler.cloned()).await;
+            return ast
+                .execute_chain(
+                    controllers,
+                    leaf,
+                    query_params,
+                    post_params,
+                    &self.root_dir,
+                    stderr_handler.cloned(),
+                )
+                .await;
         }
         // CGI fallback: run each script separately (no shared variable context)
         for (script_path, server_vars) in controllers {
-            match self.run_php_buffered(script_path, query_params, post_params, server_vars, stderr_handler).await {
+            match self
+                .run_php_buffered(
+                    script_path,
+                    query_params,
+                    post_params,
+                    server_vars,
+                    stderr_handler,
+                )
+                .await
+            {
                 Ok(exec) if Self::php_stops_controller(&exec) => return Ok(exec),
                 Ok(_) => {}
                 Err(e) => warn!("CGI chain controller failed: {}", e),
             }
         }
         if let Some((leaf_path, leaf_sv)) = leaf {
-            return self.run_php_buffered(leaf_path, query_params, post_params, leaf_sv, stderr_handler).await;
+            return self
+                .run_php_buffered(
+                    leaf_path,
+                    query_params,
+                    post_params,
+                    leaf_sv,
+                    stderr_handler,
+                )
+                .await;
         }
-        Ok(PhpExecution { body: String::new(), status: 200, headers: HashMap::new(), exited: false, returned: None })
+        Ok(PhpExecution {
+            body: String::new(),
+            status: 200,
+            headers: HashMap::new(),
+            exited: false,
+            returned: None,
+        })
     }
 
     async fn run_php_buffered(
@@ -1506,7 +1873,8 @@ impl WebServer {
         server_vars: &HashMap<String, String>,
         stderr_handler: Option<&PhpStderrHandler>,
     ) -> Result<PhpExecution> {
-        let content = fs::read_to_string(script_path).await
+        let content = fs::read_to_string(script_path)
+            .await
             .map_err(|e| anyhow!("Cannot read master _index.php: {}", e))?;
 
         let try_ast = matches!(self.php_mode, PhpMode::Ast | PhpMode::Auto);
@@ -1515,7 +1883,16 @@ impl WebServer {
         // When configured for CGI, use CGI first (it's the full PHP runtime)
         if matches!(self.php_mode, PhpMode::Cgi) {
             if let Some(php) = &self.php_processor {
-                match php.process_file_with_headers(script_path, query_params, post_params, server_vars, stderr_handler).await {
+                match php
+                    .process_file_with_headers(
+                        script_path,
+                        query_params,
+                        post_params,
+                        server_vars,
+                        stderr_handler,
+                    )
+                    .await
+                {
                     Ok(mut exec) => {
                         // CGI can't distinguish exit vs return; use heuristics:
                         // body content, redirect header, or non-200 status all signal "handled"
@@ -1530,7 +1907,18 @@ impl WebServer {
             // CGI-only mode: if CGI failed, try AST as last resort
             if let Some(ast) = &self.ast_php_processor {
                 let mut ast = ast.lock().await;
-                match ast.execute_php_with_handler(&content, query_params, post_params, server_vars, script_path, &self.root_dir, stderr_handler.cloned()).await {
+                match ast
+                    .execute_php_with_handler(
+                        &content,
+                        query_params,
+                        post_params,
+                        server_vars,
+                        script_path,
+                        &self.root_dir,
+                        stderr_handler.cloned(),
+                    )
+                    .await
+                {
                     Ok(result) => return Ok(result),
                     Err(e) => warn!("Master AST fallback also failed: {}", e),
                 }
@@ -1540,7 +1928,18 @@ impl WebServer {
             if try_ast {
                 if let Some(ast) = &self.ast_php_processor {
                     let mut ast = ast.lock().await;
-                    match ast.execute_php_with_handler(&content, query_params, post_params, server_vars, script_path, &self.root_dir, stderr_handler.cloned()).await {
+                    match ast
+                        .execute_php_with_handler(
+                            &content,
+                            query_params,
+                            post_params,
+                            server_vars,
+                            script_path,
+                            &self.root_dir,
+                            stderr_handler.cloned(),
+                        )
+                        .await
+                    {
                         Ok(result) => return Ok(result),
                         Err(e) => warn!("Master AST execution failed: {}, trying fallback", e),
                     }
@@ -1549,7 +1948,16 @@ impl WebServer {
             // Fallback to CGI (can't distinguish exit vs return; use heuristics)
             if try_cgi {
                 if let Some(php) = &self.php_processor {
-                    match php.process_file_with_headers(script_path, query_params, post_params, server_vars, stderr_handler).await {
+                    match php
+                        .process_file_with_headers(
+                            script_path,
+                            query_params,
+                            post_params,
+                            server_vars,
+                            stderr_handler,
+                        )
+                        .await
+                    {
                         Ok(mut exec) => {
                             // CGI can't distinguish exit vs return; use heuristics:
                             // body content, redirect header, or non-200 status all signal "handled"
@@ -1568,7 +1976,12 @@ impl WebServer {
     }
 
     #[allow(dead_code)]
-    async fn run_init_script_for(&self, req: &Request<IncomingBody>, root: &Path, init_script: Option<&Path>) -> Result<()> {
+    async fn run_init_script_for(
+        &self,
+        req: &Request<IncomingBody>,
+        root: &Path,
+        init_script: Option<&Path>,
+    ) -> Result<()> {
         let script_path = match init_script {
             Some(path) if path.is_file() => path,
             Some(path) => {
@@ -1594,7 +2007,10 @@ impl WebServer {
         let server_vars = self.build_server_vars(req, script_path, root)?;
         let mut processor = ast_processor.lock().await;
         // Init errors are non-fatal: the front controller runs the script fully via stream_file.
-        if let Err(e) = processor.execute_init(&content, &server_vars, script_path, root).await {
+        if let Err(e) = processor
+            .execute_init(&content, &server_vars, script_path, root)
+            .await
+        {
             debug!("Init script AST pass skipped (non-fatal): {}", e);
         }
         Ok(())
@@ -1668,7 +2084,8 @@ impl WebServer {
             }
 
             // Fallback to AST init pass if CGI path is unavailable/fails.
-            self.run_init_script_for(req, root, Some(&script_path)).await?;
+            self.run_init_script_for(req, root, Some(&script_path))
+                .await?;
         }
 
         Ok(None)
@@ -1725,7 +2142,17 @@ mod tests {
     #[tokio::test]
     async fn test_static_file_serving() {
         let temp_dir = TempDir::new().unwrap();
-        let web_server = WebServer::new(temp_dir.path().to_path_buf(), HashMap::new(), Vec::new(), vec!["_index.php".to_string()], PhpMode::Auto, None, None, None).unwrap();
+        let web_server = WebServer::new(
+            temp_dir.path().to_path_buf(),
+            HashMap::new(),
+            Vec::new(),
+            vec!["_index.php".to_string()],
+            PhpMode::Auto,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let html_content = "<html><body>Hello World</body></html>";
         let html_path = temp_dir.path().join("test.html");
@@ -1738,16 +2165,26 @@ mod tests {
     #[test]
     fn test_path_traversal_protection() {
         let temp_dir = TempDir::new().unwrap();
-        let web_server = WebServer::new(temp_dir.path().to_path_buf(), HashMap::new(), Vec::new(), vec!["_index.php".to_string()], PhpMode::Auto, None, None, None).unwrap();
+        let web_server = WebServer::new(
+            temp_dir.path().to_path_buf(),
+            HashMap::new(),
+            Vec::new(),
+            vec!["_index.php".to_string()],
+            PhpMode::Auto,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
-        let result = web_server.resolve_file_path("/../etc/passwd", temp_dir.path());
-        // Either fails or the resolved path is not under root
-        if let Ok(path) = result {
-            let canonical_root = temp_dir.path().canonicalize().unwrap();
-            if let Ok(canonical) = path.canonicalize() {
-                assert!(!canonical.starts_with(&canonical_root) == false || true);
-            }
-        }
+        let outside_name = format!("ruph_outside_{}", std::process::id());
+        let outside_path = temp_dir.path().parent().unwrap().join(&outside_name);
+        std::fs::write(&outside_path, "outside").unwrap();
+
+        let result = web_server.resolve_file_path(&format!("/../{outside_name}"), temp_dir.path());
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_file(outside_path);
     }
 
     #[test]
@@ -1756,20 +2193,42 @@ mod tests {
         std::fs::write(temp_dir.path().join("page.html"), "hi").unwrap();
         std::fs::write(temp_dir.path().join("app.php"), "<?php echo 1;").unwrap();
 
-        let web_server = WebServer::new(temp_dir.path().to_path_buf(), HashMap::new(), Vec::new(), vec!["_index.php".to_string()], PhpMode::Auto, None, None, None).unwrap();
+        let web_server = WebServer::new(
+            temp_dir.path().to_path_buf(),
+            HashMap::new(),
+            Vec::new(),
+            vec!["_index.php".to_string()],
+            PhpMode::Auto,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let root = temp_dir.path();
 
-        match web_server.resolve_request_target("/page.html", root, None).unwrap() {
+        match web_server
+            .resolve_request_target("/page.html", root, None)
+            .unwrap()
+        {
             RequestTarget::Static(_) => {}
             other => panic!("Expected Static, got {:?}", std::mem::discriminant(&other)),
         }
-        match web_server.resolve_request_target("/app.php", root, None).unwrap() {
+        match web_server
+            .resolve_request_target("/app.php", root, None)
+            .unwrap()
+        {
             RequestTarget::Script(_) => {}
             other => panic!("Expected Script, got {:?}", std::mem::discriminant(&other)),
         }
-        match web_server.resolve_request_target("/nonexistent", root, None).unwrap() {
+        match web_server
+            .resolve_request_target("/nonexistent", root, None)
+            .unwrap()
+        {
             RequestTarget::NotFound => {}
-            other => panic!("Expected NotFound, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "Expected NotFound, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -1827,20 +2286,42 @@ mod tests {
         let rr = web_server.resolve_rr_vars("/users/admin/profile.html", root);
         assert_eq!(
             rr.get("rr_leaf_idx").map(|s| s.as_str()),
-            Some(root.join("users/admin/_index.php").to_string_lossy().as_ref())
+            Some(
+                root.join("users/admin/_index.php")
+                    .to_string_lossy()
+                    .as_ref()
+            )
         );
     }
 
     #[tokio::test]
     async fn test_index_resolution() {
         let temp_dir = TempDir::new().unwrap();
-        write(temp_dir.path().join("_index.php"), "<?php echo 'Root index'; ?>").await.unwrap();
+        write(
+            temp_dir.path().join("_index.php"),
+            "<?php echo 'Root index'; ?>",
+        )
+        .await
+        .unwrap();
 
-        let web_server = WebServer::new(temp_dir.path().to_path_buf(), HashMap::new(), Vec::new(), vec!["_index.php".to_string()], PhpMode::Auto, None, None, None).unwrap();
+        let web_server = WebServer::new(
+            temp_dir.path().to_path_buf(),
+            HashMap::new(),
+            Vec::new(),
+            vec!["_index.php".to_string()],
+            PhpMode::Auto,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let root = temp_dir.path();
         let init_script = root.join("_index.php");
 
-        match web_server.resolve_request_target("/", root, Some(&init_script)).unwrap() {
+        match web_server
+            .resolve_request_target("/", root, Some(&init_script))
+            .unwrap()
+        {
             RequestTarget::Script(p) => assert!(p.ends_with("_index.php")),
             other => panic!("Expected Script, got {:?}", std::mem::discriminant(&other)),
         }
@@ -1859,11 +2340,24 @@ mod tests {
         let php_path = temp_dir.path().join("test.php");
         write(&php_path, php_content).await.unwrap();
 
-        let web_server = WebServer::new(temp_dir.path().to_path_buf(), HashMap::new(), Vec::new(), vec!["_index.php".to_string()], PhpMode::Auto, None, None, None).unwrap();
+        let web_server = WebServer::new(
+            temp_dir.path().to_path_buf(),
+            HashMap::new(),
+            Vec::new(),
+            vec!["_index.php".to_string()],
+            PhpMode::Auto,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let qp = HashMap::new();
         let pp = HashMap::new();
         let sv = HashMap::new();
-        let response = web_server.process_php_template(&php_path, &qp, &pp, &sv, false, None).await.unwrap();
+        let response = web_server
+            .process_php_template(&php_path, &qp, &pp, &sv, false, None)
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 

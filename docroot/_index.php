@@ -1,30 +1,26 @@
 <?php
 
-// Basic per-request init
-header("Content-Type: text/plain");
+if (substr($_SERVER['REQUEST_URI'], 0, 6) === '/proxy') {
+    // Silent fallthrough lets the /proxy/_index.php leaf handle the request.
+} else {
+    header("Content-Type: text/plain");
 
-foreach( [1,2,3] as $v )
-    echo "ruph ok $v\n";
+    foreach ([1, 2, 3] as $v) {
+        echo "ruph ok $v\n";
+    }
 
-echo "path: " . $_SERVER['REQUEST_URI'] . "\n";
+    echo "path: " . $_SERVER['REQUEST_URI'] . "\n";
 
+    $name = 'hello';
 
-$name = 'hello';
+    echo $name;
+    var_dump($name);
+    var_dump(10);
+    echo "\n<h2>\n";
+    echo $name;
+    echo "\n</h2>\n";
 
-echo $name;
-echo var_dump($name);
-var_dump(10);
-?>
-
-<h2>
-<?=$name?>
-</h2>
-
-
-
-  <?php
-  var_dump(1);
-  echo "after\n";
-  echo var_dump('2');
-  ?>
-
+    var_dump(1);
+    echo "after\n";
+    var_dump('2');
+}

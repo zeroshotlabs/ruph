@@ -1,17 +1,17 @@
+use anyhow::{anyhow, Result};
+use rustls::crypto::ring::sign::any_supported_type;
+use rustls::crypto::ring::Ticketer;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer};
+use rustls::server::ServerSessionMemoryCache;
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
+use rustls::ServerConfig;
+use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use anyhow::{Result, anyhow};
-use rustls::ServerConfig;
-use rustls::server::{ClientHello, ResolvesServerCert};
-use rustls::server::ServerSessionMemoryCache;
-use rustls::crypto::ring::Ticketer;
-use rustls::sign::CertifiedKey;
-use rustls::crypto::ring::sign::any_supported_type;
-use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer};
 use tracing::debug;
 
 pub fn default_ssl_dir() -> PathBuf {
@@ -30,7 +30,9 @@ struct WildcardCertResolver {
 
 impl WildcardCertResolver {
     fn new() -> Self {
-        Self { certs: HashMap::new() }
+        Self {
+            certs: HashMap::new(),
+        }
     }
 
     fn add(&mut self, name: &str, cert_key: CertifiedKey) {
@@ -85,7 +87,10 @@ pub fn build_tls_config(ssl_dir: &Path) -> Result<ServerConfig> {
     }
 
     if resolver.len() == 0 {
-        return Err(anyhow!("No TLS certificates found in {}", ssl_dir.display()));
+        return Err(anyhow!(
+            "No TLS certificates found in {}",
+            ssl_dir.display()
+        ));
     }
 
     let mut config = ServerConfig::builder()
@@ -93,8 +98,8 @@ pub fn build_tls_config(ssl_dir: &Path) -> Result<ServerConfig> {
         .with_cert_resolver(Arc::new(resolver));
 
     // Enable and tune TLS session resumption for lower reconnect latency.
-    config.ticketer = Ticketer::new()
-        .map_err(|e| anyhow!("Failed to initialize TLS ticketing: {}", e))?;
+    config.ticketer =
+        Ticketer::new().map_err(|e| anyhow!("Failed to initialize TLS ticketing: {}", e))?;
     config.session_storage = ServerSessionMemoryCache::new(4096);
 
     // Prefer HTTP/2 when supported by clients; allow HTTP/1.1 fallback.
@@ -110,8 +115,7 @@ fn load_cert_key(domain_dir: &Path) -> Result<CertifiedKey> {
     let certs = read_certs(&cert_path)?;
     let key = read_key(&key_path)?;
 
-    let signing_key = any_supported_type(&key)
-        .map_err(|_| anyhow!("Invalid private key"))?;
+    let signing_key = any_supported_type(&key).map_err(|_| anyhow!("Invalid private key"))?;
 
     Ok(CertifiedKey::new(certs, signing_key))
 }
@@ -119,8 +123,7 @@ fn load_cert_key(domain_dir: &Path) -> Result<CertifiedKey> {
 fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
-    let certs = certs(&mut reader)
-        .collect::<io::Result<Vec<CertificateDer<'static>>>>()?;
+    let certs = certs(&mut reader).collect::<io::Result<Vec<CertificateDer<'static>>>>()?;
     Ok(certs)
 }
 
@@ -135,8 +138,8 @@ fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
-    let mut keys = rsa_private_keys(&mut reader)
-        .collect::<io::Result<Vec<PrivatePkcs1KeyDer<'static>>>>()?;
+    let mut keys =
+        rsa_private_keys(&mut reader).collect::<io::Result<Vec<PrivatePkcs1KeyDer<'static>>>>()?;
     if let Some(key) = keys.pop() {
         return Ok(PrivateKeyDer::Pkcs1(key));
     }
@@ -164,7 +167,10 @@ pub fn warn_expiring(ssl_dir: &Path, days: i64) {
             if let Ok(expiry) = cert_expiry(&cert_path) {
                 if expiry <= threshold {
                     if let Some(domain) = path.file_name().and_then(|s| s.to_str()) {
-                        eprintln!("  WARNING: TLS certificate for {} expires on {}", domain, expiry);
+                        eprintln!(
+                            "  WARNING: TLS certificate for {} expires on {}",
+                            domain, expiry
+                        );
                     }
                 }
             }
@@ -200,10 +206,12 @@ fn cert_expiry(path: &Path) -> Result<chrono::DateTime<chrono::Utc>> {
     let data = std::fs::read(path)?;
     let (_, pem) = x509_parser::pem::parse_x509_pem(&data)
         .map_err(|_| anyhow!("Failed to parse certificate"))?;
-    let cert = pem.parse_x509().map_err(|_| anyhow!("Failed to parse x509"))?;
+    let cert = pem
+        .parse_x509()
+        .map_err(|_| anyhow!("Failed to parse x509"))?;
     let not_after = cert.validity().not_after.to_datetime();
-    Ok(chrono::DateTime::<chrono::Utc>::from_timestamp(
-        not_after.unix_timestamp(),
-        0,
-    ).ok_or_else(|| anyhow!("Invalid cert timestamp"))?)
+    Ok(
+        chrono::DateTime::<chrono::Utc>::from_timestamp(not_after.unix_timestamp(), 0)
+            .ok_or_else(|| anyhow!("Invalid cert timestamp"))?,
+    )
 }
