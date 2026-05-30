@@ -1,24 +1,26 @@
 # ruph Quick Start
 
-`ruph` serves websites from a folder on disk.
+`ruph` is a single-binary web server with a built-in PHP interpreter. No PHP installation required.
 
-In most cases, you point it at your site folder and start it:
+Point it at your site folder and start it:
 
 ```bash
 ./ruph /var/www/mysite
 ```
 
-If you want HTTPS:
+With HTTPS:
 
 ```bash
 ./ruph /var/www/mysite --tls
 ```
 
-If you use a config file:
+With a config file:
 
 ```bash
 ./ruph -c ruph.ini /var/www/mysite
 ```
+
+Running `./ruph` with no arguments prints help.
 
 ## Basic Idea
 
@@ -29,7 +31,7 @@ Inside that folder, ruph can do two things:
 1. Serve normal files directly
 2. Run `_index.php` files to customize behavior
 
-That means you can start simple with plain HTML files, and only add PHP control files where you need them.
+PHP runs natively inside ruph using a built-in AST interpreter — no external PHP binary is needed. You can start simple with plain HTML files, and only add PHP control files where you need them.
 
 ## Simplest Site
 
@@ -99,7 +101,7 @@ But if that folder has its own `_index.php`, that file can intercept the request
 
 ## Existing PHP Files
 
-If the requested file itself ends in `.php`, ruph executes that file as PHP.
+If the requested file itself ends in `.php`, ruph executes that file as PHP.  Files named `_index.php` cannot be accessed directly by URL — they only run as controllers.
 
 Example:
 
@@ -126,6 +128,32 @@ docroot = /var/www/other.org
 
 Each site can then have its own files and its own `_index.php`.
 
+## Logging
+
+By default, ruph logs access and error information to configured log files.
+
+To see logs on the console:
+
+```bash
+./ruph /var/www/mysite --log-console
+```
+
+To control log verbosity:
+
+```bash
+./ruph /var/www/mysite --log-level debug --log-console
+```
+
+Available levels: `error`, `warn`, `info` (default), `debug`, `trace`.
+
+When `--log-level` is set without `--log-console`, tracing output goes to the configured error log file.
+
+To print periodic server stats:
+
+```bash
+./ruph /var/www/mysite --stdoutstats 5
+```
+
 ## When to Use `_index.php`
 
 Use `_index.php` when you want to:
@@ -150,6 +178,9 @@ Then add `_index.php` later only if you need custom behavior.
 
 ## More Detail
 
-For the full request flow and exact `_index.php` behavior, see [REQUESTS.md](REQUESTS.md).
+For the full request flow and exact `_index.php` behavior, see [REQUESTS.md](docs/REQUESTS.md).
 
-For config file details, see [RUPH_INI.md](RUPH_INI.md).
+For config file details, see [RUPH_INI.md](docs/RUPH_INI.md).
+
+For the built-in PHP language reference, see [RUPH-PHP.md](docs/RUPH-PHP.md).
+

@@ -148,6 +148,8 @@ pub struct AstPhpProcessor {
     next_curl_id: u32,
     /// Domain for the current request (for log context)
     request_domain: String,
+    /// Request URI for the current request (for log context)
+    request_uri: String,
 }
 
 impl AstPhpProcessor {
@@ -235,6 +237,7 @@ impl AstPhpProcessor {
             curl_handles: HashMap::new(),
             next_curl_id: 1,
             request_domain: String::new(),
+            request_uri: String::new(),
             constants: {
                 let mut c = HashMap::new();
                 c.insert("PATHINFO_DIRNAME".to_string(), PhpValue::Int(1));
@@ -325,7 +328,16 @@ impl AstPhpProcessor {
         if let Some(ref handler) = self.error_log_handler {
             handler(msg);
         } else {
-            warn!("PHP: {}", msg);
+            warn!("[{}] PHP: {}", self.request_domain, msg);
+        }
+    }
+
+    fn log_error_with_context(&self, msg: &str) {
+        let ctx = format!("[{} {}] {}", self.request_domain, self.request_uri, msg);
+        if let Some(ref handler) = self.error_log_handler {
+            handler(&ctx);
+        } else {
+            warn!("PHP: {}", ctx);
         }
     }
 
@@ -368,6 +380,10 @@ impl AstPhpProcessor {
         self.error_log_handler = error_handler;
         self.request_domain = server_vars
             .get("HTTP_HOST")
+            .cloned()
+            .unwrap_or_default();
+        self.request_uri = server_vars
+            .get("REQUEST_URI")
             .cloned()
             .unwrap_or_default();
 
@@ -1228,11 +1244,11 @@ impl AstPhpProcessor {
                     let (class_name, message) = match val {
                         PhpValue::Object(obj) => {
                             let msg = obj.props.get("message").map_or(String::new(), |v| v.as_string());
-                            warn!("[{}] PHP throw {}: props={:?}, msg='{}'", self.request_domain, obj.class_name, obj.props.keys().collect::<Vec<_>>(), msg);
+                            debug!("[{}] PHP throw {}: props={:?}, msg='{}'", self.request_domain, obj.class_name, obj.props.keys().collect::<Vec<_>>(), msg);
                             (obj.class_name.clone(), msg)
                         }
                         _ => {
-                            warn!("[{}] PHP throw (non-object): {:?}", self.request_domain, val);
+                            debug!("[{}] PHP throw (non-object): {:?}", self.request_domain, val);
                             ("Exception".to_string(), val.as_string())
                         }
                     };
@@ -1348,8 +1364,8 @@ impl AstPhpProcessor {
                             | "use_declaration"
                     ) {
                         let line = node.start_position().row + 1;
-                        warn!("[{}] PHP Unhandled AST node '{}' at line {}", self.request_domain, kind, line);
-                        self.log_error(&format!("Unhandled AST node '{}' at line {}", kind, line));
+                        warn!("[{}] {} Unhandled AST node '{}' at line {}", self.request_domain, self.request_uri, kind, line);
+                        self.log_error_with_context(&format!("Unhandled AST node '{}' at line {}", kind, line));
                     }
                     // Recursively process child nodes
                     for child in node.named_children(&mut node.walk()) {
@@ -2308,7 +2324,7 @@ impl AstPhpProcessor {
 
                 let class_def = self.user_classes.get(&class_name).cloned();
                 let Some(class_def) = class_def else {
-                    self.log_error(&format!("Class '{}' not found", class_name));
+                    self.log_error_with_context(&format!("Class '{}' not found", class_name));
                     return Ok(PhpValue::Null);
                 };
 
@@ -2324,7 +2340,16 @@ impl AstPhpProcessor {
                 props.extend(class_def.default_props.clone());
 
                 // Evaluate constructor arguments
-                let args_node = node.child_by_field_name("arguments");
+                let mut args_node = node.child_by_field_name("arguments");
+                if args_node.is_none() {
+                    // Fallback: tree-sitter-php may not expose args as a named field
+                    for child in node.named_children(&mut node.walk()) {
+                        if child.kind() == "arguments" || child.kind() == "argument_list" {
+                            args_node = Some(child);
+                            break;
+                        }
+                    }
+                }
                 let mut args = Vec::new();
                 if let Some(args_node) = args_node {
                     for child in args_node.named_children(&mut args_node.walk()) {
@@ -2342,20 +2367,20 @@ impl AstPhpProcessor {
 
                 // Call __construct if defined
                 if class_def.methods.contains_key("__construct") {
-                    warn!("[{}] PHP new {} — calling __construct with {} args", self.request_domain, class_name, args.len());
+                    debug!("[{}] PHP new {} — calling __construct with {} args", self.request_domain, class_name, args.len());
                     let (_, updated) = self.call_method(obj, "__construct", args).await?;
                     obj = updated;
                 } else if obj.props.contains_key("message") && !args.is_empty() {
                     // Built-in exception-style constructor: ($message, $code, $previous)
                     if let Some(msg) = args.first() {
-                        warn!("[{}] PHP new {} — built-in exception ctor, message={:?}", self.request_domain, class_name, msg);
+                        debug!("[{}] PHP new {} — built-in exception ctor, message={:?}", self.request_domain, class_name, msg);
                         obj.props.insert("message".to_string(), msg.clone());
                     }
                     if let Some(code) = args.get(1) {
                         obj.props.insert("code".to_string(), code.clone());
                     }
                 } else {
-                    warn!("[{}] PHP new {} — no __construct, {} args, has_message_prop={}", self.request_domain, class_name, args.len(), obj.props.contains_key("message"));
+                    debug!("[{}] PHP new {} — no __construct, {} args, has_message_prop={}", self.request_domain, class_name, args.len(), obj.props.contains_key("message"));
                 }
 
                 Ok(PhpValue::Object(Box::new(obj)))
@@ -2465,8 +2490,8 @@ impl AstPhpProcessor {
                                 PhpValue::Resource(_) => "resource",
                                 PhpValue::Object(_) => "object",
                             };
-                            warn!("[{}] PHP Method call on non-object ({}) for {}->{} at line {}", self.request_domain, type_name, obj_src, method_name, line);
-                            self.log_error(&format!(
+                            warn!("[{}] {} Method call on non-object ({}) for {}->{} at line {}", self.request_domain, self.request_uri, type_name, obj_src, method_name, line);
+                            self.log_error_with_context(&format!(
                                 "Method call on non-object ({}) for {}->{} at line {}",
                                 type_name, obj_src, method_name, line
                             ));
@@ -2487,11 +2512,11 @@ impl AstPhpProcessor {
                 let (class_name, message) = match val {
                     PhpValue::Object(obj) => {
                         let msg = obj.props.get("message").map_or(String::new(), |v| v.as_string());
-                        warn!("[{}] PHP throw expr {}: props={:?}, msg='{}'", self.request_domain, obj.class_name, obj.props.keys().collect::<Vec<_>>(), msg);
+                        debug!("[{}] PHP throw expr {}: props={:?}, msg='{}'", self.request_domain, obj.class_name, obj.props.keys().collect::<Vec<_>>(), msg);
                         (obj.class_name.clone(), msg)
                     }
                     _ => {
-                        warn!("[{}] PHP throw expr (non-object): {:?}", self.request_domain, val);
+                        debug!("[{}] PHP throw expr (non-object): {:?}", self.request_domain, val);
                         ("Exception".to_string(), val.as_string())
                     }
                 };
@@ -2501,8 +2526,8 @@ impl AstPhpProcessor {
             _ => {
                 let kind = node.kind();
                 let line = node.start_position().row + 1;
-                warn!("[{}] PHP Unhandled expression '{}' at line {}", self.request_domain, kind, line);
-                self.log_error(&format!(
+                warn!("[{}] {} Unhandled expression '{}' at line {}", self.request_domain, self.request_uri, kind, line);
+                self.log_error_with_context(&format!(
                     "Unhandled expression node '{}' at line {}",
                     kind, line
                 ));
@@ -4626,8 +4651,8 @@ impl AstPhpProcessor {
                     if let Some(val) = self.constants.get(&func_name) {
                         return Ok(val.clone());
                     }
-                    warn!("[{}] PHP Unknown function: {}() with {} args", self.request_domain, func_name, args.len());
-                    self.log_error(&format!("Unknown function: {}() with {} args", func_name, args.len()));
+                    warn!("[{}] {} Unknown function: {}() with {} args", self.request_domain, self.request_uri, func_name, args.len());
+                    self.log_error_with_context(&format!("Unknown function: {}() with {} args", func_name, args.len()));
                     Ok(PhpValue::Null)
                 }
             }
@@ -4730,7 +4755,7 @@ impl AstPhpProcessor {
                                     .unwrap_or("$e")
                                     .trim_start_matches('$')
                                     .to_string();
-                                warn!("[{}] PHP catch: {}='{}' into ${}", self.request_domain, thrown_class, thrown_message, var_name);
+                                debug!("[{}] PHP catch: {}='{}' into ${}", self.request_domain, thrown_class, thrown_message, var_name);
                                 // Create an exception object with a getMessage() method
                                 let mut props = HashMap::new();
                                 props.insert("message".to_string(), PhpValue::String(thrown_message.clone()));
@@ -4804,7 +4829,7 @@ impl AstPhpProcessor {
             match method_name {
                 "getmessage" => {
                     let msg = obj.props.get("message").cloned().unwrap_or(PhpValue::Null);
-                    warn!("[{}] PHP getMessage() on {}: props={:?}, result={:?}", self.request_domain, class_name, obj.props.keys().collect::<Vec<_>>(), msg);
+                    debug!("[{}] PHP getMessage() on {}: props={:?}, result={:?}", self.request_domain, class_name, obj.props.keys().collect::<Vec<_>>(), msg);
                     return Ok((msg, obj));
                 }
                 "getcode" => {
@@ -4815,7 +4840,7 @@ impl AstPhpProcessor {
                     return Ok((PhpValue::String(String::new()), obj));
                 }
                 _ => {
-                    self.log_error(&format!(
+                    self.log_error_with_context(&format!(
                         "Call to undefined method {}::{}()",
                         class_name, method_name
                     ));
@@ -4850,7 +4875,7 @@ impl AstPhpProcessor {
         match &exec_result {
             Ok(out) => method_output = out.clone(),
             Err(e) => {
-                warn!("[{}] PHP method {}::{}() error: {}", self.request_domain, class_name, method_name, e);
+                debug!("[{}] PHP method {}::{}() error: {}", self.request_domain, class_name, method_name, e);
                 method_output = String::new();
             }
         }
@@ -5117,9 +5142,13 @@ impl AstPhpProcessor {
         self.error_log_handler = error_handler;
         self.accumulated_output.clear();
 
-        // Extract domain from server vars for log context
+        // Extract domain/URI from server vars for log context
         self.request_domain = first_sv
             .get("HTTP_HOST")
+            .cloned()
+            .unwrap_or_default();
+        self.request_uri = first_sv
+            .get("REQUEST_URI")
             .cloned()
             .unwrap_or_default();
 
