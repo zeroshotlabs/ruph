@@ -24,6 +24,7 @@ mod ssl;
 mod status;
 mod trailhead_client;
 mod web_server;
+mod xml_parser;
 
 use crate::web_server::{RuphBody, WebServer};
 

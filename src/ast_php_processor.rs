@@ -25,6 +25,8 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio_rustls::TlsConnector;
 
+use crate::xml_parser;
+
 static PHP_TAG_RE: OnceLock<Regex> = OnceLock::new();
 static SESSION_LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
     OnceLock::new();
@@ -33,6 +35,12 @@ static SESSION_LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<AsyncMutex<(
 struct PhpTlsStream {
     stream: tokio_rustls::client::TlsStream<TcpStream>,
     eof: bool,
+    /// Buffer for efficient line reading (fgets) and fread
+    read_buffer: Vec<u8>,
+    /// Write buffer for coalescing small writes
+    write_buffer: Vec<u8>,
+    /// Real-time streaming mode (disables write buffering for immediate flush)
+    streaming_mode: bool,
 }
 
 /// AST-based PHP processor using tree-sitter-php
@@ -649,6 +657,39 @@ impl AstPhpProcessor {
                             self.append_output(output, &out);
                         }
                         self.append_output(output, &value.as_string());
+                    }
+                }
+            }
+            "unset_statement" => {
+                // Handle unset($var1, $var2, ...)
+                if let Some(args_node) = node.child_by_field_name("arguments") {
+                    for arg in args_node.named_children(&mut args_node.walk()) {
+                        match arg.kind() {
+                            "variable_name" => {
+                                let var_name = arg
+                                    .utf8_text(self.source_code.as_bytes())
+                                    .unwrap_or("")
+                                    .trim_start_matches('$');
+                                // Remove from local variables first, then global
+                                self.variables.remove(var_name);
+                                self.global_variables.remove(var_name);
+                            }
+                            "subscript_expression" => {
+                                // Handle array element unset: unset($arr['key'])
+                                // For now, just evaluate the expression (which might have side effects)
+                                // Full array element removal would require more complex handling
+                                let _ = self.evaluate_expression(arg).await?;
+                            }
+                            "member_access_expression" => {
+                                // Handle object property unset: unset($obj->prop)
+                                // For now, just evaluate the expression
+                                let _ = self.evaluate_expression(arg).await?;
+                            }
+                            _ => {
+                                // Try to evaluate as a general expression
+                                let _ = self.evaluate_expression(arg).await?;
+                            }
+                        }
                     }
                 }
             }
@@ -2082,7 +2123,15 @@ impl AstPhpProcessor {
                 match cast_type.trim().to_lowercase().as_str() {
                     "int" | "integer" => Ok(PhpValue::Int(value.as_int())),
                     "float" | "double" | "real" => Ok(PhpValue::Float(value.as_float())),
-                    "string" => Ok(PhpValue::String(value.as_string())),
+                    "string" => {
+                        // Special handling for SimpleXMLElement to string conversion
+                        if let PhpValue::Object(obj) = &value {
+                            if obj.class_name == "SimpleXMLElement" {
+                                return Ok(PhpValue::String(xml_parser::get_xml_text(&value)));
+                            }
+                        }
+                        Ok(PhpValue::String(value.as_string()))
+                    }
                     "bool" | "boolean" => Ok(PhpValue::Bool(value.is_truthy())),
                     "array" => Ok(match value {
                         PhpValue::Array(_) => value,
@@ -2409,7 +2458,13 @@ impl AstPhpProcessor {
                                 .unwrap_or("")
                                 .trim_start_matches('$')
                                 .to_string();
-                            Ok(obj.props.get(&prop).cloned().unwrap_or(PhpValue::Null))
+
+                            // Special handling for SimpleXMLElement
+                            if obj.class_name == "SimpleXMLElement" {
+                                Ok(xml_parser::get_xml_child(&PhpValue::Object(obj), &prop))
+                            } else {
+                                Ok(obj.props.get(&prop).cloned().unwrap_or(PhpValue::Null))
+                            }
                         } else {
                             Ok(PhpValue::Null)
                         }
@@ -4232,6 +4287,9 @@ impl AstPhpProcessor {
                             PhpTlsStream {
                                 stream: tls_stream,
                                 eof: false,
+                                read_buffer: Vec::new(),
+                                write_buffer: Vec::new(),
+                                streaming_mode: false,
                             },
                         );
                         Ok(PhpValue::Resource(id))
@@ -4247,7 +4305,25 @@ impl AstPhpProcessor {
                 }
             }
             "stream_set_blocking" => {
-                // No-op: all I/O uses tokio async (inherently non-blocking)
+                // stream_set_blocking($stream, $blocking)
+                // We use this to control streaming mode:
+                // blocking=false enables real-time streaming (no write buffering)
+                // blocking=true enables buffering for efficiency
+                let handle = if let Some(PhpValue::Resource(id)) = args.first() {
+                    *id
+                } else {
+                    0
+                };
+                let blocking = args.get(1).map_or(true, |a| a.is_truthy());
+
+                if handle != 0 {
+                    if let Some(php_stream) = self.streams.get_mut(&handle) {
+                        // Non-blocking = streaming mode (immediate flush)
+                        php_stream.streaming_mode = !blocking;
+                        debug!("[{}] PHP stream_set_blocking: handle={}, streaming_mode={}",
+                               self.request_domain, handle, !blocking);
+                    }
+                }
                 Ok(PhpValue::Bool(true))
             }
             "fwrite" => {
@@ -4257,23 +4333,91 @@ impl AstPhpProcessor {
                     0
                 };
                 let data = args.get(1).map_or(String::new(), |a| a.as_string());
-                debug!("[{}] PHP fwrite: handle={}, {} bytes", self.request_domain, handle, data.len());
+                let length = args.get(2).map_or(data.len(), |a| a.as_int().max(0) as usize);
+
                 if handle == 0 {
                     return Ok(PhpValue::Bool(false));
                 }
+
                 if let Some(mut php_stream) = self.streams.remove(&handle) {
-                    let bytes = data.into_bytes();
+                    let bytes = if length < data.len() {
+                        data[..length].to_string().into_bytes()
+                    } else {
+                        data.into_bytes()
+                    };
                     let len = bytes.len() as i64;
-                    let result = php_stream.stream.write_all(&bytes).await;
-                    self.streams.insert(handle, php_stream);
-                    match result {
-                        Ok(_) => {
-                            debug!("[{}] PHP fwrite: OK, wrote {} bytes", self.request_domain, len);
-                            Ok(PhpValue::Int(len))
+
+                    // In streaming mode, always write immediately
+                    if php_stream.streaming_mode {
+                        // Flush any buffered data first
+                        let to_write = if !php_stream.write_buffer.is_empty() {
+                            let mut buf = std::mem::take(&mut php_stream.write_buffer);
+                            buf.extend_from_slice(&bytes);
+                            buf
+                        } else {
+                            bytes
+                        };
+
+                        let result = php_stream.stream.write_all(&to_write).await;
+                        self.streams.insert(handle, php_stream);
+
+                        match result {
+                            Ok(_) => {
+                                debug!("[{}] PHP fwrite (streaming): handle={}, wrote {} bytes immediately",
+                                       self.request_domain, handle, len);
+                                Ok(PhpValue::Int(len))
+                            }
+                            Err(e) => {
+                                self.log_error(&format!("fwrite failed: {}", e));
+                                Ok(PhpValue::Bool(false))
+                            }
                         }
-                        Err(e) => {
-                            self.log_error(&format!("fwrite failed: {}", e));
-                            Ok(PhpValue::Bool(false))
+                    }
+                    // For small writes (< 256 bytes) in non-streaming mode, buffer them
+                    else if bytes.len() < 256 {
+                        php_stream.write_buffer.extend_from_slice(&bytes);
+                        debug!("[{}] PHP fwrite: handle={}, buffered {} bytes (total buffer: {})",
+                               self.request_domain, handle, len, php_stream.write_buffer.len());
+
+                        // Flush if buffer is getting large (> 1KB)
+                        if php_stream.write_buffer.len() > 1024 {
+                            let flush_data = std::mem::take(&mut php_stream.write_buffer);
+                            match php_stream.stream.write_all(&flush_data).await {
+                                Ok(_) => {
+                                    debug!("[{}] PHP fwrite: flushed {} bytes", self.request_domain, flush_data.len());
+                                }
+                                Err(e) => {
+                                    self.log_error(&format!("fwrite flush failed: {}", e));
+                                    self.streams.insert(handle, php_stream);
+                                    return Ok(PhpValue::Bool(false));
+                                }
+                            }
+                        }
+                        self.streams.insert(handle, php_stream);
+                        Ok(PhpValue::Int(len))
+                    } else {
+                        // Large write - flush buffer first, then write directly
+                        let to_write = if !php_stream.write_buffer.is_empty() {
+                            let mut buf = std::mem::take(&mut php_stream.write_buffer);
+                            buf.extend_from_slice(&bytes);
+                            buf
+                        } else {
+                            bytes
+                        };
+
+                        let result = php_stream.stream.write_all(&to_write).await;
+                        self.streams.insert(handle, php_stream);
+
+                        match result {
+                            Ok(_) => {
+                                debug!("[{}] PHP fwrite: OK, wrote {} bytes (flushed: {})",
+                                       self.request_domain, len, to_write.len());
+                                Ok(PhpValue::Int(len))
+                            }
+                            Err(e) => {
+                                self.log_error(&format!("fwrite failed: {}", e));
+                                Ok(PhpValue::Bool(false))
+                            }
                         }
                     }
                 } else {
@@ -4294,35 +4438,182 @@ impl AstPhpProcessor {
                     return Ok(PhpValue::Bool(false));
                 }
                 if let Some(mut php_stream) = self.streams.remove(&handle) {
-                    let result = if php_stream.eof {
+                    let result = if php_stream.eof && php_stream.read_buffer.is_empty() {
                         Ok(PhpValue::String(String::new()))
                     } else {
-                        let mut buf = vec![0u8; length];
-                        // Short timeout simulates non-blocking read (PHP stream_set_blocking false)
-                        match tokio::time::timeout(
-                            std::time::Duration::from_millis(10),
-                            php_stream.stream.read(&mut buf),
-                        )
-                        .await
-                        {
-                            Ok(Ok(0)) => {
-                                php_stream.eof = true;
-                                debug!("[{}] PHP fread: handle={}, EOF (0 bytes)", self.request_domain, handle);
+                        // First check if we have enough buffered data
+                        if php_stream.read_buffer.len() >= length {
+                            // We have enough buffered data, return it immediately
+                            let data: Vec<u8> = php_stream.read_buffer.drain(..length).collect();
+                            let data_str = String::from_utf8_lossy(&data).into_owned();
+                            debug!("[{}] PHP fread: handle={}, {} bytes from buffer", self.request_domain, handle, length);
+                            Ok(PhpValue::String(data_str))
+                        } else {
+                            // Take what we have from buffer
+                            let mut data: Vec<u8> = php_stream.read_buffer.drain(..).collect();
+                            let remaining = length - data.len();
+
+                            if remaining > 0 && !php_stream.eof {
+                                // Need to read more from stream
+                                let mut buf = vec![0u8; remaining];
+                                // Short timeout simulates non-blocking read
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_millis(10),
+                                    php_stream.stream.read(&mut buf),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(0)) => {
+                                        php_stream.eof = true;
+                                        debug!("[{}] PHP fread: handle={}, EOF after {} bytes", self.request_domain, handle, data.len());
+                                    }
+                                    Ok(Ok(n)) => {
+                                        // Add the newly read data
+                                        data.extend_from_slice(&buf[..n]);
+                                        debug!("[{}] PHP fread: handle={}, {} bytes total (buffered + read)", self.request_domain, handle, data.len());
+                                    }
+                                    Ok(Err(e)) => {
+                                        self.log_error(&format!("fread error: {}", e));
+                                        php_stream.eof = true;
+                                    }
+                                    Err(_) => {
+                                        // Timeout: no additional data available (non-blocking)
+                                        debug!("[{}] PHP fread: handle={}, timeout, returning {} buffered bytes", self.request_domain, handle, data.len());
+                                    }
+                                }
+                            }
+
+                            if data.is_empty() && php_stream.eof {
                                 Ok(PhpValue::String(String::new()))
+                            } else {
+                                let data_str = String::from_utf8_lossy(&data).into_owned();
+                                Ok(PhpValue::String(data_str))
                             }
-                            Ok(Ok(n)) => {
-                                let data = String::from_utf8_lossy(&buf[..n]).into_owned();
-                                debug!("[{}] PHP fread: handle={}, {} bytes: {}", self.request_domain, handle, n, &data[..data.len().min(200)]);
-                                Ok(PhpValue::String(data))
-                            }
-                            Ok(Err(e)) => {
-                                self.log_error(&format!("fread error: {}", e));
-                                php_stream.eof = true;
-                                Ok(PhpValue::Bool(false))
-                            }
-                            Err(_) => {
-                                // Timeout: no data available yet (non-blocking)
-                                Ok(PhpValue::String(String::new()))
+                        }
+                    };
+                    self.streams.insert(handle, php_stream);
+                    result
+                } else {
+                    Ok(PhpValue::Bool(false))
+                }
+            }
+            "fgets" => {
+                // fgets($handle, $length = 1024) - read until newline or length
+                let handle = if let Some(PhpValue::Resource(id)) = args.first() {
+                    *id
+                } else {
+                    0
+                };
+                let max_length = args
+                    .get(1)
+                    .map_or(1024usize, |a| a.as_int().max(1) as usize);
+
+                if handle == 0 {
+                    return Ok(PhpValue::Bool(false));
+                }
+
+                if let Some(mut php_stream) = self.streams.remove(&handle) {
+                    let result = if php_stream.eof && php_stream.read_buffer.is_empty() {
+                        Ok(PhpValue::Bool(false))
+                    } else {
+                        // Check if we already have a newline in the buffer
+                        if let Some(newline_pos) = php_stream.read_buffer.iter().position(|&b| b == b'\n') {
+                            // Found newline in buffer, return line including newline
+                            let line_end = (newline_pos + 1).min(max_length).min(php_stream.read_buffer.len());
+                            let line: Vec<u8> = php_stream.read_buffer.drain(..line_end).collect();
+                            let line_str = String::from_utf8_lossy(&line).into_owned();
+                            debug!("[{}] PHP fgets: handle={}, buffered line: {:?}", self.request_domain, handle, &line_str);
+                            Ok(PhpValue::String(line_str))
+                        } else if php_stream.read_buffer.len() >= max_length {
+                            // Buffer has enough data already
+                            let line: Vec<u8> = php_stream.read_buffer.drain(..max_length).collect();
+                            let line_str = String::from_utf8_lossy(&line).into_owned();
+                            Ok(PhpValue::String(line_str))
+                        } else {
+                            // Need to read more data
+                            let mut temp_buf = vec![0u8; 256]; // Read in small chunks for efficiency
+                            let mut line: Vec<u8> = php_stream.read_buffer.drain(..).collect();
+
+                            // Read until we find newline or reach max_length
+                            loop {
+                                if line.len() >= max_length {
+                                    // Reached max length, return what we have
+                                    let result = String::from_utf8_lossy(&line[..max_length]).into_owned();
+                                    // Put remaining bytes back in buffer
+                                    if line.len() > max_length {
+                                        php_stream.read_buffer.extend_from_slice(&line[max_length..]);
+                                    }
+                                    break Ok(PhpValue::String(result));
+                                }
+
+                                // Try to read more data with a short timeout
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_millis(100),
+                                    php_stream.stream.read(&mut temp_buf),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(0)) => {
+                                        // EOF reached
+                                        php_stream.eof = true;
+                                        if line.is_empty() {
+                                            break Ok(PhpValue::Bool(false));
+                                        } else {
+                                            let result = String::from_utf8_lossy(&line).into_owned();
+                                            break Ok(PhpValue::String(result));
+                                        }
+                                    }
+                                    Ok(Ok(n)) => {
+                                        // Check for newline in newly read data
+                                        if let Some(newline_pos) = temp_buf[..n].iter().position(|&b| b == b'\n') {
+                                            // Found newline
+                                            let bytes_needed = max_length - line.len();
+                                            let take = (newline_pos + 1).min(bytes_needed);
+                                            line.extend_from_slice(&temp_buf[..take]);
+
+                                            // Buffer remaining data
+                                            if take < n {
+                                                php_stream.read_buffer.extend_from_slice(&temp_buf[take..n]);
+                                            }
+                                            let result = String::from_utf8_lossy(&line).into_owned();
+                                            break Ok(PhpValue::String(result));
+                                        } else {
+                                            // No newline yet, add to line
+                                            let bytes_needed = max_length - line.len();
+                                            let take = n.min(bytes_needed);
+                                            line.extend_from_slice(&temp_buf[..take]);
+
+                                            // Buffer any excess
+                                            if take < n {
+                                                php_stream.read_buffer.extend_from_slice(&temp_buf[take..n]);
+                                                // Check if we've reached max_length
+                                                if line.len() >= max_length {
+                                                    let result = String::from_utf8_lossy(&line).into_owned();
+                                                    break Ok(PhpValue::String(result));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        self.log_error(&format!("fgets read error: {}", e));
+                                        php_stream.eof = true;
+                                        if line.is_empty() {
+                                            break Ok(PhpValue::Bool(false));
+                                        } else {
+                                            let result = String::from_utf8_lossy(&line).into_owned();
+                                            break Ok(PhpValue::String(result));
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // Timeout - return what we have if anything
+                                        if line.is_empty() {
+                                            break Ok(PhpValue::String(String::new()));
+                                        } else {
+                                            let result = String::from_utf8_lossy(&line).into_owned();
+                                            break Ok(PhpValue::String(result));
+                                        }
+                                    }
+                                }
                             }
                         }
                     };
@@ -4341,8 +4632,38 @@ impl AstPhpProcessor {
                 if handle == 0 {
                     return Ok(PhpValue::Bool(true));
                 }
-                let eof = self.streams.get(&handle).map_or(true, |s| s.eof);
+                let eof = self.streams.get(&handle).map_or(true, |s| s.eof && s.read_buffer.is_empty());
                 Ok(PhpValue::Bool(eof))
+            }
+            "fflush" => {
+                let handle = if let Some(PhpValue::Resource(id)) = args.first() {
+                    *id
+                } else {
+                    0
+                };
+                if handle == 0 {
+                    return Ok(PhpValue::Bool(false));
+                }
+
+                if let Some(mut php_stream) = self.streams.remove(&handle) {
+                    let result = if !php_stream.write_buffer.is_empty() {
+                        let flush_data = std::mem::take(&mut php_stream.write_buffer);
+                        debug!("[{}] PHP fflush: handle={}, flushing {} bytes", self.request_domain, handle, flush_data.len());
+                        match php_stream.stream.write_all(&flush_data).await {
+                            Ok(_) => Ok(PhpValue::Bool(true)),
+                            Err(e) => {
+                                self.log_error(&format!("fflush failed: {}", e));
+                                Ok(PhpValue::Bool(false))
+                            }
+                        }
+                    } else {
+                        Ok(PhpValue::Bool(true))
+                    };
+                    self.streams.insert(handle, php_stream);
+                    result
+                } else {
+                    Ok(PhpValue::Bool(false))
+                }
             }
             "fclose" => {
                 let handle = if let Some(PhpValue::Resource(id)) = args.first() {
@@ -4350,8 +4671,19 @@ impl AstPhpProcessor {
                 } else {
                     0
                 };
-                self.streams.remove(&handle);
-                Ok(PhpValue::Bool(true))
+
+                // Flush write buffer before closing
+                if let Some(mut php_stream) = self.streams.remove(&handle) {
+                    if !php_stream.write_buffer.is_empty() {
+                        let flush_data = std::mem::take(&mut php_stream.write_buffer);
+                        debug!("[{}] PHP fclose: handle={}, flushing {} bytes before close",
+                               self.request_domain, handle, flush_data.len());
+                        let _ = php_stream.stream.write_all(&flush_data).await;
+                    }
+                    Ok(PhpValue::Bool(true))
+                } else {
+                    Ok(PhpValue::Bool(true))
+                }
             }
             "php_uname" => Ok(PhpValue::String(std::env::consts::OS.to_string())),
             "php_sapi_name" => Ok(PhpValue::String("ruph-ast".to_string())),
@@ -4527,14 +4859,48 @@ impl AstPhpProcessor {
             "libxml_clear_errors" => Ok(PhpValue::Null),
             "libxml_get_errors" => Ok(PhpValue::Array(Vec::new())),
             "simplexml_load_string" => {
-                // Stub: return false (XML parsing not supported in AST mode)
-                let _xml = args.first().map_or(String::new(), |a| a.as_string());
-                self.log_error("simplexml_load_string: XML parsing not natively supported, returning false");
-                Ok(PhpValue::Bool(false))
+                let xml_string = args.first().map_or(String::new(), |a| a.as_string());
+                if xml_string.is_empty() {
+                    Ok(PhpValue::Bool(false))
+                } else {
+                    match xml_parser::parse_xml_to_php_value(&xml_string) {
+                        Ok(value) => Ok(value),
+                        Err(e) => {
+                            self.log_error(&format!("simplexml_load_string: {}", e));
+                            Ok(PhpValue::Bool(false))
+                        }
+                    }
+                }
             }
             "simplexml_load_file" => {
-                self.log_error("simplexml_load_file: XML parsing not natively supported, returning false");
-                Ok(PhpValue::Bool(false))
+                let file_path = args.first().map_or(String::new(), |a| a.as_string());
+                if file_path.is_empty() {
+                    Ok(PhpValue::Bool(false))
+                } else {
+                    match self.resolve_local_path(&file_path) {
+                        Ok(abs_path) => {
+                            match std::fs::read_to_string(&abs_path) {
+                                Ok(xml_string) => {
+                                    match xml_parser::parse_xml_to_php_value(&xml_string) {
+                                        Ok(value) => Ok(value),
+                                        Err(e) => {
+                                            self.log_error(&format!("simplexml_load_file: {}", e));
+                                            Ok(PhpValue::Bool(false))
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    self.log_error(&format!("simplexml_load_file: Failed to read {}: {}", abs_path.display(), e));
+                                    Ok(PhpValue::Bool(false))
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.log_error(&format!("simplexml_load_file: Failed to resolve path {}: {}", file_path, e));
+                            Ok(PhpValue::Bool(false))
+                        }
+                    }
+                }
             }
 
             // ── is_object / class_exists / get_class ──────────────────
@@ -6250,7 +6616,14 @@ impl PhpValue {
             PhpValue::Array(_) => "Array".to_string(),
             PhpValue::Null => String::new(),
             PhpValue::Resource(id) => format!("Resource id #{}", id),
-            PhpValue::Object(obj) => format!("Object({})", obj.class_name),
+            PhpValue::Object(obj) => {
+                // Special handling for SimpleXMLElement string conversion
+                if obj.class_name == "SimpleXMLElement" {
+                    xml_parser::get_xml_text(self)
+                } else {
+                    format!("Object({})", obj.class_name)
+                }
+            }
         }
     }
 
