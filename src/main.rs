@@ -324,6 +324,11 @@ async fn main() -> Result<()> {
     let log_console = cli.log_console || cfg.log_console;
     if log_console {
         init_logging(log_level)?;
+    } else if cli.log_level.is_some() || cfg.log_level != "info" {
+        // log_level explicitly set but log_console is off — write to error log file
+        let log_file = cfg.default_error_log.as_deref().unwrap_or("ruph_error.log");
+        init_logging_to(log_level, Some(log_file))?;
+        eprintln!("  tracing: {} -> {}", log_level, log_file);
     }
 
     let domain_logger = Arc::new(DomainLogger::new(
@@ -1022,14 +1027,35 @@ fn parse_new_cert_spec(spec: &str, cfg: &config::Config) -> Result<(String, Stri
 }
 
 fn init_logging(level: &str) -> Result<()> {
+    init_logging_to(level, None)
+}
+
+fn init_logging_to(level: &str, file_path: Option<&str>) -> Result<()> {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
     let filter = EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new(level))?;
 
-    tracing_subscriber::registry()
-        .with(fmt::layer().event_format(RuphFormatter))
-        .with(filter)
-        .init();
+    if let Some(path) = file_path {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| anyhow!("Cannot open log file '{}': {}", path, e))?;
+        tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .event_format(RuphFormatter)
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(file)),
+            )
+            .with(filter)
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(fmt::layer().event_format(RuphFormatter))
+            .with(filter)
+            .init();
+    }
 
     Ok(())
 }

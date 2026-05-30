@@ -34,6 +34,7 @@ webpki-roots = "0.26"
 simple-dns = "0.9"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
+sha1 = "0.10"
 
 # PHP parsing
 tree-sitter = "0.25"

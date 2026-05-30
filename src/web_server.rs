@@ -1469,6 +1469,12 @@ impl WebServer {
         let file_path = self.resolve_file_path(url_path, root)?;
 
         if file_path.exists() && file_path.is_file() {
+            // Block direct URL access to _index.php files — they are only
+            // executed as controllers/leaves via the chain, never directly.
+            let fname = file_path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+            if fname == "_index.php" {
+                return Ok(RequestTarget::NotFound);
+            }
             if file_path.extension().and_then(|s| s.to_str()) == Some("php") {
                 return Ok(RequestTarget::Script(file_path));
             }
