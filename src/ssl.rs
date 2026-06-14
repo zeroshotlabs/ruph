@@ -202,6 +202,39 @@ pub fn list_certs(ssl_dir: &Path) -> Result<Vec<(String, chrono::DateTime<chrono
     Ok(out)
 }
 
+pub fn get_expiring_certs(ssl_dir: &Path, days: i64) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>> {
+    let mut expiring = Vec::new();
+    let threshold = chrono::Utc::now() + chrono::Duration::days(days);
+
+    for (domain, expiry) in list_certs(ssl_dir)? {
+        if expiry <= threshold {
+            expiring.push((domain, expiry));
+        }
+    }
+
+    Ok(expiring)
+}
+
+/// Check if a domain is covered by a wildcard certificate
+pub fn is_covered_by_wildcard(domain: &str, ssl_dir: &Path) -> bool {
+    // Skip if domain is already a wildcard
+    if domain.starts_with("*.") {
+        return false;
+    }
+
+    // Check if domain has at least one subdomain level
+    let parts: Vec<&str> = domain.split('.').collect();
+    if parts.len() <= 2 {
+        return false;
+    }
+
+    // Build wildcard pattern: lists.nyphp.org -> *.nyphp.org
+    let wildcard = format!("*.{}", parts[1..].join("."));
+    let wildcard_dir = ssl_dir.join(&wildcard);
+
+    wildcard_dir.exists() && wildcard_dir.join("fullchain.pem").exists()
+}
+
 fn cert_expiry(path: &Path) -> Result<chrono::DateTime<chrono::Utc>> {
     let data = std::fs::read(path)?;
     let (_, pem) = x509_parser::pem::parse_x509_pem(&data)

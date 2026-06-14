@@ -5,6 +5,7 @@ use hyper::service::service_fn;
 use hyper::{body::Incoming as IncomingBody, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -272,6 +273,10 @@ struct Cli {
     #[arg(long)]
     new_cert: Option<String>,
 
+    /// Refresh SSL certificates expiring within a month
+    #[arg(long, default_value_t = false)]
+    refresh_ssl: bool,
+
     /// List known certificates and exit
     #[arg(long, default_value_t = false)]
     list_certs: bool,
@@ -391,6 +396,169 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if cli.refresh_ssl {
+        let expiring = ssl::get_expiring_certs(&ssl_dir, 30)?;
+        if expiring.is_empty() {
+            println!("No certificates expiring within 30 days");
+            return Ok(());
+        }
+
+        println!("Found {} certificate(s) expiring within 30 days:", expiring.len());
+
+        // Convert subdomains to wildcards and deduplicate
+        let mut domains_to_refresh = std::collections::HashSet::new();
+        let mut conversions = Vec::new();
+
+        for (domain, expiry) in &expiring {
+            println!("  {} expires on {}", domain, expiry);
+
+            // Check if this is a subdomain that should be converted to wildcard
+            let parts: Vec<&str> = domain.split('.').collect();
+            if parts.len() == 2 {
+                // Root domain (e.g., example.com) - keep as is
+                domains_to_refresh.insert(domain.clone());
+            } else if parts.len() > 2 && !domain.starts_with("*.") {
+                // Subdomain (e.g., www.example.com) - convert to wildcard
+                let wildcard = format!("*.{}", parts[1..].join("."));
+                conversions.push((domain.clone(), wildcard.clone()));
+                domains_to_refresh.insert(wildcard);
+            } else {
+                // Already a wildcard or special case
+                domains_to_refresh.insert(domain.clone());
+            }
+        }
+
+        // Show conversions
+        if !conversions.is_empty() {
+            println!("\nConverting subdomains to wildcards for efficiency:");
+            for (subdomain, wildcard) in &conversions {
+                println!("  {} → {}", subdomain, wildcard);
+            }
+        }
+
+        let mut to_refresh: Vec<(String, chrono::DateTime<chrono::Utc>)> = domains_to_refresh
+            .into_iter()
+            .map(|d| {
+                // Try to get expiry from original list or use a default
+                expiring.iter()
+                    .find(|(domain, _)| domain == &d)
+                    .map(|(_, exp)| (d.clone(), exp.clone()))
+                    .unwrap_or_else(|| (d, chrono::Utc::now() + chrono::Duration::days(30)))
+            })
+            .collect();
+
+        if to_refresh.is_empty() {
+            println!("No certificates need refreshing");
+            return Ok(());
+        }
+
+        // Check if we have ACME email configured
+        let email = cfg.acme_email.as_ref().ok_or_else(|| {
+            anyhow!("ACME email not configured. Set [acme] email in config file or use --new-cert with email")
+        })?;
+
+        // Check for required CNAMEs if using DNS-01
+        if cfg.acme_zone.is_some() {
+            println!("\nChecking DNS configuration...");
+            let zone = cfg.acme_zone.as_ref().unwrap();
+            let map_path = ssl_dir.join("acme_domains.json");
+            let domain_map = acme_state::AcmeDomainMap::load(&map_path)?;
+
+            let mut missing_cnames = Vec::new();
+            for (domain, _) in &to_refresh {
+                let base = acme_state::base_domain(domain);
+                if let Some(uuid) = domain_map.domains.get(&base) {
+                    let cname_source = format!("_acme-challenge.{}", base);
+                    let cname_target = format!("{}.{}", uuid, zone);
+
+                    if !dns_server::verify_cname(&base, &cname_target).await {
+                        missing_cnames.push((cname_source, cname_target));
+                    }
+                }
+            }
+
+            if !missing_cnames.is_empty() {
+                println!("\nThe following CNAME records are required but not found:");
+                for (source, target) in &missing_cnames {
+                    println!("  {} -> {}", source, target);
+                }
+                println!("\nPlease add these DNS records before proceeding.");
+                println!("Note: If subdomains are covered by a wildcard certificate, consider using the wildcard instead.");
+                return Ok(());
+            }
+        }
+
+        // Start DNS server if needed for renewal
+        let txt_records = if cfg.acme_zone.is_some() {
+            let records = dns_server::new_txt_store();
+            let zone = cfg.acme_zone.as_ref().unwrap().clone();
+            let dns_bind = cfg
+                .acme_dns_bind
+                .as_deref()
+                .unwrap_or("0.0.0.0:53")
+                .to_string();
+            let dns_cfg = dns_server::DnsServerConfig {
+                bind: dns_bind.clone(),
+                zone: zone.clone(),
+            };
+            let records_clone = records.clone();
+            tokio::spawn(async move {
+                if let Err(e) = dns_server::run_dns_server(dns_cfg, records_clone).await {
+                    error!("DNS server failed: {}", e);
+                }
+            });
+            eprintln!("Started temporary DNS server on {} for zone {}", dns_bind, zone);
+            Some(records)
+        } else {
+            None
+        };
+
+        // Batch refresh certificates
+        println!("\nRefreshing {} certificate(s)...", to_refresh.len());
+        let mut results = Vec::new();
+
+        for (domain, _expiry) in to_refresh {
+            println!("  Initiating renewal for {}...", domain);
+            let result = acme::issue_cert(
+                email,
+                &domain,
+                &ssl_dir,
+                cfg.acme_zone.as_deref(),
+                txt_records.clone(),
+            )
+            .await;
+
+            match &result {
+                Ok(_) => println!("    ✓ Successfully refreshed {}", domain),
+                Err(e) => eprintln!("    ✗ Failed to refresh {}: {}", domain, e),
+            }
+            results.push((domain, result));
+        }
+
+        // Summary
+        println!("\n=== Refresh Summary ===");
+        let successes: Vec<_> = results.iter().filter(|(_, r)| r.is_ok()).collect();
+        let failures: Vec<_> = results.iter().filter(|(_, r)| r.is_err()).collect();
+
+        if !successes.is_empty() {
+            println!("Successfully refreshed {} certificate(s):", successes.len());
+            for (domain, _) in successes {
+                println!("  ✓ {}", domain);
+            }
+        }
+
+        if !failures.is_empty() {
+            println!("Failed to refresh {} certificate(s):", failures.len());
+            for (domain, err) in failures {
+                if let Err(e) = err {
+                    println!("  ✗ {}: {}", domain, e);
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
     if let Some(spec) = &cli.new_cert {
         let (email, domain) = parse_new_cert_spec(spec, &cfg)?;
 
@@ -440,7 +608,7 @@ async fn main() -> Result<()> {
         std::path::PathBuf::from(r)
     } else if let Some(ref d) = cfg.docroot {
         std::path::PathBuf::from(d)
-    } else if !cli.list_certs && cli.new_cert.is_none() {
+    } else if !cli.list_certs && cli.new_cert.is_none() && !cli.refresh_ssl {
         return Err(anyhow!("DOCROOT is required. Run with --help for usage."));
     } else {
         std::env::current_dir()?
