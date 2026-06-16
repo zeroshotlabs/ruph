@@ -1,0 +1,16 @@
+Clean build — only pre-existing warnings, no new errors.
+
+What changed and what it does:
+
+deepest_leaf_for_dir now delegates to the new index_chain_for_dir (same result, no behavior change for existing callers/rr_leaf_idx)
+index_chain_for_dir walks root→dir and collects all _index.php files found along the way into a Vec
+target_dir_for_path extracts the request's directory from the URL (same logic resolve_rr_vars already used internally)
+In handle_request, the leaf block now calls index_chain_for_dir and pushes all but the last as additional controllers before setting the leaf to the deepest one
+Resulting chain for a request to yip.ee/a/b/page:
+
+/ruph_root/_index.php (global master)
+/ruph_root/yip.ee/_index.php (vhost root)
+/ruph_root/yip.ee/a/_index.php → now runs as intermediate controller (was skipped before)
+/ruph_root/yip.ee/a/b/_index.php → leaf
+
+

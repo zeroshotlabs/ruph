@@ -367,20 +367,47 @@ impl WebServer {
     }
 
     fn deepest_leaf_for_dir(&self, root: &Path, dir: &Path) -> Option<PathBuf> {
-        let canonical_root = root.canonicalize().ok()?;
-        let canonical_dir = dir.canonicalize().ok()?;
-        let rel = canonical_dir.strip_prefix(&canonical_root).ok()?;
+        self.index_chain_for_dir(root, dir).into_iter().last()
+    }
 
+    /// Collect all `_index.php` files found while walking from root (exclusive)
+    /// into dir, in top-down order.
+    fn index_chain_for_dir(&self, root: &Path, dir: &Path) -> Vec<PathBuf> {
+        let canonical_root = match root.canonicalize() { Ok(p) => p, Err(_) => return vec![] };
+        let canonical_dir = match dir.canonicalize() { Ok(p) => p, Err(_) => return vec![] };
+        let rel = match canonical_dir.strip_prefix(&canonical_root) { Ok(r) => r, Err(_) => return vec![] };
         let mut current = canonical_root.clone();
-        let mut deepest = None;
+        let mut chain = Vec::new();
         for component in rel.components() {
             current = current.join(component);
             let candidate = current.join("_index.php");
             if candidate.is_file() {
-                deepest = candidate.canonicalize().ok().or(Some(candidate));
+                chain.push(candidate.canonicalize().unwrap_or(candidate));
             }
         }
-        deepest
+        chain
+    }
+
+    /// Return the directory that a URL path resolves to.
+    fn target_dir_for_path(&self, url_path: &str, root: &Path) -> PathBuf {
+        let file_path = match self.resolve_file_path(url_path, root) {
+            Ok(p) => p,
+            Err(_) => return root.to_path_buf(),
+        };
+        if file_path.is_file() {
+            file_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| root.to_path_buf())
+        } else if file_path.is_dir() {
+            file_path
+        } else {
+            let decoded = decode(url_path).unwrap_or_default();
+            let clean = decoded.trim_start_matches('/');
+            let mut deepest = root.to_path_buf();
+            for part in clean.split('/').filter(|p| !p.is_empty()) {
+                let next = deepest.join(part);
+                if next.is_dir() { deepest = next; } else { break; }
+            }
+            deepest
+        }
     }
 
     #[allow(dead_code)]
@@ -740,12 +767,19 @@ impl WebServer {
         let is_direct_php = !rr_vars["rr_file"].is_empty()
             && matches!(&target, RequestTarget::Script(p) if p.extension().and_then(|s| s.to_str()) == Some("php") && p.is_file());
 
+        // Build intermediate controllers + leaf from the full _index.php chain.
+        // For /a/b/c: if _index.php exists in /a/ and /a/b/, /a/_index.php runs as
+        // a controller first, then /a/b/_index.php runs as the leaf.
         let leaf: Option<(PathBuf, HashMap<String, String>)> = if is_direct_php {
             None
         } else {
-            let leaf_str = rr_vars.get("rr_leaf_idx").map(|s| s.as_str()).unwrap_or("");
-            if !leaf_str.is_empty() {
-                let lp = PathBuf::from(leaf_str);
+            let tdir = self.target_dir_for_path(&path, &root);
+            let chain = self.index_chain_for_dir(&root, &tdir);
+            let n = chain.len();
+            for p in chain.iter().take(n.saturating_sub(1)) {
+                controllers.push((p.clone(), build_sv(p)?));
+            }
+            if let Some(lp) = chain.into_iter().last() {
                 Some((lp.clone(), build_sv(&lp)?))
             } else {
                 None
