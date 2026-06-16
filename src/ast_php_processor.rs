@@ -158,6 +158,8 @@ pub struct AstPhpProcessor {
     request_domain: String,
     /// Request URI for the current request (for log context)
     request_uri: String,
+    /// Last JSON error code (0 = none; updated by json_decode)
+    last_json_error: i64,
 }
 
 impl AstPhpProcessor {
@@ -246,6 +248,7 @@ impl AstPhpProcessor {
             next_curl_id: 1,
             request_domain: String::new(),
             request_uri: String::new(),
+            last_json_error: 0,
             constants: {
                 let mut c = HashMap::new();
                 c.insert("PATHINFO_DIRNAME".to_string(), PhpValue::Int(1));
@@ -306,6 +309,12 @@ impl AstPhpProcessor {
                 c.insert("CURLINFO_CONTENT_TYPE".to_string(), PhpValue::Int(1048594));
                 c.insert("CURLOPT_ENCODING".to_string(), PhpValue::Int(10102));
                 // JSON constants
+                c.insert("JSON_ERROR_NONE".to_string(), PhpValue::Int(0));
+                c.insert("JSON_ERROR_DEPTH".to_string(), PhpValue::Int(1));
+                c.insert("JSON_ERROR_STATE_MISMATCH".to_string(), PhpValue::Int(2));
+                c.insert("JSON_ERROR_CTRL_CHAR".to_string(), PhpValue::Int(3));
+                c.insert("JSON_ERROR_SYNTAX".to_string(), PhpValue::Int(4));
+                c.insert("JSON_ERROR_UTF8".to_string(), PhpValue::Int(5));
                 c.insert("JSON_UNESCAPED_SLASHES".to_string(), PhpValue::Int(64));
                 c.insert("JSON_UNESCAPED_UNICODE".to_string(), PhpValue::Int(256));
                 c.insert("JSON_PRETTY_PRINT".to_string(), PhpValue::Int(128));
@@ -689,6 +698,27 @@ impl AstPhpProcessor {
                                 // Try to evaluate as a general expression
                                 let _ = self.evaluate_expression(arg).await?;
                             }
+                        }
+                    }
+                }
+            }
+            // `global $a, $b;` — make named variables available from the global scope.
+            // In this processor functions already see the outer scope, so the main job
+            // is silently handling the node (avoids "Unhandled AST node" warnings) and
+            // pulling in any variable that exists in global_variables but not yet locally.
+            "global_declaration" => {
+                for child in node.named_children(&mut node.walk()) {
+                    let var_name = child
+                        .utf8_text(self.source_code.as_bytes())
+                        .unwrap_or("")
+                        .trim_start_matches('$')
+                        .to_string();
+                    if var_name.is_empty() {
+                        continue;
+                    }
+                    if !self.variables.contains_key(&var_name) {
+                        if let Some(val) = self.global_variables.get(&var_name).cloned() {
+                            self.variables.insert(var_name, val);
                         }
                     }
                 }
@@ -3559,9 +3589,28 @@ impl AstPhpProcessor {
                 let s = args.first().map_or(String::new(), |a| a.as_string());
                 let assoc = args.get(1).map_or(false, |a| a.is_truthy());
                 match serde_json::from_str::<serde_json::Value>(&s) {
-                    Ok(json) => Ok(json_to_php_value(&json, assoc)),
-                    Err(_) => Ok(PhpValue::Null),
+                    Ok(json) => {
+                        self.last_json_error = 0;
+                        Ok(json_to_php_value(&json, assoc))
+                    }
+                    Err(_) => {
+                        self.last_json_error = 4; // JSON_ERROR_SYNTAX
+                        Ok(PhpValue::Null)
+                    }
                 }
+            }
+            "json_last_error" => Ok(PhpValue::Int(self.last_json_error)),
+            "json_last_error_msg" => {
+                let msg = match self.last_json_error {
+                    0 => "No error",
+                    1 => "Maximum stack depth exceeded",
+                    2 => "State mismatch (invalid or malformed JSON)",
+                    3 => "Control character error, possibly incorrectly encoded",
+                    4 => "Syntax error",
+                    5 => "Malformed UTF-8 characters, possibly incorrectly encoded",
+                    _ => "Unknown error",
+                };
+                Ok(PhpValue::String(msg.to_string()))
             }
 
             // ── Date/time ───────────────────────────────────────────────
@@ -4151,6 +4200,9 @@ impl AstPhpProcessor {
                         | "ruph_session_start"
                         | "ruph_session_destroy"
                         | "ruph_session_id"
+                        | "version_compare"
+                        | "json_last_error"
+                        | "json_last_error_msg"
                 );
                 Ok(PhpValue::Bool(
                     is_builtin || self.user_functions.contains_key(&name),
@@ -4688,6 +4740,45 @@ impl AstPhpProcessor {
             "php_uname" => Ok(PhpValue::String(std::env::consts::OS.to_string())),
             "php_sapi_name" => Ok(PhpValue::String("ruph-ast".to_string())),
             "ini_get" | "ini_set" => Ok(PhpValue::String(String::new())),
+            "version_compare" => {
+                // version_compare($v1, $v2 [, $op]) — compare two dotted version strings.
+                // Without $op: returns -1 / 0 / 1.
+                // With $op: returns bool.
+                let parse = |s: &str| -> Vec<i64> {
+                    s.split('.').map(|p| p.parse::<i64>().unwrap_or(0)).collect()
+                };
+                let v1 = args.first().map_or(String::new(), |a| a.as_string());
+                let v2 = args.get(1).map_or(String::new(), |a| a.as_string());
+                let p1 = parse(&v1);
+                let p2 = parse(&v2);
+                let max_len = p1.len().max(p2.len());
+                let mut cmp = 0i64;
+                for i in 0..max_len {
+                    match (p1.get(i), p2.get(i)) {
+                        (None, _) => { cmp = -1; break; }  // p1 shorter → p1 < p2
+                        (_, None) => { cmp = 1; break; }   // p2 shorter → p1 > p2
+                        (Some(a), Some(b)) if a != b => {
+                            cmp = if a < b { -1 } else { 1 };
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(op) = args.get(2) {
+                    let result = match op.as_string().as_str() {
+                        "<" | "lt" => cmp < 0,
+                        "<=" | "le" => cmp <= 0,
+                        ">" | "gt" => cmp > 0,
+                        ">=" | "ge" => cmp >= 0,
+                        "==" | "=" | "eq" => cmp == 0,
+                        "!=" | "<>" | "ne" => cmp != 0,
+                        _ => false,
+                    };
+                    Ok(PhpValue::Bool(result))
+                } else {
+                    Ok(PhpValue::Int(cmp))
+                }
+            }
 
             // ── curl_* emulation via reqwest ──────────────────────────
             "curl_init" => {

@@ -1,0 +1,6 @@
+
+IMPLODE IGNORES GLUE
+error_log("GKEYS: ".implode('+: ',$keywords));
+GKEYS: strange regex problem
+
+

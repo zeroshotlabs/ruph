@@ -1,0 +1,7 @@
+global_declaration — handled in process_node: silently resolves, pulls from global_variables if not in local scope (eliminates the "Unhandled AST node" warning)
+version_compare($v1, $v2 [, $op]) — full implementation matching PHP's behavior (shorter version is less than longer, even when trailing component is 0)
+json_last_error() — returns last error code set by json_decode
+json_last_error_msg() — returns the corresponding message string
+JSON_ERROR_NONE/DEPTH/STATE_MISMATCH/CTRL_CHAR/SYNTAX/UTF8 — added as constants
+json_decode — now sets last_json_error on success (0) and failure (4)
+
