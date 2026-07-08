@@ -29,6 +29,9 @@ mod xml_parser;
 
 use crate::web_server::{RuphBody, WebServer};
 
+/// Version string sourced from Cargo.toml at compile time.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 type ResponseBody = RuphBody;
 
 type LogFile = std::sync::Mutex<std::io::BufWriter<std::fs::File>>;
@@ -255,6 +258,7 @@ impl DomainLogger {
 
 #[derive(Parser, Debug)]
 #[command(name = "ruph")]
+#[command(version = VERSION)]
 #[command(about = "Rust + PHP-ish web server", long_about = None)]
 struct Cli {
     /// Root directory to serve
@@ -657,7 +661,7 @@ async fn main() -> Result<()> {
     }
 
     let listener = TcpListener::bind(addr).await?;
-    eprintln!("ruph listening on {}", addr);
+    eprintln!("ruph/{} listening on {}", VERSION, addr);
     let connection_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
     let tls_config = if cli.tls || cfg.tls {
@@ -671,7 +675,7 @@ async fn main() -> Result<()> {
     let http_listener = if let Some(hb) = http_bind_str {
         let http_addr: SocketAddr = hb.parse()?;
         let hl = TcpListener::bind(http_addr).await?;
-        eprintln!("ruph HTTP listening on {}", http_addr);
+        eprintln!("ruph/{} HTTP listening on {}", VERSION, http_addr);
         Some(hl)
     } else {
         None

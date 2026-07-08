@@ -10,14 +10,15 @@ Request flow:
 
 1. Resolve the effective vhost docroot from the request host.
 2. Populate all `rr_*` values before any PHP runs.
-3. Intercept the status page path, if configured (before any PHP).
-4. Run the global master `/_index.php` from the server root, if present.
-5. Run the effective vhost root `/_index.php`, if present and different from the global master.
-6. Resolve the request target.
-7. If the target is an existing `.php` file, execute that file directly.
-8. Otherwise, if a deepest local leaf `_index.php` exists below the vhost root, execute that single leaf.
-9. If the leaf passes through, deliver the resolved file/index directly.
-10. If nothing resolves, return 404.
+3. If the URL maps to a directory without a trailing slash, 301 redirect to add the slash (like `mod_dir`).
+4. Intercept the status page path, if configured (before any PHP).
+5. Run the global master `/_index.php` from the server root, if present.
+6. Run the effective vhost root `/_index.php`, if present and different from the global master.
+7. Resolve the request target.
+8. If the target is an existing `.php` file, execute that file directly.
+9. Otherwise, if a deepest local leaf `_index.php` exists below the vhost root, execute that single leaf.
+10. If the leaf passes through, deliver the resolved file/index directly.
+11. If nothing resolves, return 404.
 
 Only one local leaf `_index.php` ever runs.
 
@@ -50,6 +51,7 @@ Before any PHP executes, ruph resolves the request URI against the effective vho
 | `rr_index` | First configured content index file found inside `rr_dir`, else empty |
 | `rr_leaf_idx` | Deepest local `_index.php` below the vhost root relevant to this path, else empty |
 | `rr_mime` | MIME type ruph would use for `rr_file` |
+| `rr_is_static` | `"1"` if `rr_file` is a non-PHP file suitable for direct static delivery, else empty |
 
 Notes:
 
@@ -149,7 +151,9 @@ Explicit existing `.php` files do not get wrapped by the local leaf `_index.php`
 
 ### Existing directory
 
-If the literal request path exists and is a directory:
+If the URL maps to a directory but lacks a trailing slash (e.g. `/subdir`), ruph issues a `301 Moved Permanently` redirect to the slash-terminated form (`/subdir/`) before any PHP runs. This matches the default behavior of Apache `mod_dir` and Nginx, preventing relative-URL breakage and avoiding redirect loops when PHP also tries to normalize the slash. Query strings are preserved across the redirect.
+
+Once the URL has a trailing slash, the directory is resolved:
 
 - scan `index_files` in configured order, **skipping `_index.php`**
 - first matching `.php` index (e.g. `index.php`) => PHP target

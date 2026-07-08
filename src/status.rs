@@ -318,7 +318,7 @@ td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
 {ip_rows}
 </table>
 
-<div class="footer">ruph/0.1.0</div>
+<div class="footer">ruph/{version}</div>
 </body>
 </html>"#,
         now = now,
@@ -332,6 +332,7 @@ td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
         unique_ips = ip_hits.len(),
         ips_per_s = stats.unique_ips_in_window(2) as f64 / 2.0,
         ip_rows = ip_rows,
+        version = crate::VERSION,
     )
 }
 

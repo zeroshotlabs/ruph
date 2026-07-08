@@ -575,9 +575,24 @@ impl WebServer {
             Err(_) => return rr,
         };
 
+        // Helper: scan index_files for the first content index in a directory.
+        // Skips the middleware index (e.g. _index.php) since it's infrastructure.
+        let find_content_index = |dir: &Path, index_files: &[String], middleware: &str| -> Option<PathBuf> {
+            for name in index_files {
+                if name == middleware {
+                    continue;
+                }
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return candidate.canonicalize().ok();
+                }
+            }
+            None
+        };
+
         let target_dir = if file_path.is_file() {
             let fname = file_path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-            if fname != "_index.php" {
+            if fname != self.middleware_index.as_str() {
                 if let Ok(real) = file_path.canonicalize() {
                     rr.insert("rr_file".to_string(), real.to_string_lossy().to_string());
                     rr.insert("rr_exists".to_string(), "1".to_string());
@@ -594,17 +609,8 @@ impl WebServer {
             if let Ok(real) = file_path.canonicalize() {
                 rr.insert("rr_dir".to_string(), real.to_string_lossy().to_string());
             }
-            for name in &self.index_files {
-                if name == "_index.php" {
-                    continue;
-                }
-                let candidate = file_path.join(name);
-                if candidate.is_file() {
-                    if let Ok(real) = candidate.canonicalize() {
-                        rr.insert("rr_index".to_string(), real.to_string_lossy().to_string());
-                    }
-                    break;
-                }
+            if let Some(idx) = find_content_index(&file_path, &self.index_files, &self.middleware_index) {
+                rr.insert("rr_index".to_string(), idx.to_string_lossy().to_string());
             }
             Some(file_path.clone())
         } else {
@@ -688,6 +694,31 @@ impl WebServer {
             rr_vars.get("rr_index").unwrap_or(&String::new()),
             rr_vars.get("rr_leaf_idx").unwrap_or(&String::new())
         );
+
+        // ── Directory trailing-slash redirect (like mod_dir / Nginx) ──────
+        // When a URL maps to a directory but lacks a trailing slash, issue a
+        // 301 redirect to the slash-terminated form.  This matches the default
+        // behaviour of Apache mod_dir and Nginx and prevents:
+        //  - relative-URL breakage in served HTML pages
+        //  - redirect loops when PHP also tries to normalize the slash
+        if !path.ends_with('/') && path != "" {
+            if let Ok(fp) = self.resolve_file_path(&path, &root) {
+                if fp.is_dir() {
+                    let mut location = path.clone();
+                    location.push('/');
+                    if let Some(qs) = parts.uri.query() {
+                        location.push('?');
+                        location.push_str(qs);
+                    }
+                    debug!("Directory slash redirect: {} -> {}", path, location);
+                    return Response::builder()
+                        .status(StatusCode::MOVED_PERMANENTLY)
+                        .header("Location", &location)
+                        .body(RuphBody::empty())
+                        .map_err(|e| anyhow!("Failed to build redirect: {}", e));
+                }
+            }
+        }
 
         let query_string = parts.uri.query().unwrap_or("").to_string();
         let query_params = self.parse_query_string(&query_string);
@@ -1586,9 +1617,22 @@ impl WebServer {
         let uri = req.uri();
         let query_string = uri.query().unwrap_or("").to_string();
 
-        server_vars.insert("SERVER_SOFTWARE".to_string(), "ruph/0.1.0".to_string());
-        server_vars.insert("SERVER_NAME".to_string(), "localhost".to_string());
-        server_vars.insert("SERVER_PORT".to_string(), "8082".to_string());
+        // Derive SERVER_NAME and SERVER_PORT from Host header / URI authority
+        let host_header = req
+            .headers()
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| uri.authority().map(|a| a.as_str()))
+            .unwrap_or("localhost");
+        let (server_name, server_port) = if let Some(colon) = host_header.rfind(':') {
+            (&host_header[..colon], &host_header[colon + 1..])
+        } else {
+            (host_header, if uri.scheme_str() == Some("https") { "443" } else { "80" })
+        };
+
+        server_vars.insert("SERVER_SOFTWARE".to_string(), format!("ruph/{}", crate::VERSION).to_string());
+        server_vars.insert("SERVER_NAME".to_string(), server_name.to_string());
+        server_vars.insert("SERVER_PORT".to_string(), server_port.to_string());
         server_vars.insert("REQUEST_METHOD".to_string(), req.method().to_string());
         let script_name = script_path
             .strip_prefix(root)
@@ -1665,9 +1709,22 @@ impl WebServer {
         let uri = &parts.uri;
         let query_string = uri.query().unwrap_or("").to_string();
 
-        server_vars.insert("SERVER_SOFTWARE".to_string(), "ruph/0.1.0".to_string());
-        server_vars.insert("SERVER_NAME".to_string(), "localhost".to_string());
-        server_vars.insert("SERVER_PORT".to_string(), "8082".to_string());
+        // Derive SERVER_NAME and SERVER_PORT from Host header / URI authority
+        let host_header = parts
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| uri.authority().map(|a| a.as_str()))
+            .unwrap_or("localhost");
+        let (server_name, server_port) = if let Some(colon) = host_header.rfind(':') {
+            (&host_header[..colon], &host_header[colon + 1..])
+        } else {
+            (host_header, if uri.scheme_str() == Some("https") { "443" } else { "80" })
+        };
+
+        server_vars.insert("SERVER_SOFTWARE".to_string(), format!("ruph/{}", crate::VERSION).to_string());
+        server_vars.insert("SERVER_NAME".to_string(), server_name.to_string());
+        server_vars.insert("SERVER_PORT".to_string(), server_port.to_string());
         server_vars.insert("REQUEST_METHOD".to_string(), parts.method.to_string());
         let script_name = script_path
             .strip_prefix(root)
